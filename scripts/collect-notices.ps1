@@ -111,6 +111,41 @@ function Get-LicenseBodyKey([string]$text) {
     return Get-TextHash ($lines -join "`n")
 }
 
+# ---------------------------------------------------------------------------
+# Host-independent ordering
+# ---------------------------------------------------------------------------
+
+# Sort-Object's -Culture resolves through the host's globalization stack: NLS
+# on Windows PowerShell 5.1 (.NET Framework) and ICU on PowerShell 7 (.NET).
+# The two order punctuation-bearing names differently (e.g. bit-set/bit-vec
+# relative to neighbouring crates), so the committed file generated under one
+# host is reported stale by -Check under the other. Ordinal comparison is
+# plain code-point order, identical on every host, culture and .NET runtime.
+function Sort-OrdinalStrings([string[]]$Items) {
+    $arr = [string[]]@($Items)
+    [System.Array]::Sort($arr, [System.StringComparer]::Ordinal)
+    return $arr
+}
+
+function Sort-OrdinalObjects([object[]]$Items, [string[]]$Properties) {
+    $list = New-Object System.Collections.Generic.List[object]
+    foreach ($it in $Items) { $list.Add($it) }
+    $props = $Properties
+    $list.Sort([System.Comparison[object]]{
+        param($x, $y)
+        foreach ($name in $props) {
+            $a = [string]$x.$name
+            $b = [string]$y.$name
+            if ($null -eq $a) { $a = '' }
+            if ($null -eq $b) { $b = '' }
+            $r = [string]::CompareOrdinal($a, $b)
+            if ($r -ne 0) { return $r }
+        }
+        return 0
+    })
+    return $list.ToArray()
+}
+
 # --- SPDX expression parsing -------------------------------------------------
 
 function Get-SpdxTokens([string]$expr) {
@@ -307,7 +342,7 @@ function Get-LicenseFiles([string]$dir, [string]$licenseFile) {
     if ($dir -and (Test-Path -LiteralPath $dir -PathType Container)) {
         $all = Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
             Where-Object { Test-LicenseFileName $_.Name }
-        foreach ($f in ($all | Sort-Object Name)) { $files += $f.FullName }
+        foreach ($f in (Sort-OrdinalObjects @($all) @('Name'))) { $files += $f.FullName }
     }
     if ($licenseFile -and (Test-Path -LiteralPath $licenseFile -PathType Leaf)) {
         $files += (Resolve-Path -LiteralPath $licenseFile).Path
@@ -485,7 +520,7 @@ function Sort-Packages($ids, $pkgById) {
         $p = $pkgById[$i]
         [pscustomobject]@{ Id = $i; Name = $p.name; Version = $p.version; Pkg = $p }
     }
-    return @($objs | Sort-Object -Property Name, Version -Culture ([System.Globalization.CultureInfo]::InvariantCulture))
+    return @(Sort-OrdinalObjects $objs @('Name', 'Version'))
 }
 
 function Get-Closure($rootId, $kind, $nodeById) {
@@ -700,12 +735,16 @@ Add-Line ('-' * 76)
 Add-Line '2. License texts'
 Add-Line ('-' * 76)
 Add-Line ''
-$textKeys = @($licenseTexts.Keys | Sort-Object -Culture ([System.Globalization.CultureInfo]::InvariantCulture))
+$textKeys = Sort-OrdinalStrings @($licenseTexts.Keys)
 $ordered = foreach ($k in $textKeys) {
     $t = $licenseTexts[$k]
-    [pscustomobject]@{ Key = $k; Ids = @($t.Ids) | Sort-Object -Culture ([System.Globalization.CultureInfo]::InvariantCulture); UsedBy = @($t.UsedBy) | Sort-Object -Culture ([System.Globalization.CultureInfo]::InvariantCulture); Text = $t.Text }
+    $ids = @(Sort-OrdinalStrings @($t.Ids))
+    [pscustomobject]@{ Key = $k; Ids = $ids; UsedBy = @(Sort-OrdinalStrings @($t.UsedBy)); Text = $t.Text; SortKey = ($ids -join ',') }
 }
-$ordered = @($ordered | Sort-Object -Property @{ Expression = { ($_.Ids -join ',') } } -Culture ([System.Globalization.CultureInfo]::InvariantCulture))
+# List<T>.Sort is not stable, so equal SortKey values (the same id set with
+# different text bodies) must be ordered by the content hash too, or the two
+# .NET runtimes would order them differently.
+$ordered = @(Sort-OrdinalObjects @($ordered) @('SortKey', 'Key'))
 foreach ($t in $ordered) {
     Add-Line ('=' * 76)
     Add-Line ("License: {0}" -f ($t.Ids -join ', '))
@@ -725,12 +764,12 @@ Add-Line ('-' * 76)
 Add-Line '3. Additional notices shipped by crates'
 Add-Line ('-' * 76)
 Add-Line ''
-$extraKeys = @($extraTexts.Keys | Sort-Object -Culture ([System.Globalization.CultureInfo]::InvariantCulture))
+$extraKeys = Sort-OrdinalStrings @($extraTexts.Keys)
 $extraOrdered = foreach ($k in $extraKeys) {
     $t = $extraTexts[$k]
-    [pscustomobject]@{ Who = $t.Who; Name = $t.Name; Text = $t.Text }
+    [pscustomobject]@{ Key = $k; Who = $t.Who; Name = $t.Name; Text = $t.Text }
 }
-$extraOrdered = @($extraOrdered | Sort-Object -Property Who, Name -Culture ([System.Globalization.CultureInfo]::InvariantCulture))
+$extraOrdered = @(Sort-OrdinalObjects @($extraOrdered) @('Who', 'Name', 'Key'))
 if ($extraOrdered.Count -eq 0) { Add-Line '(none)' ; Add-Line '' }
 foreach ($t in $extraOrdered) {
     Add-Line ("--- {0} - {1} ---" -f $t.Who, $t.Name)
