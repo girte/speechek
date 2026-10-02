@@ -2,7 +2,13 @@ name: Release
 
 # Publishes a verified candidate artifact. The tag pipeline never rebuilds:
 # it downloads the exact candidate-produced installer, validates it against the
-# annotated tag, and only then publishes it. See docs/releasing.md.
+# remote annotated tag, and only then publishes it. See docs/releasing.md.
+#
+# Triggers: a push of a single v[0-9]* tag, or a manual workflow_dispatch with
+# the required `tag` input naming an already pushed annotated release tag. The
+# manual path recovers a tag whose release run failed after the tag was pushed:
+# it revalidates and republishes the same verified candidate and never creates a
+# tag, starts a candidate or builds anything.
 #
 # The tagged candidate must be a manual workflow_dispatch of candidate.yml on
 # `main` (dispatched by scripts/publish-tag.ps1 with the full commit SHA in its
@@ -12,6 +18,16 @@ on:
   push:
     tags:
       - 'v[0-9]*'
+  # Manual recovery for an existing annotated tag whose release run failed (for
+  # example a workflow bug after the tag was already pushed). The tag and the
+  # candidate artifact are never recreated: only the already verified candidate
+  # is republished.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing annotated release tag to publish (vX.Y.Z)'
+        required: true
+        type: string
 
 # Least privilege by default; only the publish job widens permissions, and only
 # after the verify job has passed.
@@ -19,7 +35,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  # One group per tag, shared by a tag push and a recovery dispatch, so the same
+  # release can never be published twice at the same time.
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 defaults:
@@ -34,28 +52,45 @@ jobs:
       contents: read
       actions: read
     outputs:
-      version: ${{ steps.validate.outputs.version }}
-      tag_commit: ${{ steps.validate.outputs.tag_commit }}
-      candidate_run: ${{ steps.validate.outputs.candidate_run }}
+      version: ${{ steps.tag.outputs.version }}
+      tag_commit: ${{ steps.tag.outputs.tag_commit }}
+      candidate_run: ${{ steps.tag.outputs.candidate_run }}
       installer_name: ${{ steps.manifest.outputs.installer_name }}
-      installer_sha256: ${{ steps.validate.outputs.installer_sha256 }}
+      installer_sha256: ${{ steps.tag.outputs.installer_sha256 }}
     steps:
-      - name: Checkout tag
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      # Strict tag shape, annotated-tag message, main ancestry, version mirrors,
-      # and a dated CHANGELOG section. Pure repository reads, no secrets.
-      - name: Validate tag, ancestry, versions and changelog
-        id: validate
+      # The remote annotated tag is the source of truth. It is read through the
+      # GitHub Git Refs/Tags API with the read-only token: the ref must be an
+      # annotated `tag` object (not a lightweight commit ref), its target must be
+      # a commit, and its message must carry exactly one candidate record. A
+      # local checkout can show the tag peeled to its commit, so local refs are
+      # never trusted here. Read-only repository reads with the workflow token,
+      # no repository secrets and no writes.
+      - name: Resolve the remote annotated tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $repoRoot = $env:GITHUB_WORKSPACE
-          Set-Location $repoRoot
+          function Invoke-Gh([string[]]$GhArgs) {
+            $output = (& gh @GhArgs 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) { throw "gh $($GhArgs -join ' ') failed: $output" }
+            return $output
+          }
 
-          $tag = [string]$env:GITHUB_REF_NAME
+          # A tag push publishes its own tag; a manual recovery dispatch must
+          # name the existing tag explicitly.
+          $tag = [string]$env:INPUT_TAG
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            if ([string]$env:EVENT_NAME -eq 'workflow_dispatch') {
+              Write-Error "a manual recovery dispatch requires the 'tag' input."
+              exit 1
+            }
+            $tag = [string]$env:EVENT_REF_NAME
+          }
           $tagMatch = [regex]::Match($tag, '^v(?<version>\d+\.\d+\.\d+)$')
           if (-not $tagMatch.Success) {
             Write-Error "tag '$tag' is not a strict vX.Y.Z tag."
@@ -63,17 +98,50 @@ jobs:
           }
           $version = $tagMatch.Groups['version'].Value
 
-          # The verification record must live in an annotated tag object.
-          $objectType = (& git for-each-ref "refs/tags/$tag" --format='%(objecttype)' | Out-String).Trim()
-          if ($objectType -ne 'tag') {
-            Write-Error "tag '$tag' is not annotated (objecttype '$objectType'); the candidate run id and installer hash must be in the tag message."
+          $repo = $env:REPO
+          $refObject = Invoke-Gh @('api', "repos/$repo/git/ref/tags/$tag") | ConvertFrom-Json
+          if ($null -eq $refObject -or $null -eq $refObject.object) {
+            Write-Error "the Git Refs API returned no ref object for '$tag'."
             exit 1
           }
-          $message = (& git for-each-ref "refs/tags/$tag" --format='%(contents)' | Out-String)
+          if ([string]$refObject.ref -ne "refs/tags/$tag") {
+            Write-Error "the Git Refs API answered for ref '$($refObject.ref)', expected 'refs/tags/$tag'."
+            exit 1
+          }
+          $objectType = [string]$refObject.object.type
+          if ($objectType -ne 'tag') {
+            Write-Error "remote tag '$tag' is not annotated (Git Refs API object type '$objectType'); the candidate run id and installer hash must be in the annotated tag object."
+            exit 1
+          }
+          $tagObjectSha = [string]$refObject.object.sha
+          if ($tagObjectSha -notmatch '^[0-9a-f]{40}$') {
+            Write-Error "the Git Refs API did not return a tag object SHA for '$tag'."
+            exit 1
+          }
+
+          $tagObject = Invoke-Gh @('api', "repos/$repo/git/tags/$tagObjectSha") | ConvertFrom-Json
+          if ($null -eq $tagObject -or $null -eq $tagObject.object) {
+            Write-Error "the Git Tags API returned no object for tag object '$tagObjectSha'."
+            exit 1
+          }
+          if ([string]$tagObject.tag -ne $tag) {
+            Write-Error "tag object '$tagObjectSha' names '$($tagObject.tag)', expected '$tag'."
+            exit 1
+          }
+          $targetType = [string]$tagObject.object.type
+          if ($targetType -ne 'commit') {
+            Write-Error "tag '$tag' points at a '$targetType' object, not a commit."
+            exit 1
+          }
+          $tagCommit = [string]$tagObject.object.sha
+          if ($tagCommit -notmatch '^[0-9a-f]{40}$') {
+            Write-Error "tag '$tag' does not resolve to a full commit SHA through the Git Tags API."
+            exit 1
+          }
 
           # Exactly one record, in the fixed order and format emitted by
           # scripts/publish-tag.ps1 (extra tag text is allowed).
-          $records = [regex]::Matches($message, '(?m)candidate-run:(?<run>[0-9]+)[ ]installer-sha256:(?<sha>[0-9a-f]{64})')
+          $records = [regex]::Matches([string]$tagObject.message, '(?m)candidate-run:(?<run>[0-9]+)[ ]installer-sha256:(?<sha>[0-9a-f]{64})')
           if ($records.Count -ne 1) {
             Write-Error "the annotated tag message must contain exactly one 'candidate-run:<id> installer-sha256:<64-hex>' record (found $($records.Count))."
             exit 1
@@ -81,9 +149,37 @@ jobs:
           $candidateRun = $records[0].Groups['run'].Value
           $installerSha = $records[0].Groups['sha'].Value
 
-          $tagCommit = (& git rev-parse "$tag^{commit}" | Out-String).Trim()
-          if (-not ($tagCommit -match '^[0-9a-f]{40}$')) {
-            Write-Error "could not resolve the peeled commit of '$tag'."
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag_commit=$tagCommit" >> $env:GITHUB_OUTPUT
+          "candidate_run=$candidateRun" >> $env:GITHUB_OUTPUT
+          "installer_sha256=$installerSha" >> $env:GITHUB_OUTPUT
+          Write-Host "remote annotated tag $tag resolved through the API: commit $tagCommit, candidate run $candidateRun, installer $installerSha"
+
+      - name: Checkout tag commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          ref: ${{ steps.tag.outputs.tag_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Local consistency of the checked-out tag commit: it must be the commit
+      # the API resolved, reachable from main, with matching version mirrors and
+      # a dated CHANGELOG section. Pure repository reads, no secrets.
+      - name: Validate ancestry, versions and changelog
+        id: validate
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repoRoot = $env:GITHUB_WORKSPACE
+          Set-Location $repoRoot
+
+          $version = '${{ steps.tag.outputs.version }}'
+          $tagCommit = '${{ steps.tag.outputs.tag_commit }}'
+
+          # The checkout must be exactly the resolved tag commit.
+          $head = (& git rev-parse HEAD | Out-String).Trim()
+          if ($head -ne $tagCommit) {
+            Write-Error "checked-out commit '$head' is not the resolved tag commit '$tagCommit'."
             exit 1
           }
 
@@ -114,11 +210,7 @@ jobs:
             exit 1
           }
 
-          "version=$version" >> $env:GITHUB_OUTPUT
-          "tag_commit=$tagCommit" >> $env:GITHUB_OUTPUT
-          "candidate_run=$candidateRun" >> $env:GITHUB_OUTPUT
-          "installer_sha256=$installerSha" >> $env:GITHUB_OUTPUT
-          Write-Host "tag $tag validated: commit $tagCommit, candidate run $candidateRun, installer $installerSha"
+          Write-Host "tag commit $tagCommit validated: version $version is an ancestor of main with a dated changelog section"
 
       # GitHub API: the named run must belong to this repository, use the
       # candidate workflow, be a successful workflow_dispatch of main, and still
@@ -137,8 +229,8 @@ jobs:
           }
 
           $repo = $env:REPO
-          $runId = '${{ steps.validate.outputs.candidate_run }}'
-          $tagCommit = '${{ steps.validate.outputs.tag_commit }}'
+          $runId = '${{ steps.tag.outputs.candidate_run }}'
+          $tagCommit = '${{ steps.tag.outputs.tag_commit }}'
           $artName = "windows-x64-$tagCommit"
 
           $repoId = [string]((Invoke-Gh @('api', "repos/$repo") | ConvertFrom-Json).id)
@@ -185,7 +277,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $repo = $env:REPO
-          $runId = '${{ steps.validate.outputs.candidate_run }}'
+          $runId = '${{ steps.tag.outputs.candidate_run }}'
           $artName = '${{ steps.candidate.outputs.artifact_name }}'
           if (Test-Path -LiteralPath candidate) { Remove-Item -Recurse -Force candidate }
           & gh run download $runId --repo $repo --name $artName --dir candidate
@@ -202,10 +294,10 @@ jobs:
           $repoRoot = $env:GITHUB_WORKSPACE
           . (Join-Path $repoRoot 'scripts/release-common.ps1')
 
-          $version = '${{ steps.validate.outputs.version }}'
-          $tagCommit = '${{ steps.validate.outputs.tag_commit }}'
-          $candidateRun = '${{ steps.validate.outputs.candidate_run }}'
-          $tagInstallerSha = '${{ steps.validate.outputs.installer_sha256 }}'
+          $version = '${{ steps.tag.outputs.version }}'
+          $tagCommit = '${{ steps.tag.outputs.tag_commit }}'
+          $candidateRun = '${{ steps.tag.outputs.candidate_run }}'
+          $tagInstallerSha = '${{ steps.tag.outputs.installer_sha256 }}'
 
           $manifestFile = Get-ChildItem -Path candidate -Recurse -File -Filter 'release-manifest.json' | Select-Object -First 1
           if (-not $manifestFile) { Write-Error "release-manifest.json is missing from the artifact."; exit 1 }
@@ -270,9 +362,9 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $repoRoot = $env:GITHUB_WORKSPACE
-          $version = '${{ steps.validate.outputs.version }}'
+          $version = '${{ steps.tag.outputs.version }}'
           $installerName = '${{ steps.manifest.outputs.installer_name }}'
-          $sha = '${{ steps.validate.outputs.installer_sha256 }}'
+          $sha = '${{ steps.tag.outputs.installer_sha256 }}'
 
           $lines = Get-Content -LiteralPath (Join-Path $repoRoot 'CHANGELOG.md')
           $start = $null
@@ -329,9 +421,11 @@ jobs:
       contents: write
       actions: read
     steps:
-      - name: Checkout verified tag helpers
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Checkout tag commit for the release helper
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
         with:
+          ref: ${{ needs.verify.outputs.tag_commit }}
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Download verified release assets
@@ -403,7 +497,7 @@ jobs:
           Invoke-Gh @('release', 'edit', $tag, '--repo', $repo, '--draft=false', '--latest') | Out-Null
           $release = (Invoke-Gh @('api', "repos/$repo/releases/tags/$tag")) | ConvertFrom-Json
           if ([bool]$release.draft) { Write-Error "release $tag is still a draft."; exit 1 }
-          Write-Host "published release $tag: $($release.html_url)"
+          Write-Host "published release ${tag}: $($release.html_url)"
 
       # Download the published asset through the API and confirm the bytes.
       - name: Confirm published asset

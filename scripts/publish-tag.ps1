@@ -35,6 +35,9 @@
     `candidate-run:<id> installer-sha256:<hex>`, and only that single tag ref is
     pushed. Nothing downloaded from a run is executed and no local verification
     report is consulted.
+    The tag push is judged only by git's exit code: git writes its push progress
+    to stderr, which Windows PowerShell 5.1 must not turn into a reported
+    failure.
 
     Runs on Windows PowerShell 5.1 and PowerShell 7+.
 #>
@@ -51,13 +54,41 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = Get-SpeechekRepoRoot -ScriptRoot $PSScriptRoot
 
+# Resolved once, so every git call goes through the .NET child-process helper.
+$gitPath = Resolve-SpeechekExecutable -Name 'git'
+if (-not $gitPath) {
+    throw "git was not found on PATH; install Git before publishing."
+}
+
+# Git is invoked as a .NET child process (Get-SpeechekProcessResult), never
+# through PowerShell's native `2>&1` redirection. On Windows PowerShell 5.1 a
+# native command that writes to stderr while $ErrorActionPreference is 'Stop'
+# raises a terminating NativeCommandError even when the command succeeded, and
+# `git push` writes its progress to stderr: that previously reported a
+# successful tag push as a failure. Only the child exit code counts as success.
+function Invoke-SpeechekGit {
+    param([string[]]$Arguments)
+    $result = Get-SpeechekProcessResult -FilePath $gitPath -Arguments (@('-C', $repoRoot) + $Arguments) -WorkingDirectory $repoRoot
+    if ($result.ExitCode -ne 0) {
+        throw ("git " + ($Arguments -join ' ') + " failed (exit $($result.ExitCode)): " + $result.StandardError.Trim())
+    }
+    return (($result.StandardOutput | Out-String).Trim())
+}
+
 function Get-SpeechekGitText {
     param([string[]]$Arguments)
-    $output = & git -C $repoRoot @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "git $($Arguments -join ' ') failed: " + (($output | Out-String).Trim())
+    return (Invoke-SpeechekGit -Arguments $Arguments)
+}
+
+# Deletes the local tag after a failed tag or push. Tolerant on purpose: this
+# runs on an error path where the tag may already be gone.
+function Remove-SpeechekLocalTag {
+    try {
+        Invoke-SpeechekGit @('tag', '-d', $tagName) | Out-Null
     }
-    return (($output | Out-String).Trim())
+    catch {
+        Write-Warning "could not delete the local tag ${tagName}: $($_.Exception.Message)"
+    }
 }
 
 function Get-SpeechekJsonProperty {
@@ -485,21 +516,27 @@ finally {
 # ── 8. Annotated tag and single-ref push ───────────────────────────────────
 
 $tagMessage = "Speechek $Version release`n`ncandidate-run:$runId installer-sha256:$installerSha"
-$tagOutput = & git -C $repoRoot tag -a $tagName -m $tagMessage 2>&1
-if ($LASTEXITCODE -ne 0) {
-    throw "git tag -a $tagName failed: " + (($tagOutput | Out-String).Trim())
+try {
+    Invoke-SpeechekGit @('tag', '-a', $tagName, '-m', $tagMessage) | Out-Null
 }
-$tagType = (& git -C $repoRoot cat-file -t $tagName 2>&1 | Out-String).Trim()
+catch {
+    throw "git tag -a $tagName failed: $($_.Exception.Message)"
+}
+$tagType = Invoke-SpeechekGit @('cat-file', '-t', $tagName)
 if ($tagType -ne 'tag') {
-    & git -C $repoRoot tag -d $tagName 2>&1 | Out-Null
+    Remove-SpeechekLocalTag
     throw "the created tag $tagName is not annotated (object type '$tagType'); removed it."
 }
 
-$pushOutput = & git -C $repoRoot push origin "refs/tags/$tagName" 2>&1
-if ($LASTEXITCODE -ne 0) {
-    & git -C $repoRoot tag -d $tagName 2>&1 | Out-Null
+# The child exit code is the only success signal: git push writes progress to
+# stderr, which must never be mistaken for a failure.
+try {
+    Invoke-SpeechekGit @('push', 'origin', "refs/tags/$tagName") | Out-Null
+}
+catch {
+    Remove-SpeechekLocalTag
     throw ("pushing tag $tagName failed; the local tag was deleted so the publish can be retried: " +
-           (($pushOutput | Out-String).Trim()))
+           $_.Exception.Message)
 }
 
 Write-Host "Pushed annotated tag $tagName for commit $head"

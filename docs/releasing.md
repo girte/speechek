@@ -101,9 +101,19 @@ The tag pipeline accepts only that recorded candidate, so the published file is 
 
 ## Release workflow
 
-`.github/workflows/release.yml` runs only on a push of a single `v[0-9]*` tag, never on pull requests. It validates that the tag is `vX.Y.Z`, that all manifests agree, that the CHANGELOG has a section for the version, and that the tag commit is on `main`. Through the GitHub API it then confirms that the candidate run named in the annotated tag belongs to the current public repository, uses the candidate workflow, was a `workflow_dispatch` event on `main`, concluded `success`, has a `head_sha` equal to the peeled tag commit, and still has the `windows-x64-<SHA>` artifact, unexpired.
+`.github/workflows/release.yml` runs on a push of a single `v[0-9]*` tag and can also be started manually to recover an existing tag (see below); it never runs on pull requests. It reads the **remote** tag through the GitHub Git Refs/Tags API, never through a local checkout ref — the ref must be an annotated `tag` object whose target is a commit and whose message records the candidate, because a checkout may show the tag peeled to its commit. It validates that the tag is `vX.Y.Z`, checks out exactly the resolved tag commit, and verifies that this commit is on `main`, that all version manifests agree with the tag and that the CHANGELOG has a dated section for the version. Through the GitHub API it then confirms that the candidate run named in the annotated tag belongs to the current public repository, uses the candidate workflow, was a `workflow_dispatch` event on `main`, concluded `success`, has a `head_sha` equal to that commit, and still has the `windows-x64-<SHA>` artifact, unexpired. A lightweight tag, a tag whose peeled commit differs from the recorded candidate, or a tag without exactly one candidate record fails the run closed.
 
 The publish job receives `contents:write` and `actions:read` only after those checks pass. It builds release notes from the matching CHANGELOG section, adds the fixed footer (Windows 11 x64, install, manual-download update, unsigned, accepted hang risks, SHA-256), attaches the exact same setup executable and checksum, and publishes the release as latest within the tag workflow. Downloaded scripts are never executed — only bytes and documents are validated. If any check fails, the release is not rebuilt from scratch and no substitute file is uploaded.
+
+### Recovering a failed release run
+
+The tag is pushed before the release workflow starts, so a failure of that workflow after the push (for example a bug in its own validation) does not lose the verified candidate. Re-run the same pipeline for the existing tag — without creating a tag, a candidate or a build:
+
+```powershell
+gh workflow run release.yml --repo girte/speechek --ref main -f tag=v0.2.0
+```
+
+The dispatch re-reads the annotated tag through the API, re-validates the candidate run and artifact recorded in it, and publishes that identical verified file as the latest release. Nothing is rebuilt and nothing downloaded from the run is executed. If the candidate artifact has expired, the workflow fails and a new candidate must be built and verified; a published tag is never moved and a released file is never replaced.
 
 ## Immutable releases and updates
 
