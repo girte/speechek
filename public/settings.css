@@ -205,6 +205,8 @@ body.settings-body [hidden] { display: none !important; }
 }
 .settings-device-notice { color: var(--accent-text); font-size: 13px; line-height: 1.5; margin: 8px 0 0; min-height: 1.5em; }
 .settings-device-notice:empty { margin-top: 0; }
+.settings-autostart-notice { color: var(--accent-text); font-size: 13px; line-height: 1.5; margin: 8px 0 0; min-height: 1.5em; }
+.settings-autostart-notice:empty { margin-top: 0; }
 
 .settings-button {
   font: inherit;
@@ -292,6 +294,7 @@ body.settings-body [hidden] { display: none !important; }
   .settings-foot { padding: 12px 0 14px; }
   .settings-panel .mode-picker label { flex: 1 1 auto; min-width: 120px; }
   .settings-help-panel { padding: 9px 11px; }
+  .settings-autostart-row { display: grid; grid-template-columns: 18px minmax(0, 1fr) 20px; }
   .settings-dialog { padding: 18px; }
 }
 

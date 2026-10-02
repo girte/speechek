@@ -62,6 +62,17 @@
           </div>
 
           <div class="settings-field">
+            <div class="settings-check-row settings-autostart-row">
+              <input type="checkbox" id="autostart-enabled" aria-describedby="autostart-notice help-autostart">
+              <label for="autostart-enabled">Запускать Speechek при входе в Windows</label>
+              <button type="button" class="settings-help" aria-label="Подсказка: автозагрузка при входе в Windows" aria-expanded="false" aria-controls="help-autostart" aria-describedby="help-autostart">?</button>
+              <div class="settings-help-panel" role="tooltip" id="help-autostart" hidden>Speechek будет запускаться сам при входе в Windows для текущего пользователя. Установщик и эта настройка используют одну и ту же запись в реестре. Если автозагрузку отключили в параметрах Windows, включение здесь вернёт её. Вход в систему может занять немного больше времени. Пока состояние записи прочитать нельзя, изменить настройку не получится.</div>
+            </div>
+            <p class="settings-autostart-notice" id="autostart-notice" role="status" aria-live="polite"></p>
+            <div class="error" id="autostart-error" role="alert" hidden></div>
+          </div>
+
+          <div class="settings-field">
             <div class="settings-block-head">
               <label class="settings-field-title" for="input-device">Микрофон</label>
               <button type="button" class="settings-help" aria-label="Подсказка: выбор микрофона" aria-expanded="false" aria-controls="help-device" aria-describedby="help-device">?</button>

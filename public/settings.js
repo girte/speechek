@@ -63,6 +63,7 @@ const CMD = {
   applyKeys: 'settings_apply_keys',
   close: 'settings_close',
   action: 'settings_action',
+  setAutostart: 'settings_set_autostart',
 };
 
 const SECTIONS = ['general', 'keys'];
@@ -76,6 +77,11 @@ const TYPING_IDLE_MS = 350;
 const DICTATION_HINT = 'Диктовка выполняется: горячую клавишу сейчас изменить нельзя.';
 /** Why the port field was refused; the shell uses the same line for a zero port. */
 const PORT_INVALID_MESSAGE = 'Укажите целое число от 1 до 65535.';
+/**
+ * Why the autostart switch is mixed and disabled; the shell could not read the
+ * registration it would have to change.
+ */
+const AUTOSTART_UNKNOWN = 'Состояние автозагрузки определить не удалось: запись Windows недоступна. Изменить её сейчас нельзя.';
 
 /** Fixed Russian texts for codes the shell may answer with. */
 const FALLBACK_MESSAGES = {
@@ -97,6 +103,8 @@ const FALLBACK_MESSAGES = {
   SAVE_PARTIAL: 'Файлы могли измениться частично; приложение продолжает использовать прежние настройки. Устраните ошибку доступа и повторите.',
   CHECK_IN_PROGRESS: 'Проверка ключей уже выполняется.',
   INTERNAL: 'Внутренняя ошибка приложения.',
+  AUTOSTART_UNAVAILABLE: 'Автозагрузку сейчас изменить нельзя: запись Windows занята другой программой или недоступна.',
+  AUTOSTART_FAILED: 'Не удалось изменить автозагрузку: проверьте доступ к реестру и повторите.',
 };
 
 const tauri = globalThis.__TAURI__;
@@ -109,6 +117,9 @@ const tabs = { general: el('tab-general'), keys: el('tab-keys') };
 const panels = { general: el('panel-general'), keys: el('panel-keys') };
 const modePicker = el('mode-picker');
 const muteToggle = el('mute-during-recording');
+const autostartToggle = el('autostart-enabled');
+const autostartNotice = el('autostart-notice');
+const autostartError = el('autostart-error');
 const generalError = el('general-error');
 const hotkeyInput = el('hotkey-input');
 const hotkeyState = el('hotkey-state');
@@ -214,6 +225,17 @@ let partialConsentedFor = null;
 let generalIntent = 0;
 /** General sends that have not settled yet; their views must not repaint. */
 let generalInFlight = 0;
+/**
+ * An autostart change that has not settled yet: its own optimistic value stays
+ * on the switch until its answer lands, and a refusal rolls it back.
+ */
+let autostartInFlight = 0;
+/** The wording of a refused autostart change, kept under the switch until the
+ * next attempt; a repainted view never clears it on its own. */
+let autostartFailure = '';
+/** Grows with every activation re-read of the registration: only the newest
+ * answer may update the value the page took from a focus. */
+let autostartRefreshEpoch = 0;
 /** The port field holds text the shell has not taken; a view never erases it. */
 let portDirty = false;
 /**
@@ -441,6 +463,9 @@ function renderControls() {
   keyClear.disabled = !usable;
   keyCheck.disabled = !usable;
   muteToggle.disabled = !usable;
+  // An unreadable registration leaves the switch mixed and disabled: a control
+  // that cannot confirm its own state must not look actionable.
+  autostartToggle.disabled = !usable || autostartState() === null;
   // The lab is a second window over a running take: it stays closed until the
   // dictation ends, while everything that does not touch the chord stays live.
   actionLab.disabled = !ready || dictationActive;
@@ -478,6 +503,9 @@ function renderGeneral() {
   // may repaint the general controls is the truth about both of them, and a
   // send in flight keeps this painting away until its own answer lands.
   muteToggle.checked = view?.settings?.mute_during_recording === true;
+  // The autostart switch is painted from the same view as the other general
+  // controls: a send in flight keeps this painting away until its answer lands.
+  renderAutostart();
   // The port field belongs to the user while it holds text the shell has not
   // taken: a view that paints a general, chord or key answer must not erase
   // what was typed but not yet committed. A field that already holds the
@@ -1051,6 +1079,89 @@ function askUnsaved(reason) {
 /* General settings                                                            */
 /* -------------------------------------------------------------------------- */
 
+/** The shell's read of the autostart registration: `true`, `false`, or `null`
+ * when it could not be read or a foreign value owns the name. Anything else
+ * means no view has answered yet. */
+function autostartState() {
+  return typeof view?.autostartEnabled === 'boolean' ? view.autostartEnabled : null;
+}
+
+/**
+ * Paints the autostart switch. A registration the shell could not read stays
+ * mixed and disabled instead of claiming a state Windows did not confirm, and
+ * a change in flight keeps the user's own value until its answer lands.
+ */
+function renderAutostart() {
+  if (autostartInFlight > 0) return;
+  const state = autostartState();
+  autostartToggle.checked = state === true;
+  autostartToggle.indeterminate = state === null;
+  autostartNotice.textContent = state === null && view !== null ? AUTOSTART_UNKNOWN : '';
+  setError(autostartError, autostartFailure);
+}
+
+/**
+ * Re-reads the autostart registration when the window is activated: Windows
+ * Startup Apps and the registry can change it while the settings window stays
+ * open in the background, and the switch would otherwise keep the value the
+ * last open painted. The read changes nothing, so it is not queued; its answer
+ * is merged into the newest accepted view only when it still speaks for the
+ * draft on screen (activation epoch, draft id, revision) and the page is not
+ * frozen or leaving. Every other field, every typed draft and every error line
+ * stays untouched, and a change in flight keeps its own optimistic value: only
+ * the registration this read was made for is adopted, and a failure leaves the
+ * last value on screen rather than claiming a state Windows did not answer.
+ */
+async function refreshAutostartOnActivation() {
+  if (view === null || closed || !shell || busy || closePending) return;
+  const epoch = ++autostartRefreshEpoch;
+  try {
+    const next = await invoke(CMD.open, {});
+    // A newer activation, a close flow or a frozen page owns the screen now: a
+    // read for the state this window was in must not paint over it.
+    if (epoch !== autostartRefreshEpoch || view === null || closed || busy || closePending) return;
+    // Only an answer about the draft on screen and not older than the view it
+    // answers may move the switch: a send that ran while this read was in
+    // flight has already reported its own, newer registration.
+    if (!next || typeof next !== 'object' || next.draftId !== view.draftId) return;
+    if (typeof next.revision === 'number' && typeof view.revision === 'number' && next.revision < view.revision) return;
+    // The shell answers `true`, `false` or `null`; anything else means this
+    // page cannot tell Windows' state and must not invent one.
+    if (next.autostartEnabled !== true && next.autostartEnabled !== false && next.autostartEnabled !== null) return;
+    if (autostartState() === next.autostartEnabled) return;
+    view = { ...view, autostartEnabled: next.autostartEnabled };
+    renderAutostart();
+    // The switch is disabled while the registration cannot be read: readability
+    // may have changed on this read, so the control follows it.
+    renderControls();
+  } catch {
+    // A failed re-read is not a state: the page keeps the value it last
+    // accepted and waits for the next activation.
+  }
+}
+
+/**
+ * The autostart interaction, taken synchronously like the other general
+ * settings: one change event is one intent and the switch's own value is read
+ * here, while the send itself goes through the same serial queue so it cannot
+ * race a chord or key command's revision.
+ */
+function onAutostartChange() {
+  if (view === null || closed || busy) return;
+  if (autostartState() === null) {
+    // The registration cannot be read: the control takes no input and is repainted.
+    renderAutostart();
+    return;
+  }
+  const enabled = autostartToggle.checked;
+  const draftId = view.draftId;
+  autostartFailure = '';
+  autostartInFlight += 1;
+  setError(autostartError, '');
+  setStatus('Применяем настройки…');
+  void enqueue(() => sendAutostart(draftId, enabled));
+}
+
 /**
  * The general interaction, handled synchronously: the intent and the values are
  * taken here, before anything is queued, so two quick clicks can never share
@@ -1126,6 +1237,35 @@ async function sendGeneral(intent, settings, draftId) {
     }
   } finally {
     generalInFlight = Math.max(0, generalInFlight - 1);
+  }
+}
+
+/**
+ * Sends one autostart change. The revision travels from the newest accepted
+ * view: an answer that belongs to an older interaction may land, but the newest
+ * view is the truth and a refusal rolls the switch back to it.
+ */
+async function sendAutostart(draftId, enabled) {
+  try {
+    if (view === null || closed || view.draftId !== draftId) return;
+    const revision = view.revision;
+    const next = await invoke(CMD.setAutostart, { draftId, revision, enabled });
+    applyView(next);
+    setStatus('Настройки применены.');
+  } catch (cause) {
+    const error = errorOf(cause);
+    if (error.code === 'STALE_DRAFT') {
+      // Another answer already moved the draft on; the newest view is the truth.
+      if (draftLive(draftId)) await resync();
+      return;
+    }
+    autostartFailure = messageOf(error);
+    setStatus(autostartFailure);
+    if (error.code === 'FORBIDDEN') disableForm(autostartFailure);
+  } finally {
+    autostartInFlight = Math.max(0, autostartInFlight - 1);
+    // A refused choice is rolled back; an accepted one is already in `view`.
+    renderAutostart();
   }
 }
 
@@ -2127,7 +2267,7 @@ function onHotkeyKey(event) {
 /* -------------------------------------------------------------------------- */
 function disableForm(message) {
   const hotkeyWasHeld = hotkeyFieldHoldsKeyboard();
-  for (const node of [keyReveal, keyApply, keyClear, keyCheck, actionLab, hotkeyInput, portInput, deviceSelect, muteToggle]) {
+  for (const node of [keyReveal, keyApply, keyClear, keyCheck, actionLab, hotkeyInput, portInput, deviceSelect, muteToggle, autostartToggle]) {
     node.disabled = true;
   }
   if (hotkeyWasHeld) signalHotkeyField(false);
@@ -2306,6 +2446,10 @@ function wire() {
   // intent, and the value is read from the control itself when it is sent.
   muteToggle.addEventListener('change', () => onGeneralChange());
 
+  // The autostart switch is an ordinary general setting with its own command:
+  // one change event is one intent, and the value is read from the control here.
+  autostartToggle.addEventListener('change', () => onAutostartChange());
+
   // The port is typed like the chord: a keystroke only edits the field and
   // takes the complaint about the previous value away, and only a completed
   // number — Enter, or leaving the field — is sent.
@@ -2350,10 +2494,12 @@ function wire() {
   actionLab.addEventListener('click', () => void openLab());
 
   // The window is shown and activated again: the host may have gained or lost
-  // a device while it was hidden, so the list is re-read on every focus — and
-  // the chord field may hold the keyboard again, which the shell has to know.
+  // a device while it was hidden, and Windows may have changed the autostart
+  // registration in the meantime, so both are re-read on every focus — and the
+  // chord field may hold the keyboard again, which the shell has to know.
   window.addEventListener('focus', () => {
     void refreshDevices();
+    void refreshAutostartOnActivation();
     signalHotkeyField(hotkeyFieldHoldsKeyboard());
   });
 

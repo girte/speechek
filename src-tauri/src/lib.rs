@@ -67,6 +67,7 @@
 //! message box.
 
 mod audio;
+mod autostart;
 mod backend;
 mod capture;
 mod installer;
@@ -2960,7 +2961,8 @@ pub fn run() {
             preferences::settings_close,
             preferences::settings_action,
             preferences::settings_update_hotkey,
-            preferences::settings_hotkey_capture
+            preferences::settings_hotkey_capture,
+            preferences::settings_set_autostart
         ])
         .setup(move |app| {
             // The plugins have run by now, a second launch is already gone, and

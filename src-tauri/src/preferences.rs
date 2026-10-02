@@ -87,6 +87,13 @@ const INPUT_DEVICE_INVALID_MESSAGE: &str =
 /// text, which may name endpoints, never reaches it.
 const INPUT_DEVICES_UNAVAILABLE_MESSAGE: &str =
     "Не удалось получить список микрофонов. Проверьте доступ к устройствам записи.";
+/// Wording for a launch-at-logon registration the name already holds, or the
+/// registry cannot be read: nothing was changed.
+const AUTOSTART_UNAVAILABLE_MESSAGE: &str =
+    "Автозагрузка занята другой программой или недоступна; изменение не выполнено.";
+/// Wording for a launch-at-logon write that did not stick.
+const AUTOSTART_FAILED_MESSAGE: &str =
+    "Не удалось изменить автозагрузку. Проверьте права текущего пользователя и повторите.";
 
 /* -------------------------------------------------------------------------- */
 /* Command failure                                                            */
@@ -226,6 +233,12 @@ pub struct SettingsView {
     pub partial_persistence: bool,
     /// Which section the window should show first.
     pub selected_section: String,
+    /// Whether this executable is registered to start at logon for the current
+    /// user: `true` when our own `Run` value points at this executable and
+    /// Windows has not disabled it, `false` when it is absent or disabled, and
+    /// `null` when the registration cannot be read or the value name belongs to
+    /// another program.
+    pub autostart_enabled: Option<bool>,
 }
 
 /// One input device the settings window may choose between. `id` is the
@@ -660,6 +673,7 @@ impl PreferencesState {
             hotkey_error: self.hotkey_error.lock().clone(),
             dictation_active: crate::phase_of(&crate::inner(app)).is_active(),
             partial_persistence: self.partial_persistence(),
+            autostart_enabled: crate::autostart::state(),
             selected_section,
         }
     }
@@ -1011,6 +1025,63 @@ fn update_hotkey_blocking(
         return Err(SettingsUiError::stale_draft());
     }
     apply_locked(app, &state, draft, planned, ApplyScope::Hotkey, false)
+}
+
+/// Turns this executable's launch-at-logon registration on or off. The change
+/// is immediate and lives only in the current user's registry: no settings
+/// document is written, and the answer is the fresh view the page should
+/// render. The revision the page worked on has to be the current one, so an
+/// answer that raced another change cannot move the registration of a draft the
+/// page no longer shows.
+#[tauri::command]
+pub async fn settings_set_autostart(
+    window: WebviewWindow,
+    app: AppHandle,
+    draft_id: u64,
+    revision: u64,
+    enabled: bool,
+) -> Result<SettingsView, SettingsUiError> {
+    check_window(&window)?;
+    run_blocking(move || set_autostart_blocking(&app, draft_id, revision, enabled)).await
+}
+
+fn set_autostart_blocking(
+    app: &AppHandle,
+    draft_id: u64,
+    revision: u64,
+    enabled: bool,
+) -> Result<SettingsView, SettingsUiError> {
+    let state = app.state::<PreferencesState>();
+    let inner = crate::inner(app);
+    // The same lock order every apply uses: the write must not run beside a
+    // dictation that is pinning the configuration.
+    let _session = inner.session.lock();
+    ensure_running(&state)?;
+    let mut slot = state.draft.lock();
+    let draft = slot.as_mut().ok_or_else(SettingsUiError::stale_draft)?;
+    if draft.id != draft_id || draft.revision != revision {
+        return Err(SettingsUiError::stale_draft());
+    }
+    // The registry is written before the draft revision moves, so a refusal
+    // leaves the draft and its revision exactly as they were.
+    let changed = crate::autostart::set_enabled(enabled).map_err(autostart_error)?;
+    if changed {
+        draft.revision += 1;
+    }
+    Ok(state.view(app, draft, SECTION_LAST.to_owned()))
+}
+
+/// Maps a launch-at-logon failure to the fixed text the page shows. The
+/// registry's own text may name a path, so it never reaches the page.
+fn autostart_error(error: crate::autostart::AutostartError) -> SettingsUiError {
+    match error {
+        crate::autostart::AutostartError::Unavailable => {
+            SettingsUiError::new("AUTOSTART_UNAVAILABLE", AUTOSTART_UNAVAILABLE_MESSAGE)
+        }
+        crate::autostart::AutostartError::Failed => {
+            SettingsUiError::new("AUTOSTART_FAILED", AUTOSTART_FAILED_MESSAGE)
+        }
+    }
 }
 
 /// Records whether the settings window's chord field holds the keyboard.

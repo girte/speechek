@@ -31,6 +31,7 @@ fn main() {
                 "settings_action",
                 "settings_update_hotkey",
                 "settings_hotkey_capture",
+                "settings_set_autostart",
             ])),
     )
     .expect("Tauri command permission generation failed");

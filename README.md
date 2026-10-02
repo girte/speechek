@@ -26,7 +26,7 @@ Get the latest installer from **[github.com/girte/speechek/releases/latest](http
 2. During a first install the setup offers two optional boxes, both unchecked: a desktop shortcut and starting Speechek when you sign in to Windows. The **Run Speechek** box on the final page is checked by default.
 3. Speechek starts in the system tray (there is no main window). Right-click the tray icon, choose **Настройка**, then add one or more Gemini API keys under **API-ключи** and click **Применить ключи**. Without a saved key, pressing the hotkey opens the settings window instead of recording.
 4. Put the cursor in the field you want, press **F2** to start, speak, and press **F2** again. **Escape** cancels the current dictation before the text is handed to the paste step. If the app cannot confirm the automatic paste, it shows "Скопировано — вставьте вручную"; the text is already in your clipboard, so press **Ctrl+V**.
-5. To change modes, hotkey, microphone or sound behaviour later, open the same settings window from the tray. General settings apply immediately; the local port is applied after a restart.
+5. To change modes, hotkey, microphone, sound behaviour or start-at-sign-in later, open the same settings window from the tray. General settings apply immediately; the local port is applied after a restart. The start-at-sign-in switch writes the same per-user entry as the installer, so no Windows Settings step is needed.
 
 ### Important caveats
 

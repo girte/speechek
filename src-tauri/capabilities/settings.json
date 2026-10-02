@@ -16,6 +16,7 @@
     "allow-settings-close",
     "allow-settings-action",
     "allow-settings-update-hotkey",
-    "allow-settings-hotkey-capture"
+    "allow-settings-hotkey-capture",
+    "allow-settings-set-autostart"
   ]
 }
