@@ -7,6 +7,13 @@ The text of each GitHub Release is generated from the matching version section b
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-02
+
+### Changed
+
+- Development builds are portable: `settings.json` and the DPAPI-protected `secrets.bin` live beside the Development executable instead of in `%APPDATA%`; installed Production and isolated Test profiles retain their existing locations.
+- The release process now hands off a committed Development preview for owner-run UI verification before dispatching a production candidate. The interactive smoke harness requires an explicit owner-session switch; GUI-free checks remain available without one.
+
 ## [0.2.0] - 2026-10-02
 
 The first public release. Version `0.1.1` was a local build and was never published as a GitHub release.

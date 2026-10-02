@@ -46,6 +46,11 @@
                      installer must honour the shared 5 s grace and terminate
                      exactly the verified handle (exit code 1)
 
+    Only GateSelfTest and FixtureSelfTest are GUI-free; the default scenario is
+    GateSelfTest. Every other scenario shows the native app or the installer and
+    is owner-run: without -OwnerUi it is refused with a nonzero exit before any
+    fixture, ownership, registry or process side effect.
+
     Only the last five scenarios mutate installed state beyond a normal
     install/uninstall; all of them act on the Speechek Test identity and its
     ownership manifest only, never on production.
@@ -72,7 +77,7 @@ param(
         'UninstallDelete', 'Cancel',
         'SameVersion', 'CorruptVersion', 'PreserveOptions', 'ForeignLocker',
         'Rollback', 'ForceClose')]
-    [string]$Scenario = 'All',
+    [string]$Scenario = 'GateSelfTest',
 
     [string]$Fixture,
     [string]$FixtureB,
@@ -83,7 +88,8 @@ param(
 
     [int]$Port = 0,
     [int]$TimeoutSec = 300,
-    [switch]$KeepRunning
+    [switch]$KeepRunning,
+    [switch]$OwnerUi
 )
 
 Set-StrictMode -Version Latest
@@ -101,6 +107,16 @@ $TestTranscript = 'Installer smoke transcript'
 
 if ($TestProductName -eq 'Speechek' -or $TestIdentifier -eq 'app.speechek.desktop') {
     throw 'refusing to run: the smoke must target the test identity, not production.'
+}
+
+# ── Owner-UI gate ───────────────────────────────────────────────────────────
+# GateSelfTest and FixtureSelfTest never show a native window and may run
+# unattended. Everything else drives the Speechek Test EXE or the installer GUI
+# and is owner-run only; this exits before any fixture, ownership, registry or
+# process side effect.
+if (-not $OwnerUi -and $Scenario -ne 'GateSelfTest' -and $Scenario -ne 'FixtureSelfTest') {
+    [Console]::Error.WriteLine('Interactive smoke is owner-run only; use -OwnerUi from an owner session.')
+    exit 1
 }
 
 $repoRoot = Get-SpeechekRepoRoot $PSScriptRoot

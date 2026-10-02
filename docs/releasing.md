@@ -2,7 +2,7 @@
 
 [README](../README.md) · [Contributing](../CONTRIBUTING.md) · [User guide](user-guide.md)
 
-This document describes how official Speechek builds are produced, verified and published. Release artifacts are built by the on-demand candidate workflow and only that verified candidate is ever published; a release is never assembled by hand from a locally built executable.
+This document describes how official Speechek builds are produced, verified and published. Release artifacts are built by the on-demand candidate workflow and only that verified candidate is ever published; a release is never assembled by hand from a locally built executable. Publishing additionally requires the owner's manual smoke of the portable Development preview for the same `main` commit — see *Owner preview before publishing*.
 
 ## Pinned toolchain
 
@@ -22,6 +22,7 @@ The application version is authoritative in `src-tauri/tauri.conf.json`. `Cargo.
 
 - Versions are `X.Y.Z`. Tags are annotated `vX.Y.Z` and must match the manifest version exactly.
 - The first public release is `0.2.0`. The earlier local build `0.1.1` was never a public GitHub release.
+- Publishing is gated by the owner's manual smoke of the Development preview for the exact clean `main` commit; `scripts/publish-tag.ps1` refuses to dispatch or tag without `-OwnerApproved` and the matching preview manifest (see *Owner preview before publishing*).
 - A published version and its installer file are immutable: to fix something, publish a new version. There is no downgrade support and no reuse of a released number or file.
 
 ## Local release build
@@ -82,22 +83,34 @@ Only a successful dispatch on `main` can be the source of a public release. The 
 
 It contains no host paths, user names or environment contents. `SHA256SUMS.txt` lists lowercase hashes, two spaces, the installer basename, and a trailing newline.
 
+## Owner preview before publishing
+
+Every release starts with a portable Development preview that the **owner** runs by hand; the agent never opens a visible window. The authoritative order is `prepare-preview → owner feedback → publish`:
+
+1. **prepare-preview** — `scripts/prepare-preview.ps1`, from a clean committed `main`, runs the GUI-free checks and unit tests (`cargo check`, `cargo test --features test-provider`) and then builds the Development flavor **last**, so nothing else overwrites the canonical `src-tauri/target/debug/speechek.exe`. It writes the ignored `src-tauri/target/debug/preview-manifest.json` (`schemaVersion` 1, `commit`, `version`, `flavor` `development`, `exe.file` `speechek.exe`, `exe.sha256`) and never starts the app, an installer, a shortcut, a Run entry or a registry write.
+2. **owner feedback** — the owner double-clicks `src-tauri/target/debug/speechek.exe`: no installation, no shortcuts and no uninstall entry are created. The build runs as **Speechek Dev** (default hotkey `Ctrl+Shift+F9`, first port `4174`) and keeps its `settings.json` and `secrets.bin` **beside that EXE**, separate from the installed production app, which keeps them under `%APPDATA%\Speechek`. The owner enters their own Dev keys and replies either that it works or with the concrete problems.
+3. **publish** — `scripts/publish-tag.ps1` accepts the release only when it is given `-OwnerApproved` and the canonical preview manifest that matches this clean `main` commit and the current debug EXE, so a bug report restarts the cycle: fix, rebuild the preview, hand it off again, and the previous approval is void. See *Publishing a tag* below.
+
+The preview manifest describes the preview EXE only; it carries no user name, host path or environment value, and it is not the production `release-manifest.json` of a candidate run.
+
 ## Publishing a tag
 
-`scripts/publish-tag.ps1` is the single entry point for a release. From a clean `main` checkout it dispatches exactly one candidate run, waits for it and only then tags:
+`scripts/publish-tag.ps1` is the single entry point for a release, and it runs only **after** the owner preview above has been confirmed. From a clean `main` checkout, with the canonical preview manifest present and `-OwnerApproved` given, it dispatches exactly one candidate run, waits for it and only then tags:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/publish-tag.ps1 -Version 0.2.0
+$previewManifest = (Resolve-Path 'src-tauri/target/debug/preview-manifest.json').Path
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/publish-tag.ps1 `
+    -Version 0.2.1 -PreviewManifest $previewManifest -OwnerApproved
 ```
 
 The script:
 
-1. requires the checkout to be on `main` at the version it publishes, the version mirrors to equal `-Version`, and the tracked tree to be clean;
+1. requires the owner-approval gate to hold **before the first GitHub API call**: `-OwnerApproved` is given, `-PreviewManifest` is the absolute canonical `src-tauri/target/debug/preview-manifest.json`, that manifest has `schemaVersion` 1, `flavor` `development` and `exe.file` `speechek.exe`, its `version` and `commit` equal `-Version` and the current clean `main` HEAD, and the SHA-256 of the current `src-tauri/target/debug/speechek.exe` still equals the manifest `exe.sha256`, so a rebuilt or replaced preview invalidates the approval; nothing is dispatched and no tag is created when any of this fails;
 2. dispatches `.github/workflows/candidate.yml` once with the `commit` input set to that `main` HEAD and a fresh random `requestId` (the GitHub workflow-dispatch API). The API may answer with the documented HTTP 200 body carrying a `workflow_run_id`, or with HTTP 204 and no body at all; the returned id is used when it is present and well formed, and otherwise the script locates exactly the run named `release-<requestId>` through the workflow-runs API (filtered to `workflow_dispatch` on `main` at this commit), waiting a bounded time for it to appear. Only a run whose name is exactly `release-<requestId>` is accepted, a missing or ambiguous match fails the script, and no run is ever selected by recency;
 3. accepts only a successful run that belongs to this repository, uses the candidate workflow, is a `workflow_dispatch` event on `main` with a `head_sha` equal to the published commit and the expected `release-<requestId>` name, and whose unexpired `windows-x64-<commit>` artifact carries a production manifest whose installer bytes match both the manifest and `SHA256SUMS.txt`;
 4. creates the annotated tag `vX.Y.Z`, whose message records `candidate-run:<id> installer-sha256:<hex>`, and pushes only that tag.
 
-The tag pipeline accepts only that recorded candidate, so the published file is exactly the one the candidate build produced and is never rebuilt. No local verification report and no local installer smoke is required: installing a candidate by hand is not a release gate. A dispatch response without a run id (the observed HTTP 204 empty body) is not a failure: the same single invocation resolves its own run through the unique `requestId` and never falls back to a previous or "latest" run. If the candidate run fails, or its artifact has expired before the tag is pushed, resolve the problem and dispatch a new candidate; a tag is never created for a file that was not verified.
+The tag pipeline accepts only that recorded candidate, so the published file is exactly the one the candidate build produced and is never rebuilt. Installing the candidate by hand is not a release gate: the owner gate is the confirmed Development preview for this source commit, and `-OwnerApproved` is passed only after that explicit positive answer. A preview bug report restarts the cycle (fix, rebuild the preview, re-confirm) and voids the previous approval. A dispatch response without a run id (the observed HTTP 204 empty body) is not a failure: the same single invocation resolves its own run through the unique `requestId` and never falls back to a previous or "latest" run. If the candidate run fails, or its artifact has expired before the tag is pushed, resolve the problem and dispatch a new candidate; a tag is never created for a file that was not verified.
 
 ## Release workflow
 

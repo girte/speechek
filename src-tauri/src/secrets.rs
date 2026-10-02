@@ -379,9 +379,9 @@ impl std::error::Error for SecretStoreError {}
 /* Store files                                                                */
 /* -------------------------------------------------------------------------- */
 
-/// The container beside the settings file: `settings.json` and `secrets.bin`
-/// share one directory for both the default `%APPDATA%` location and a debug
-/// override, because the caller passes the resolved settings path.
+/// The container beside the resolved settings file: Production and Test use
+/// their own profile locations, and Development uses its executable directory.
+/// The caller supplies the path; this function never chooses a profile.
 pub fn secrets_path(config_path: &Path) -> PathBuf {
     config_path.with_file_name(SECRETS_FILE_NAME)
 }

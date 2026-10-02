@@ -13,9 +13,12 @@
 //! No diagnostic ever echoes a value read from a configuration file - only
 //! paths, line numbers, field names and property names.
 //!
-//! A debug build accepts an absolute `SPEECHEK_CONFIG_PATH`; the distributed
-//! executable uses the active flavor's `%APPDATA%/<directory>/settings.json`
-//! (`crate::profile`), and a release build never reads a path from the
+//! Storage depends on the build flavor (`crate::profile`): the distributed
+//! shell always uses `%APPDATA%\Speechek\settings.json`, the test flavor
+//! accepts an absolute `SPEECHEK_CONFIG_PATH` and otherwise uses
+//! `%APPDATA%\Speechek-Test\settings.json`, and the development flavor keeps
+//! `settings.json` beside the executable it runs from, so a portable build
+//! carries its own profile. A release build reads no path from the
 //! environment. The settings window saves through [`patch_settings_document`]
 //! and [`atomic_replace`].
 
@@ -61,7 +64,9 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-/// Settings file inside the flavor's `%APPDATA%` directory.
+/// The settings file every flavor resolves: inside the flavor's `%APPDATA%`
+/// directory for production and test, and beside the executable for the
+/// development flavor.
 const SETTINGS_FILE_NAME: &str = "settings.json";
 
 /// The local loopback port a document that does not name one is read with, and
@@ -834,135 +839,204 @@ fn splice(document: &str, edits: &mut Vec<(Range<usize>, String)>) -> String {
     result
 }
 
-/// The settings document this process uses: the active flavor's
-/// `%APPDATA%/<directory>/settings.json`, or - in a debug build only - the
-/// absolute path `SPEECHEK_CONFIG_PATH` names.
+/// The settings document this process uses, resolved from the active flavor
+/// alone: the development flavor keeps `settings.json` beside the executable
+/// it runs from, the test flavor accepts an absolute `SPEECHEK_CONFIG_PATH`
+/// and otherwise keeps `%APPDATA%\Speechek-Test\settings.json`, and the
+/// distributed shell always uses `%APPDATA%\Speechek\settings.json` and never
+/// reads a path from the environment.
 ///
-/// A production build passes no override here and never reads the variable, so
-/// a shipped executable can only ever use the profile it documents. For a debug
-/// flavor the override wins when it is a non-empty absolute path: a blank value
-/// is no override at all, a relative one is refused with the variable's name,
-/// and a valid one names the document even when the profile directory around it
-/// exists only for that run. Without `%APPDATA%` there is no profile to fall
-/// back to, and the refusal names the flavor's own directory rather than a
-/// working directory.
+/// The override belongs to the test flavor alone: a blank value is no override
+/// at all, a relative one is refused with the variable's name, and a valid one
+/// names the document even when the profile directory around it exists only
+/// for that run. The development flavor never reads it, so a forgotten
+/// override cannot move a portable build off the profile beside its
+/// executable; the executable itself is read for the development flavor only,
+/// and a release build reads neither it nor any variable.
 ///
 /// Nothing here touches the disk: [`create_default_if_missing`] writes the
 /// first-run document, and a preflight on top of this must not create one.
 pub fn settings_path() -> Result<PathBuf, ConfigError> {
-    // The override is compiled in for debug builds only; a release build never
-    // consults the environment, and `resolve_settings_path` ignores an override
-    // for the production flavor even if one were handed to it.
-    #[cfg(debug_assertions)]
-    let config_override = env::var_os("SPEECHEK_CONFIG_PATH");
+    // One flavor is compiled in, so exactly one of these selections exists in
+    // a given build: a release build reads no environment path at all, and the
+    // development flavor resolves its own executable instead.
     #[cfg(not(debug_assertions))]
-    let config_override: Option<std::ffi::OsString> = None;
+    let (flavor, config_override, executable) = (
+        BuildFlavor::Production,
+        None::<std::ffi::OsString>,
+        None::<PathBuf>,
+    );
+    #[cfg(all(debug_assertions, feature = "test-provider"))]
+    let (flavor, config_override, executable) = (
+        BuildFlavor::Test,
+        env::var_os("SPEECHEK_CONFIG_PATH"),
+        None::<PathBuf>,
+    );
+    #[cfg(all(debug_assertions, not(feature = "test-provider")))]
+    let (flavor, config_override, executable) = (
+        BuildFlavor::Development,
+        None::<std::ffi::OsString>,
+        Some(env::current_exe().map_err(|_| {
+            dev_executable_error("the current executable path could not be read")
+        })?),
+    );
 
     resolve_settings_path(
-        profile::ACTIVE,
+        flavor,
         config_override.as_deref(),
         env::var_os("APPDATA").as_deref(),
+        executable.as_deref(),
     )
 }
 
-/// [`settings_path`] with the flavor and both environment values as arguments,
-/// so the whole precedence can be exercised without touching the process
-/// environment or the compiled-in flavor: `config_override` is what a debug
-/// build takes from `SPEECHEK_CONFIG_PATH` and `appdata` what it takes from
-/// `APPDATA`.
+/// [`settings_path`] with the flavor, both environment values and the
+/// executable path as arguments, so the whole precedence can be exercised
+/// without touching the process environment or the compiled-in flavor:
+/// `config_override` is what the test flavor takes from
+/// `SPEECHEK_CONFIG_PATH`, `appdata` what it takes from `APPDATA`, and
+/// `executable` what the development flavor takes from the running
+/// executable's own path.
 ///
-/// The override belongs to the debug flavors alone. [`BuildFlavor::Production`]
-/// ignores it entirely - the caller passes `None` there, and the resolver does
-/// not care whether it does - so no release build can be moved off the profile
-/// it documents.
+/// The override belongs to [`BuildFlavor::Test`] alone and the executable to
+/// [`BuildFlavor::Development`] alone. Production ignores both entirely - it
+/// resolves through `%APPDATA%` and nothing else - so no released build can be
+/// moved off the profile it documents, and a debug flavor cannot pick up
+/// another flavor's document from an inherited variable.
 fn resolve_settings_path(
     flavor: BuildFlavor,
     config_override: Option<&OsStr>,
     appdata: Option<&OsStr>,
+    executable: Option<&Path>,
 ) -> Result<PathBuf, ConfigError> {
-    if flavor != BuildFlavor::Production {
-        if let Some(override_path) = config_override {
-            let override_text = override_path.to_string_lossy();
-            let trimmed = ts_trim(&override_text);
-            if !trimmed.is_empty() {
-                let path = PathBuf::from(override_path);
-                if !path.is_absolute() {
-                    return Err(config_invalid(format!(
-                        "SPEECHEK_CONFIG_PATH must be an absolute path (got \"{override_text}\")."
-                    )));
+    match flavor {
+        BuildFlavor::Production => appdata_settings_path(flavor, appdata),
+        BuildFlavor::Development => development_settings_path(executable),
+        BuildFlavor::Test => {
+            if let Some(override_path) = config_override {
+                let override_text = override_path.to_string_lossy();
+                let trimmed = ts_trim(&override_text);
+                if !trimmed.is_empty() {
+                    let path = PathBuf::from(override_path);
+                    if !path.is_absolute() {
+                        return Err(config_invalid(format!(
+                            "SPEECHEK_CONFIG_PATH must be an absolute path (got \"{override_text}\")."
+                        )));
+                    }
+                    return Ok(path);
                 }
-                return Ok(path);
             }
+            appdata_settings_path(flavor, appdata)
         }
     }
-
-    let appdata = appdata.filter(|value| !value.is_empty()).ok_or_else(|| {
-        config_invalid(format!(
-            "APPDATA is not set; Speechek keeps settings.json in %APPDATA%\\{}.",
-            profile::defaults(flavor).directory
-        ))
-    })?;
-    Ok(PathBuf::from(appdata)
-        .join(profile::defaults(flavor).directory)
-        .join(SETTINGS_FILE_NAME))
 }
 
+/// The `%APPDATA%` document of a flavor whose profile directory the table
+/// names: `%APPDATA%\<directory>\settings.json`. Only the flavors that keep
+/// such a profile reach this - the development flavor never does, and its
+/// empty table directory is not a path this function has to handle.
+fn appdata_settings_path(
+    flavor: BuildFlavor,
+    appdata: Option<&OsStr>,
+) -> Result<PathBuf, ConfigError> {
+    let directory = profile::defaults(flavor).directory;
+    let appdata = appdata.filter(|value| !value.is_empty()).ok_or_else(|| {
+        config_invalid(format!(
+            "APPDATA is not set; Speechek keeps settings.json in %APPDATA%\\{directory}."
+        ))
+    })?;
+    Ok(PathBuf::from(appdata).join(directory).join(SETTINGS_FILE_NAME))
+}
+
+/// The development flavor's document: `settings.json` in the directory of the
+/// executable the process runs from (`src-tauri/target/debug` for the
+/// canonical build), so a portable run carries its own profile and never
+/// touches `%APPDATA%`.
+///
+/// The path has to be absolute and to have a directory of its own: a missing
+/// executable, a relative path or a bare file name is refused with a
+/// diagnostic that says the directory cannot be determined. Nothing falls back
+/// to the working directory or to `%APPDATA%`, because either would silently
+/// select a document the user never chose.
+fn development_settings_path(executable: Option<&Path>) -> Result<PathBuf, ConfigError> {
+    let executable =
+        executable.ok_or_else(|| dev_executable_error("the executable path is not available"))?;
+    if !executable.is_absolute() {
+        return Err(dev_executable_error(&format!(
+            "\"{}\" is not an absolute path",
+            executable.display()
+        )));
+    }
+    let directory = executable
+        .parent()
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .ok_or_else(|| {
+            dev_executable_error(&format!("\"{}\" has no directory", executable.display()))
+        })?;
+    Ok(directory.join(SETTINGS_FILE_NAME))
+}
+
+/// The refusal of a development run whose document directory cannot be named:
+/// the message names the unusable path, or the missing one, and never falls
+/// back to another directory.
+fn dev_executable_error(reason: &str) -> ConfigError {
+    config_invalid(format!(
+        "Cannot determine the Dev executable directory for settings.json: {reason}."
+    ))
+}
 
 /// The loopback port the next start should claim, resolved before the shell is
 /// built and without touching anything on disk.
 ///
-/// The document is the one startup will read: an absolute
-/// `SPEECHEK_CONFIG_PATH` in debug builds, otherwise the active flavor's
-/// `%APPDATA%/<directory>/settings.json`. A document that is not there yet
-/// reads as [`DEFAULT_PORT`], the port the flavor's first-run document spells
-/// out; a document that is there is read through the same reader the startup
-/// uses, so a stored port that cannot be served, or a document that cannot be
-/// read at all, stops this run instead of being replaced by a port nobody
-/// chose. Nothing here creates or rewrites a file: writing the first-run
-/// document and re-reading the port are the shell's startup, and the port
-/// returned here is checked against that re-read before a socket is served or a
-/// window exists.
+/// The document is the one [`settings_path`] names - beside the development
+/// executable, the test flavor's override or `%APPDATA%` document, the
+/// production profile otherwise. A document that is not there yet reads as
+/// [`DEFAULT_PORT`], the port the flavor's first-run document spells out; a
+/// document that is there is read through the same reader the startup uses, so
+/// a stored port that cannot be served, or a document that cannot be read at
+/// all, stops this run instead of being replaced by a port nobody chose.
+/// Nothing here creates or rewrites a file: writing the first-run document and
+/// re-reading the port are the shell's startup, and the port returned here is
+/// checked against that re-read before a socket is served or a window exists.
 pub fn preflight_port() -> Result<u16, ConfigError> {
-    // The override is read exactly where `settings_path` reads it; a release
-    // build never consults the environment at all, so the shipped executable
-    // can only serve the profile it documents.
-    #[cfg(debug_assertions)]
-    let config_override = env::var_os("SPEECHEK_CONFIG_PATH");
-    #[cfg(not(debug_assertions))]
-    let config_override: Option<std::ffi::OsString> = None;
-
-    preflight_port_from(
-        profile::ACTIVE,
-        config_override.as_deref(),
-        env::var_os("APPDATA").as_deref(),
-    )
+    match preflight_document(settings_path()?) {
+        None => Ok(DEFAULT_PORT),
+        Some(path) => read_settings_document(&path, "settings file").map(|settings| settings.port),
+    }
 }
 
-/// [`preflight_port`] with the flavor and both environment values as arguments,
-/// so the whole precedence can be exercised without touching the process
-/// environment or the compiled-in flavor.
+/// [`preflight_port`] with the flavor, both environment values and the
+/// executable path as arguments, for the regression matrix: the compiled-in
+/// flavor and the process environment are never consulted, and the same
+/// arguments resolve exactly the document [`settings_path`] would.
+#[cfg(test)]
 fn preflight_port_from(
     flavor: BuildFlavor,
     config_override: Option<&OsStr>,
     appdata: Option<&OsStr>,
+    executable: Option<&Path>,
 ) -> Result<u16, ConfigError> {
-    match preflight_document_from(flavor, config_override, appdata)? {
+    match preflight_document_from(flavor, config_override, appdata, executable)? {
         None => Ok(profile::defaults(flavor).port),
         Some(path) => read_settings_document(&path, "settings file").map(|settings| settings.port),
     }
 }
 
 /// The settings document that startup will read, resolved the way
-/// [`settings_path`] resolves it, but without writing anything.
+/// [`settings_path`] resolves it, but without writing anything. Test-only: the
+/// runtime path goes through [`settings_path`], so the environment and the
+/// executable path are read in one place.
+#[cfg(test)]
 fn preflight_document_from(
     flavor: BuildFlavor,
     config_override: Option<&OsStr>,
     appdata: Option<&OsStr>,
+    executable: Option<&Path>,
 ) -> Result<Option<PathBuf>, ConfigError> {
     Ok(preflight_document(resolve_settings_path(
         flavor,
         config_override,
         appdata,
+        executable,
     )?))
 }
 
@@ -2601,7 +2675,9 @@ mod tests {
         assert!(runtime.resolve(Some(9)).is_none());
     }
 
-    /// Isolated `%APPDATA%` tree for port preflight tests, removed on drop.
+    /// Isolated tree for the storage regression matrix: the simulated
+    /// `%APPDATA%` directory and the directory a development executable runs
+    /// from, removed on drop.
     struct Scratch(PathBuf);
 
     impl Scratch {
@@ -2621,19 +2697,45 @@ mod tests {
             &self.0
         }
 
+        /// The directory the development build runs from: its `settings.json`
+        /// and `secrets.bin` live here.
+        fn dev_bin(&self) -> PathBuf {
+            self.0.join("dev-bin")
+        }
+
+        /// The absolute executable path the development flavor resolves its
+        /// document from.
+        fn executable(&self) -> PathBuf {
+            self.dev_bin().join("speechek.exe")
+        }
+
         fn target(&self) -> PathBuf {
             self.target_of(profile::ACTIVE)
         }
 
-        /// The profile directory one flavor keeps under the simulated
-        /// `%APPDATA%`, named by the flavor table.
+        /// The directory one flavor keeps its document in: the flavor's own
+        /// directory under the simulated `%APPDATA%` for production and test,
+        /// and the executable's directory for the development flavor, which
+        /// never resolves through `%APPDATA%`.
         fn target_of(&self, flavor: BuildFlavor) -> PathBuf {
-            self.0.join(profile::defaults(flavor).directory)
+            match flavor {
+                BuildFlavor::Development => self.dev_bin(),
+                BuildFlavor::Production | BuildFlavor::Test => {
+                    self.0.join(profile::defaults(flavor).directory)
+                }
+            }
         }
 
         fn target_settings(&self) -> PathBuf {
             self.target().join(SETTINGS_FILE_NAME)
         }
+    }
+
+    /// The `executable` argument the regression matrix passes for the
+    /// development flavor, and `None` for the flavors that resolve through
+    /// `%APPDATA%` alone.
+    fn active_executable(scratch: &Scratch) -> Option<PathBuf> {
+        (profile::ACTIVE == BuildFlavor::Development).then(|| scratch.executable())
     }
 
     impl Drop for Scratch {
@@ -2650,8 +2752,13 @@ mod tests {
     fn the_preflight_reads_the_port_the_startup_will_use() {
         let scratch = Scratch::new("preflight-read");
         assert_eq!(
-            preflight_port_from(profile::ACTIVE, None, Some(scratch.appdata().as_os_str()))
-                .expect("an absent profile"),
+            preflight_port_from(
+                profile::ACTIVE,
+                None,
+                Some(scratch.appdata().as_os_str()),
+                active_executable(&scratch).as_deref(),
+            )
+            .expect("an absent profile"),
             DEFAULT_PORT,
             "no document yet reads as the default the flavor's first run documents"
         );
@@ -2665,8 +2772,13 @@ mod tests {
         fs::create_dir_all(scratch.target()).expect("the profile directory");
         fs::write(scratch.target_settings(), without_port).expect("the document");
         assert_eq!(
-            preflight_port_from(profile::ACTIVE, None, Some(scratch.appdata().as_os_str()))
-                .expect("a document without a port"),
+            preflight_port_from(
+                profile::ACTIVE,
+                None,
+                Some(scratch.appdata().as_os_str()),
+                active_executable(&scratch).as_deref(),
+            )
+            .expect("a document without a port"),
             DEFAULT_PORT
         );
         assert_eq!(
@@ -2678,8 +2790,13 @@ mod tests {
         let named = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"port\": 43118\r\n}\r\n";
         fs::write(scratch.target_settings(), named).expect("the document");
         assert_eq!(
-            preflight_port_from(profile::ACTIVE, None, Some(scratch.appdata().as_os_str()))
-                .expect("a stored port"),
+            preflight_port_from(
+                profile::ACTIVE,
+                None,
+                Some(scratch.appdata().as_os_str()),
+                active_executable(&scratch).as_deref(),
+            )
+            .expect("a stored port"),
             43118
         );
         assert_eq!(
@@ -2699,8 +2816,13 @@ mod tests {
             .expect("the unrelated document");
 
         assert_eq!(
-            preflight_port_from(profile::ACTIVE, None, Some(scratch.appdata().as_os_str()))
-                .expect("no Speechek profile yet"),
+            preflight_port_from(
+                profile::ACTIVE,
+                None,
+                Some(scratch.appdata().as_os_str()),
+                active_executable(&scratch).as_deref(),
+            )
+            .expect("no Speechek profile yet"),
             DEFAULT_PORT
         );
         assert!(!scratch.target().exists());
@@ -2721,8 +2843,13 @@ mod tests {
         )
         .expect("the settings document");
         assert_eq!(
-            preflight_port_from(profile::ACTIVE, None, Some(scratch.appdata().as_os_str()))
-                .expect("the Speechek port"),
+            preflight_port_from(
+                profile::ACTIVE,
+                None,
+                Some(scratch.appdata().as_os_str()),
+                active_executable(&scratch).as_deref(),
+            )
+            .expect("the Speechek port"),
             43118
         );
         assert_eq!(
@@ -2757,8 +2884,13 @@ mod tests {
 
         for (document, expected) in &documents {
             fs::write(scratch.target_settings(), document).expect("the document");
-            let error = preflight_port_from(profile::ACTIVE, None, Some(scratch.appdata().as_os_str()))
-                .expect_err("an unusable document refuses the preflight");
+            let error = preflight_port_from(
+                profile::ACTIVE,
+                None,
+                Some(scratch.appdata().as_os_str()),
+                active_executable(&scratch).as_deref(),
+            )
+            .expect_err("an unusable document refuses the preflight");
             assert!(
                 error.to_string().contains(*expected),
                 "the refusal names the problem ({expected}): {error}"
@@ -2771,21 +2903,30 @@ mod tests {
         }
     }
 
-    /// The override belongs to the debug flavors: a relative path is refused
+    /// The override belongs to the test flavor: a relative path is refused
     /// with the variable's name, an empty value is no override at all, and an
-    /// absolute one names the document whether it exists yet or not - for a
-    /// debug flavor even without `%APPDATA%`. The production flavor ignores the
-    /// same override completely and still needs `%APPDATA%`, so a released
-    /// build cannot be moved off the profile it documents.
+    /// absolute one names the document whether it exists yet or not - even
+    /// without `%APPDATA%`. The development flavor ignores the same override
+    /// and reads beside its executable, and production ignores it and still
+    /// needs `%APPDATA%`, so neither can be moved off the profile it
+    /// documents. The preflight and the resolver name exactly the same
+    /// document.
     #[test]
     fn the_preflight_reads_the_debug_override_exactly_like_the_settings_path() {
         let scratch = Scratch::new("preflight-override");
         let appdata = Some(scratch.appdata().as_os_str());
+        let executable = scratch.executable();
+        let executable_arg = Some(executable.as_path());
+        let dev_document = scratch.target_of(BuildFlavor::Development).join(SETTINGS_FILE_NAME);
+        let elsewhere = scratch.appdata().join("elsewhere.json");
 
+        // The test flavor takes the absolute override, with or without
+        // `%APPDATA%`, and refuses a relative one with the variable's name.
         let error = preflight_port_from(
-            BuildFlavor::Development,
+            BuildFlavor::Test,
             Some(Path::new("relative.json").as_os_str()),
             appdata,
+            None,
         )
         .expect_err("a relative override");
         assert!(
@@ -2794,37 +2935,102 @@ mod tests {
         );
 
         assert_eq!(
-            preflight_port_from(BuildFlavor::Development, Some(OsStr::new("  ")), appdata)
+            preflight_port_from(BuildFlavor::Test, Some(OsStr::new("  ")), appdata, None)
                 .expect("an empty override is not one"),
-            profile::defaults(BuildFlavor::Development).port
+            profile::defaults(BuildFlavor::Test).port
         );
 
-        let document = scratch.appdata().join("elsewhere.json");
         assert_eq!(
-            preflight_port_from(BuildFlavor::Development, Some(document.as_os_str()), appdata)
-                .expect("an override to a document that is not there yet"),
-            profile::defaults(BuildFlavor::Development).port
+            preflight_document_from(
+                BuildFlavor::Test,
+                Some(elsewhere.as_os_str()),
+                appdata,
+                None,
+            )
+            .expect("an override to a document that is not there yet"),
+            None
         );
-        let named = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"port\": 43118\r\n}\r\n";
-        fs::write(&document, named).expect("the override document");
+        let named =
+            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"port\": 43118\r\n}\r\n";
+        fs::write(&elsewhere, named).expect("the override document");
         assert_eq!(
-            preflight_port_from(BuildFlavor::Development, Some(document.as_os_str()), appdata)
+            preflight_document_from(
+                BuildFlavor::Test,
+                Some(elsewhere.as_os_str()),
+                appdata,
+                None,
+            )
+            .expect("the override document"),
+            Some(elsewhere.clone())
+        );
+        assert_eq!(
+            preflight_port_from(BuildFlavor::Test, Some(elsewhere.as_os_str()), appdata, None)
                 .expect("the override document"),
             43118
         );
         assert_eq!(
-            fs::read(&document).expect("the override document"),
+            fs::read(&elsewhere).expect("the override document"),
             named.as_bytes()
         );
         // The override alone suffices: `%APPDATA%` is not consulted at all.
         assert_eq!(
-            preflight_port_from(BuildFlavor::Development, Some(document.as_os_str()), None)
+            preflight_port_from(BuildFlavor::Test, Some(elsewhere.as_os_str()), None, None)
                 .expect("the override without %APPDATA%"),
             43118
         );
 
-        // Production ignores the same override and reads its own directory, in
-        // which no document exists.
+        // The development flavor ignores the same override: it reads beside
+        // the executable it was given, creates nothing for a document that is
+        // not there yet, and the overridden document is never selected.
+        assert_eq!(
+            preflight_port_from(BuildFlavor::Development, None, None, executable_arg)
+                .expect("no development document yet"),
+            profile::defaults(BuildFlavor::Development).port
+        );
+        assert!(
+            !dev_document.exists() && !scratch.dev_bin().exists(),
+            "the preflight creates no development document"
+        );
+        assert_eq!(
+            preflight_document_from(
+                BuildFlavor::Development,
+                Some(elsewhere.as_os_str()),
+                appdata,
+                executable_arg,
+            )
+            .expect("the development document"),
+            None
+        );
+        fs::create_dir_all(scratch.dev_bin()).expect("the development directory");
+        fs::write(&dev_document, named).expect("the development document");
+        assert_eq!(
+            preflight_document_from(
+                BuildFlavor::Development,
+                Some(elsewhere.as_os_str()),
+                appdata,
+                executable_arg,
+            )
+            .expect("the development document"),
+            Some(dev_document.clone())
+        );
+        assert_eq!(
+            preflight_port_from(
+                BuildFlavor::Development,
+                Some(elsewhere.as_os_str()),
+                None,
+                executable_arg,
+            )
+            .expect("the development port"),
+            43118
+        );
+        assert_eq!(
+            fs::read(&dev_document).expect("the development document"),
+            named.as_bytes(),
+            "the development document is read and left as it is"
+        );
+
+        // Production ignores the override, relative or absolute, and the
+        // executable path with it, and still needs `%APPDATA%`.
         let production_document = scratch.appdata().join("production.json");
         fs::write(
             &production_document,
@@ -2835,7 +3041,8 @@ mod tests {
             preflight_port_from(
                 BuildFlavor::Production,
                 Some(production_document.as_os_str()),
-                appdata
+                appdata,
+                executable_arg,
             )
             .expect("production ignores the override"),
             profile::defaults(BuildFlavor::Production).port
@@ -2844,26 +3051,16 @@ mod tests {
             BuildFlavor::Production,
             Some(production_document.as_os_str()),
             None,
+            None,
         )
         .expect_err("production still needs %APPDATA%");
         assert!(error.to_string().contains("APPDATA"), "{error}");
-
-        let error = preflight_port_from(BuildFlavor::Development, None, None)
-            .expect_err("no %APPDATA%");
-        assert!(
-            error
-                .to_string()
-                .contains(profile::defaults(BuildFlavor::Development).directory),
-            "the refusal names the flavor's directory: {error}"
-        );
-        let error = preflight_port_from(BuildFlavor::Development, None, Some(OsStr::new("")))
-            .expect_err("an empty %APPDATA% is no %APPDATA%");
-        assert!(error.to_string().contains("APPDATA"), "{error}");
     }
 
-    /// The flavor table is the single source of the identities, directories and
-    /// first-run values, every row is distinct, and the compiled-in flavor
-    /// matches the kind of build this test runs in.
+    /// The flavor table is the single source of the identities, hotkeys and
+    /// first-run ports, every row is distinct, only the development row names
+    /// no `%APPDATA%` directory, and the compiled-in flavor matches the kind
+    /// of build this test runs in.
     #[test]
     fn the_flavor_table_holds_each_builds_own_identity() {
         let production = profile::defaults(BuildFlavor::Production);
@@ -2876,7 +3073,19 @@ mod tests {
         let development = profile::defaults(BuildFlavor::Development);
         let test = profile::defaults(BuildFlavor::Test);
         assert_eq!(development.identifier, "app.speechek.dev");
+        assert_eq!(development.title, "Speechek Dev");
+        assert_eq!(development.hotkey, "Ctrl+Shift+F9");
+        assert_eq!(development.port, 4174);
+        assert_eq!(
+            development.directory, "",
+            "the development flavor resolves beside its executable, not through %APPDATA%"
+        );
         assert_eq!(test.identifier, "app.speechek.test");
+        assert_eq!(test.title, "Speechek Test");
+        assert_eq!(test.directory, "Speechek-Test");
+        assert_eq!(test.hotkey, "Ctrl+Shift+F10");
+        assert_eq!(test.port, 4175);
+
         for (left, right) in [
             (&production, &development),
             (&production, &test),
@@ -2884,10 +3093,13 @@ mod tests {
         ] {
             assert_ne!(left.identifier, right.identifier);
             assert_ne!(left.title, right.title);
-            assert_ne!(left.directory, right.directory);
             assert_ne!(left.hotkey, right.hotkey);
             assert_ne!(left.port, right.port);
         }
+        assert!(
+            !production.directory.is_empty() && !test.directory.is_empty(),
+            "the flavors that resolve through %APPDATA% name their directory"
+        );
 
         assert_eq!(DEFAULT_PORT, profile::defaults(profile::ACTIVE).port);
 
@@ -2899,64 +3111,132 @@ mod tests {
         assert_eq!(profile::ACTIVE, BuildFlavor::Development);
     }
 
-    /// The resolver, flavor by flavor: a debug flavor takes an absolute
-    /// `SPEECHEK_CONFIG_PATH` (even without `%APPDATA%`), a blank value is no
-    /// override, a relative one is refused, a missing `%APPDATA%` names the
-    /// flavor's own directory, and production ignores the override entirely.
+    /// The resolver, flavor by flavor: the test flavor takes an absolute
+    /// `SPEECHEK_CONFIG_PATH` (even without `%APPDATA%`) and refuses a
+    /// relative one, while a blank value is no override at all; its
+    /// `%APPDATA%` fallback names its own directory. The development flavor
+    /// resolves beside the executable it is given and refuses without a
+    /// usable one, never through `%APPDATA%` or the working directory.
+    /// Production ignores the override and the executable entirely and still
+    /// needs `%APPDATA%`.
     #[test]
     fn the_settings_path_resolver_keeps_the_flavors_apart() {
         let scratch = Scratch::new("resolver");
         let appdata = Some(scratch.appdata().as_os_str());
         let elsewhere = scratch.appdata().join("elsewhere.json");
+        let executable = scratch.executable();
+        let executable_arg = Some(executable.as_path());
+        let dev_document = scratch.dev_bin().join(SETTINGS_FILE_NAME);
 
+        // Each flavor resolves its own document from nothing but its own
+        // source: `%APPDATA%` for production and test, the executable for
+        // development. A blank override changes nothing for any of them.
         for flavor in [
             BuildFlavor::Production,
             BuildFlavor::Development,
             BuildFlavor::Test,
         ] {
             assert_eq!(
-                resolve_settings_path(flavor, None, appdata).expect("the flavor's profile"),
+                resolve_settings_path(flavor, None, appdata, executable_arg)
+                    .expect("the flavor's document"),
                 scratch.target_of(flavor).join(SETTINGS_FILE_NAME),
-                "{flavor:?} keeps its own directory under %APPDATA%"
+                "{flavor:?} keeps its own document"
             );
             assert_eq!(
-                resolve_settings_path(flavor, Some(OsStr::new("   ")), appdata)
+                resolve_settings_path(flavor, Some(OsStr::new("   ")), appdata, executable_arg)
                     .expect("a blank override is no override"),
                 scratch.target_of(flavor).join(SETTINGS_FILE_NAME)
             );
-
-            let error = resolve_settings_path(flavor, None, None).expect_err("no %APPDATA%");
-            assert!(error.to_string().contains("APPDATA"), "{error}");
-            assert!(
-                error
-                    .to_string()
-                    .contains(profile::defaults(flavor).directory),
-                "the refusal names the flavor's directory: {error}"
-            );
         }
 
-        for flavor in [BuildFlavor::Development, BuildFlavor::Test] {
-            assert_eq!(
-                resolve_settings_path(flavor, Some(elsewhere.as_os_str()), appdata)
-                    .expect("the absolute override"),
-                elsewhere
-            );
-            assert_eq!(
-                resolve_settings_path(flavor, Some(elsewhere.as_os_str()), None)
-                    .expect("the override alone is enough"),
-                elsewhere
-            );
-            let error = resolve_settings_path(
-                flavor,
-                Some(Path::new("relative.json").as_os_str()),
+        // The development document is beside the executable and follows it
+        // alone: an inherited production override and an arbitrary location
+        // are ignored, and `%APPDATA%` never takes part.
+        assert_eq!(
+            resolve_settings_path(
+                BuildFlavor::Development,
+                Some(elsewhere.as_os_str()),
                 appdata,
+                executable_arg,
             )
-            .expect_err("a relative override");
-            assert!(error.to_string().contains("SPEECHEK_CONFIG_PATH"), "{error}");
-        }
+            .expect("the development document"),
+            dev_document
+        );
+        assert_eq!(
+            resolve_settings_path(BuildFlavor::Development, None, None, executable_arg)
+                .expect("the development document without %APPDATA%"),
+            dev_document
+        );
+        assert_eq!(
+            resolve_settings_path(
+                BuildFlavor::Development,
+                Some(Path::new("relative.json").as_os_str()),
+                None,
+                executable_arg,
+            )
+            .expect("a relative override cannot move the development document"),
+            dev_document
+        );
 
-        // Production ignores the override, relative or absolute, and still
-        // needs `%APPDATA%`.
+        // Without a usable executable path the development flavor refuses
+        // rather than falling back to a working directory or `%APPDATA%`.
+        for unusable in [
+            None,
+            Some(Path::new("speechek.exe")),
+            Some(Path::new("relative/speechek.exe")),
+        ] {
+            let error = resolve_settings_path(BuildFlavor::Development, None, appdata, unusable)
+                .expect_err("an unusable development executable");
+            assert!(
+                error.to_string().contains("Dev executable directory"),
+                "the refusal names the directory it cannot determine: {error}"
+            );
+        }
+        assert!(
+            !dev_document.exists(),
+            "a refused development resolution creates nothing"
+        );
+
+        // The test flavor takes an absolute override with or without
+        // `%APPDATA%`, and refuses a relative one with the variable's name.
+        assert_eq!(
+            resolve_settings_path(BuildFlavor::Test, Some(elsewhere.as_os_str()), appdata, None)
+                .expect("the absolute override"),
+            elsewhere
+        );
+        assert_eq!(
+            resolve_settings_path(BuildFlavor::Test, Some(elsewhere.as_os_str()), None, None)
+                .expect("the override alone is enough"),
+            elsewhere
+        );
+        let error = resolve_settings_path(
+            BuildFlavor::Test,
+            Some(Path::new("relative.json").as_os_str()),
+            appdata,
+            None,
+        )
+        .expect_err("a relative override");
+        assert!(error.to_string().contains("SPEECHEK_CONFIG_PATH"), "{error}");
+
+        // The test flavor's `%APPDATA%` fallback and its refusal name its own
+        // directory.
+        assert_eq!(
+            resolve_settings_path(BuildFlavor::Test, None, appdata, None)
+                .expect("the test document without an override"),
+            scratch.target_of(BuildFlavor::Test).join(SETTINGS_FILE_NAME)
+        );
+        let error = resolve_settings_path(BuildFlavor::Test, None, None, None)
+            .expect_err("no %APPDATA%");
+        assert!(error.to_string().contains("APPDATA"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(profile::defaults(BuildFlavor::Test).directory),
+            "the refusal names the flavor's directory: {error}"
+        );
+
+        // Production ignores the override, relative or absolute, and the
+        // executable path with it, and still needs `%APPDATA%`.
         for override_path in [
             Path::new("relative.json").as_os_str(),
             elsewhere.as_os_str(),
@@ -2965,7 +3245,8 @@ mod tests {
                 resolve_settings_path(
                     BuildFlavor::Production,
                     Some(override_path),
-                    appdata
+                    appdata,
+                    executable_arg,
                 )
                 .expect("production never reads the override"),
                 scratch
@@ -2977,20 +3258,30 @@ mod tests {
             BuildFlavor::Production,
             Some(elsewhere.as_os_str()),
             None,
+            None,
         )
         .expect_err("production still needs %APPDATA%");
         assert!(error.to_string().contains("APPDATA"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(profile::defaults(BuildFlavor::Production).directory),
+            "the refusal names the flavor's directory: {error}"
+        );
     }
 
     /// The preflight and the first run agree on one document per flavor: the
-    /// resolver names the flavor's file, the preflight reports it missing and
-    /// creates nothing, a stored port in that flavor's own directory is what it
-    /// reads, and the active flavor's first-run document loads with that
-    /// flavor's own chord and port.
+    /// resolver names the flavor's own file - beside the executable for the
+    /// development flavor, under `%APPDATA%` for production and test - the
+    /// preflight reports it missing and creates nothing, a stored port in that
+    /// flavor's document is what it reads, and the active flavor's first-run
+    /// document loads with that flavor's own chord and port.
     #[test]
     fn the_preflight_and_the_first_run_document_agree_per_flavor() {
         let scratch = Scratch::new("preflight-agreement");
         let appdata = Some(scratch.appdata().as_os_str());
+        let executable = scratch.executable();
+        let executable_arg = Some(executable.as_path());
         let named =
             "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"port\": 43118\r\n}\r\n";
 
@@ -2999,11 +3290,12 @@ mod tests {
             BuildFlavor::Development,
             BuildFlavor::Test,
         ] {
-            let path =
-                resolve_settings_path(flavor, None, appdata).expect("the flavor's document");
+            let path = resolve_settings_path(flavor, None, appdata, executable_arg)
+                .expect("the flavor's document");
             assert_eq!(path, scratch.target_of(flavor).join(SETTINGS_FILE_NAME));
             assert_eq!(
-                preflight_document_from(flavor, None, appdata).expect("a missing document"),
+                preflight_document_from(flavor, None, appdata, executable_arg)
+                    .expect("a missing document"),
                 None
             );
             assert!(
@@ -3014,14 +3306,30 @@ mod tests {
             fs::create_dir_all(scratch.target_of(flavor)).expect("the flavor's directory");
             fs::write(&path, named).expect("the document");
             assert_eq!(
-                preflight_document_from(flavor, None, appdata).expect("the document"),
+                preflight_document_from(flavor, None, appdata, executable_arg)
+                    .expect("the document"),
                 Some(path.clone())
             );
             assert_eq!(
-                preflight_port_from(flavor, None, appdata).expect("the stored port"),
+                preflight_port_from(flavor, None, appdata, executable_arg)
+                    .expect("the stored port"),
                 43118
             );
             assert_eq!(fs::read(&path).expect("the document"), named.as_bytes());
+        }
+
+        // The key container follows the resolved document: a development run
+        // keeps `secrets.bin` beside its own `settings.json`, never in the
+        // production or test profile.
+        let dev_document = scratch.dev_bin().join(SETTINGS_FILE_NAME);
+        let dev_vault = crate::secrets::secrets_path(&dev_document);
+        assert_eq!(dev_vault, scratch.dev_bin().join("secrets.bin"));
+        for flavor in [BuildFlavor::Production, BuildFlavor::Test] {
+            assert_ne!(
+                dev_vault,
+                crate::secrets::secrets_path(&scratch.target_of(flavor).join(SETTINGS_FILE_NAME)),
+                "the development vault is not the {flavor:?} vault"
+            );
         }
 
         // A clean profile for the active flavor: nothing there reads as the
@@ -3032,19 +3340,26 @@ mod tests {
         let fresh_appdata = Some(fresh.appdata().as_os_str());
         let flavor = profile::ACTIVE;
         let defaults = profile::defaults(flavor);
-        let path =
-            resolve_settings_path(flavor, None, fresh_appdata).expect("the active flavor's path");
+        let fresh_executable = active_executable(&fresh);
+        let path = resolve_settings_path(flavor, None, fresh_appdata, fresh_executable.as_deref())
+            .expect("the active flavor's path");
         assert_eq!(
-            preflight_port_from(flavor, None, fresh_appdata).expect("no document yet"),
+            path,
+            fresh.target_of(flavor).join(SETTINGS_FILE_NAME),
+            "the active flavor resolves the document its own source names"
+        );
+        assert_eq!(
+            preflight_port_from(flavor, None, fresh_appdata, fresh_executable.as_deref())
+                .expect("no document yet"),
             DEFAULT_PORT
         );
         assert!(create_default_if_missing(&path).expect("the first-run document"));
         assert!(!create_default_if_missing(&path).expect("an existing document"));
         assert_eq!(
-            preflight_port_from(flavor, None, fresh_appdata).expect("the first-run port"),
+            preflight_port_from(flavor, None, fresh_appdata, fresh_executable.as_deref())
+                .expect("the first-run port"),
             DEFAULT_PORT
         );
-
         let first_run = load_settings(&path).expect("the first-run document loads");
         assert_eq!(first_run.hotkey, defaults.hotkey);
         assert_eq!(first_run.port, defaults.port);

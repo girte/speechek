@@ -20,6 +20,8 @@ Get the latest installer from **[github.com/girte/speechek/releases/latest](http
 - Platform: **Windows 11 x64**. The **installer** UI is available in **English and Russian**; the app UI is currently Russian.
 - The installer is **not code-signed**. Windows SmartScreen or Smart App Control may warn you, or a restrictive policy may block the app from starting. There is no paid code-signing certificate yet.
 
+Pre-release **Development previews** are portable: they run by double-click with no installation, no shortcuts and no uninstall entry, and keep their own settings (`settings.json`) and encrypted keys (`secrets.bin`) beside their EXE instead of in `%APPDATA%\Speechek`. They are built with `scripts/prepare-preview.ps1` and confirmed by the owner before a release — see [Releasing](docs/releasing.md).
+
 ## Quick start
 
 1. Download the NSIS `*-setup.exe` asset from the releases page and run it. It installs for the current user — no administrator rights are required.
@@ -36,7 +38,7 @@ Get the latest installer from **[github.com/girte/speechek/releases/latest](http
 
 ## Privacy at a glance
 
-Speechek is cloud-based and needs internet access. Your speech is sent to Google for recognition. Gemini API keys are encrypted with Windows DPAPI for the current user in `secrets.bin` next to your settings file — not stored next to the executable and not in plaintext. Recordings are not saved as files. The full notes, including what the app can and cannot guarantee, are in the [user guide](docs/user-guide.md).
+Speechek is cloud-based and needs internet access. Your speech is sent to Google for recognition. In the installed app, Gemini API keys are encrypted with Windows DPAPI for the current user in `secrets.bin` next to your settings file in `%APPDATA%\Speechek` — never in plaintext. A portable Development preview keeps its own `settings.json` and `secrets.bin` beside its EXE instead. Recordings are not saved as files. The full notes, including what the app can and cannot guarantee, are in the [user guide](docs/user-guide.md).
 
 ## Documentation
 

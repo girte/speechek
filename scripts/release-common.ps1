@@ -13,9 +13,10 @@
         chain operators.
       * Hashing is done with .NET SHA-256, never a cmdlet that may be absent.
       * Child processes that need a modified environment receive a full
-        environment map; the caller's environment is never mutated, so the
-        release scripts cannot leak RUSTFLAGS or the VS developer variables
-        into the surrounding shell.
+        environment map that replaces the inherited child environment; the
+        caller's environment is never mutated, so the release scripts cannot
+        leak RUSTFLAGS or the VS developer variables into the surrounding
+        shell.
 #>
 
 function Get-SpeechekRepoRoot {
@@ -121,6 +122,10 @@ function Set-SpeechekProcessEnvironment {
     else {
         $target = $Psi.EnvironmentVariables
     }
+    # Every caller passes a complete map (normally New-SpeechekEnvironment);
+    # clear the inherited entries first so an explicit child environment can
+    # never silently keep a caller variable such as RUSTFLAGS.
+    $target.Clear()
     foreach ($key in $Environment.Keys) {
         $target[[string]$key] = [string]$Environment[$key]
     }

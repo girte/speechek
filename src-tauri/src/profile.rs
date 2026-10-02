@@ -1,6 +1,6 @@
-//! Build flavors: one compile-time table fixing the identity, the profile
-//! directory, the first-run launcher chord and the first-run loopback port of
-//! a build.
+//! Build flavors: one compile-time table fixing the identity, the location of
+//! the settings profile, the first-run launcher chord and the first-run
+//! loopback port of a build.
 //!
 //! A shipped executable is always [`BuildFlavor::Production`]; a debug build
 //! is a separate flavor, so a development or test run can never touch the
@@ -16,8 +16,9 @@
 //!
 //! * [`BuildFlavor::Production`] - the distributed shell:
 //!   `app.speechek.desktop`, `%APPDATA%/Speechek`, `F2`, port `4173`.
-//! * [`BuildFlavor::Development`] - a debug build that talks to the real
-//!   provider: `app.speechek.dev`, `%APPDATA%/Speechek-Dev`,
+//! * [`BuildFlavor::Development`] - a portable debug build that talks to the
+//!   real provider: `app.speechek.dev`, `settings.json` and `secrets.bin`
+//!   beside the executable it runs from (never `%APPDATA%`),
 //!   `Ctrl+Shift+F9`, port `4174`.
 //! * [`BuildFlavor::Test`] - a debug build with the local fake-provider
 //!   harness (`--features test-provider`): `app.speechek.test`,
@@ -38,11 +39,15 @@ pub(crate) enum BuildFlavor {
 }
 
 /// The values one flavor fixes: the bundle identifier and product name the
-/// shell runs under, the `%APPDATA%` directory its settings document lives in,
-/// and the launcher chord and loopback port its first-run document spells out.
+/// shell runs under, the `%APPDATA%` directory its settings document lives in
+/// for the flavors that keep one, and the launcher chord and loopback port its
+/// first-run document spells out.
 pub(crate) struct ProfileDefaults {
     pub(crate) identifier: &'static str,
     pub(crate) title: &'static str,
+    /// The `%APPDATA%` directory production and test keep their settings
+    /// document in; empty for the development flavor, which resolves beside
+    /// its executable instead.
     pub(crate) directory: &'static str,
     pub(crate) hotkey: &'static str,
     pub(crate) port: u16,
@@ -63,7 +68,10 @@ pub(crate) const fn defaults(flavor: BuildFlavor) -> ProfileDefaults {
         BuildFlavor::Development => ProfileDefaults {
             identifier: "app.speechek.dev",
             title: "Speechek Dev",
-            directory: "Speechek-Dev",
+            // The development flavor never resolves through `%APPDATA%`: its
+            // `settings.json` and `secrets.bin` live beside the executable it
+            // runs from, so no profile directory is named here.
+            directory: "",
             hotkey: "Ctrl+Shift+F9",
             port: 4174,
         },

@@ -53,8 +53,9 @@
 //! chord that cannot be registered at startup is not fatal: the shell runs with
 //! the launcher disabled and opens the window on the section that repairs it.
 //!
-//! Configuration lives in the active flavor's `%APPDATA%` directory
-//! (`%APPDATA%/Speechek` for the released shell): the settings document is read
+//! Configuration lives in the active flavor's profile: Production uses
+//! `%APPDATA%/Speechek`, Development uses the directory beside its executable,
+//! and Test uses its isolated profile or explicit test override. Settings are read
 //! once while the shell is starting up, and the key list travels in
 //! `secrets.bin` beside it, sealed for the current Windows user. A first run
 //! writes the annotated settings template only; keys arrive with the first explicit key apply

@@ -19,6 +19,8 @@ cargo build --manifest-path src-tauri\Cargo.toml --locked --no-default-features
 
 The debug executable appears at `src-tauri\target\debug\speechek.exe`.
 
+The debug build is **portable**: double-click `src-tauri\target\debug\speechek.exe` to run it — no installer, shortcuts, uninstall entry or registry write. The Development profile keeps its `settings.json` and `secrets.bin` beside that EXE (inside `src-tauri\target\debug`), separate from the installed production app, which keeps them under `%APPDATA%\Speechek`; the two profiles never read each other's files.
+
 For a release build, link the C runtime statically for that command only:
 
 ```bat
@@ -39,6 +41,8 @@ cargo test --manifest-path src-tauri\Cargo.toml --locked --no-default-features -
 ```
 
 The `test-provider` feature and the `SPEECHEK_TEST_PROVIDER_HTTP` / `SPEECHEK_TEST_PROVIDER_WSS` overrides exist **only in debug builds**. Use a temporary or absolute `%APPDATA%` path and fake keys. **Never** run automated checks with real keys or real speech, and never commit `settings.json`, `secrets.bin` or `keys.txt`.
+
+These checks must stay **GUI-free**: do not launch `cargo run`, a debug or release executable, or any visible-window scenario from an automated run. The visible-window smoke (overlay, tray, microphone, paste) is performed by hand by the owner. Portable previews handed to the owner are built with `scripts/prepare-preview.ps1` — see [docs/releasing.md](docs/releasing.md).
 
 ## Code layout
 

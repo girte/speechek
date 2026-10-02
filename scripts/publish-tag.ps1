@@ -7,10 +7,21 @@
     annotated release tag `vX.Y.Z` that .github/workflows/release.yml consumes:
 
         powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/publish-tag.ps1 `
-            -Version 0.2.0
+            -Version 0.2.1 `
+            -PreviewManifest <repo>/src-tauri/target/debug/preview-manifest.json `
+            -OwnerApproved
 
     The script refuses (without creating or pushing a tag) unless every condition
     holds:
+      * the owner-approval gate came first: -OwnerApproved is given and
+        -PreviewManifest is the absolute canonical path
+        `<repo>/src-tauri/target/debug/preview-manifest.json` of the Development
+        preview built by scripts/prepare-preview.ps1; that manifest records
+        schemaVersion 1, flavor `development`, `exe.file` `speechek.exe`, this
+        exact -Version and this HEAD, and the SHA-256 of the current
+        `src-tauri/target/debug/speechek.exe` still matches it - so a preview was
+        built for exactly these bytes and the owner confirmed it (all of this is
+        checked before the first GitHub API call);
       * the checkout is on `main`, the tracked tree is clean, the version mirrors
         all equal -Version, and the git identity is the public noreply handle
         (so no personal e-mail is embedded in the tag);
@@ -33,8 +44,10 @@
 
     The annotated tag message records exactly
     `candidate-run:<id> installer-sha256:<hex>`, and only that single tag ref is
-    pushed. Nothing downloaded from a run is executed and no local verification
-    report is consulted.
+    pushed. Nothing downloaded from a run is executed, and no local report or
+    installer smoke substitutes for the recorded owner approval: -OwnerApproved
+    is passed only after the owner confirms the exact preview handed off for this
+    source commit, and any change to the source or to the EXE invalidates it.
     The tag push is judged only by git's exit code: git writes its push progress
     to stderr, which Windows PowerShell 5.1 must not turn into a reported
     failure.
@@ -44,6 +57,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)][string]$Version,
+    [string]$PreviewManifest = '',
+    [switch]$OwnerApproved,
     [ValidateRange(1, 720)][int]$WaitMinutes = 150,
     [ValidateRange(1, 300)][int]$PollSeconds = 15
 )
@@ -213,7 +228,100 @@ if ($remoteTag -ne '') {
     throw "tag $tagName already exists on origin."
 }
 
-# ── 3. GitHub CLI and repository identity ──────────────────────────────────
+# ── 3. Owner preview approval (checked before any GitHub call) ──────────────
+
+# The release gate is the owner's manual smoke of the exact Development preview:
+# scripts/prepare-preview.ps1 builds src-tauri/target/debug/speechek.exe and
+# writes target/debug/preview-manifest.json next to it. Publishing requires that
+# the owner ran that double-click preview and confirmed it, which is recorded
+# here as -OwnerApproved together with the matching manifest. Every check below
+# runs before the first `gh` call, so a missing or stale approval can never
+# dispatch a candidate run or create a tag.
+if (-not $OwnerApproved) {
+    throw ("refusing to publish ${Version}: -OwnerApproved is required. Hand the " +
+           "Development preview to the owner with scripts/prepare-preview.ps1 and wait " +
+           "for an explicit confirmation of that exact build before publishing.")
+}
+
+$previewDir = Join-Path $repoRoot 'src-tauri\target\debug'
+$canonicalManifest = [System.IO.Path]::GetFullPath((Join-Path $previewDir 'preview-manifest.json'))
+
+if ([string]::IsNullOrWhiteSpace($PreviewManifest)) {
+    throw ("refusing to publish ${Version}: -PreviewManifest is required and must be the " +
+           "absolute canonical path '$canonicalManifest'.")
+}
+if (-not [System.IO.Path]::IsPathRooted($PreviewManifest)) {
+    throw ("refusing to publish ${Version}: -PreviewManifest '$PreviewManifest' is not " +
+           "absolute; expected '$canonicalManifest'.")
+}
+$manifestPath = [System.IO.Path]::GetFullPath($PreviewManifest)
+if ($manifestPath -ne $canonicalManifest) {
+    throw ("refusing to publish ${Version}: -PreviewManifest must be the canonical preview " +
+           "manifest '$canonicalManifest' (got '$manifestPath').")
+}
+if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+    throw ("refusing to publish ${Version}: preview manifest '$manifestPath' does not exist; " +
+           "run scripts/prepare-preview.ps1 and collect the owner's feedback first.")
+}
+
+$preview = $null
+try {
+    $preview = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+}
+catch {
+    throw "preview manifest '$manifestPath' is not valid JSON: $($_.Exception.Message)"
+}
+
+$previewProblems = @()
+$previewSchema = [string](Get-SpeechekJsonProperty $preview 'schemaVersion')
+if ($previewSchema -ne '1') {
+    $previewProblems += "schemaVersion is '$previewSchema', not 1"
+}
+$previewFlavor = [string](Get-SpeechekJsonProperty $preview 'flavor')
+if ($previewFlavor -ne 'development') {
+    $previewProblems += "flavor is '$previewFlavor', not development"
+}
+$previewExe = Get-SpeechekJsonProperty $preview 'exe'
+$previewExeFile = [string](Get-SpeechekJsonProperty $previewExe 'file')
+if ($previewExeFile -ne 'speechek.exe') {
+    $previewProblems += "exe.file is '$previewExeFile', not speechek.exe"
+}
+$previewVersion = [string](Get-SpeechekJsonProperty $preview 'version')
+if ($previewVersion -ne $Version) {
+    $previewProblems += "version is '$previewVersion' but -Version is '$Version'"
+}
+$previewCommit = [string](Get-SpeechekJsonProperty $preview 'commit')
+if ($previewCommit -notmatch '^[0-9a-f]{40}$') {
+    $previewProblems += "commit '$previewCommit' is not a full lowercase 40-hex commit SHA"
+}
+elseif ($previewCommit -ne $head) {
+    $previewProblems += "commit '$previewCommit' is not this checkout's HEAD '$head'"
+}
+$previewSha = [string](Get-SpeechekJsonProperty $previewExe 'sha256')
+if ($previewSha -notmatch '^[0-9a-f]{64}$') {
+    $previewProblems += "exe.sha256 '$previewSha' is not a lowercase 64-hex SHA-256"
+}
+if ($previewProblems.Count -gt 0) {
+    throw ("refusing to publish ${Version}: preview manifest '$manifestPath' is not a valid " +
+           "owner-preview handoff:`n  - " + ($previewProblems -join "`n  - "))
+}
+
+# A rebuilt or replaced preview EXE invalidates the approval recorded above.
+$previewExePath = Join-Path $previewDir 'speechek.exe'
+if (-not (Test-Path -LiteralPath $previewExePath -PathType Leaf)) {
+    throw ("refusing to publish ${Version}: preview executable '$previewExePath' does not " +
+           "exist; rebuild the preview with scripts/prepare-preview.ps1.")
+}
+$previewExeSha = Get-SpeechekSha256 -Path $previewExePath
+if ($previewExeSha -ne $previewSha) {
+    throw ("refusing to publish ${Version}: '$previewExePath' has SHA-256 $previewExeSha but " +
+           "the owner-approved manifest records $previewSha; the preview changed after the " +
+           "owner approved it - rebuild, hand off and let the owner re-confirm before publishing.")
+}
+
+Write-Host "Owner preview approval: $manifestPath (commit $previewCommit, exe SHA-256 $previewExeSha)"
+
+# ── 4. GitHub CLI and repository identity ──────────────────────────────────
 
 $ghPath = Resolve-SpeechekExecutable -Name 'gh'
 if (-not $ghPath) {
@@ -237,7 +345,7 @@ if ($repoId -notmatch '^[0-9]+$') {
     throw "could not read the numeric repository id for $slug (got '$repoId')."
 }
 
-# ── 4. Dispatch exactly one candidate run for this commit ──────────────────
+# ── 5. Dispatch exactly one candidate run for this commit ──────────────────
 
 # A fresh random requestId travels both as a dispatch input and (through the
 # workflow `run-name`) as this run's name, so a body-less response can still be
@@ -337,9 +445,9 @@ if ($runId -eq '') {
 Write-Host "Dispatched candidate run $runId for commit $head (requestId $requestId)"
 if (-not [string]::IsNullOrWhiteSpace($runHtmlUrl)) { Write-Host "Run: $runHtmlUrl" }
 
-# ── 5. Wait for that exact run and require success ─────────────────────────
+# ── 6. Wait for that exact run and require success ─────────────────────────
 
-# The $deadline set when the dispatch was resolved (section 4) bounds this
+# The $deadline set when the dispatch was resolved (section 5) bounds this
 # completion wait as well.
 $runEndpoint = "repos/$slug/actions/runs/$runId"
 $consecutiveFailures = 0
@@ -399,7 +507,7 @@ if ($failures.Count -gt 0) {
     throw "candidate run $runId does not satisfy the publication policy; no tag was created ($runHtmlUrl)."
 }
 
-# ── 6. The artifact must exist, be unexpired and carry this commit ─────────
+# ── 7. The artifact must exist, be unexpired and carry this commit ─────────
 
 $artifactName = "windows-x64-$head"
 $artifactsJson = Get-SpeechekGhApiJson "repos/$slug/actions/runs/$runId/artifacts?per_page=100"
@@ -422,7 +530,7 @@ if ([string](Get-SpeechekJsonProperty $artifactRun 'head_sha') -ne $head) {
     throw "artifact '$artifactName' was produced from a different commit."
 }
 
-# ── 7. Download and validate the artifact bytes ────────────────────────────
+# ── 8. Download and validate the artifact bytes ────────────────────────────
 
 $tempDir = Join-Path ([System.IO.Path]::GetTempPath()) ('speechek-tag-' + [System.Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempDir | Out-Null
@@ -513,7 +621,7 @@ finally {
     Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# ── 8. Annotated tag and single-ref push ───────────────────────────────────
+# ── 9. Annotated tag and single-ref push ───────────────────────────────────
 
 $tagMessage = "Speechek $Version release`n`ncandidate-run:$runId installer-sha256:$installerSha"
 try {

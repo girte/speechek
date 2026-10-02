@@ -49,6 +49,7 @@
     "scripts/build-test-installer.ps1",
     "scripts/check-release.ps1",
     "scripts/collect-notices.ps1",
+    "scripts/prepare-preview.ps1",
     "scripts/public-files.json",
     "scripts/publish-tag.ps1",
     "scripts/release-common.ps1",
