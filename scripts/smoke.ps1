@@ -1734,6 +1734,8 @@ try {
                 Invoke-FixtureSelfTest -ListenPort $listenPort -HttpBase $httpBase
             }
             'FakeProvider' {
+                $decision = Assert-SmokeOwnership
+                if ($decision -eq 'fresh') { Write-SmokeOwnership }
                 $listenPort = if ($Port -gt 0) { $Port } else { Get-SmokeFreePort }
                 $httpBase = Start-SmokeFixtureServer -ListenPort $listenPort
                 $startedFixtureServer = $true
