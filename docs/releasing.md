@@ -2,7 +2,7 @@
 
 [README](../README.md) · [Contributing](../CONTRIBUTING.md) · [User guide](user-guide.md)
 
-This document describes how official Speechek builds are produced, verified and published. Release artifacts are built by CI and only a verified candidate is ever published; a release is never assembled by hand from a locally built executable.
+This document describes how official Speechek builds are produced, verified and published. Release artifacts are built by the on-demand candidate workflow and only that verified candidate is ever published; a release is never assembled by hand from a locally built executable.
 
 ## Pinned toolchain
 
@@ -54,9 +54,11 @@ The check verifies the three version mirrors and the tag, the locked dependency 
 
 ## Candidate workflow
 
-`.github/workflows/candidate.yml` runs on pushes to `main`, pull requests and `workflow_dispatch` on `windows-2022` (x64) with read-only repository permissions. It runs the checks and tests with the `test-provider` feature and fake keys, the source and license checks, and then the release helper. It uploads an Actions artifact named `windows-x64-<full commit SHA>` containing the setup executable, `SHA256SUMS.txt` and `release-manifest.json`, with 30-day retention.
+`.github/workflows/candidate.yml` runs only when dispatched manually (`workflow_dispatch`) from `main`, on `windows-2022` (x64) with read-only repository permissions. This repository has no automatic CI: no branch or pull-request event starts any job. The dispatch requires a `commit` input that must be the full SHA of the dispatched `main` commit (`github.sha`); any other value, or a dispatch from another branch, fails the run before anything is built.
 
-Only a successful run triggered by a push to `main` can be the source of a public release. Artifacts produced for pull requests are never accepted for publication.
+The run executes the source and license checks (`scripts/check-release.ps1`) and then the release helper (`scripts/build-release.ps1`), which produces the static-CRT x64 executable and the NSIS installer. The installer is only built, never executed or installed by the workflow, and no debug, Test-profile or fake-provider build exists there. The run uploads an Actions artifact named `windows-x64-<full commit SHA>` containing the setup executable, `SHA256SUMS.txt` and `release-manifest.json`, with 30-day retention.
+
+Only a successful dispatch on `main` can be the source of a public release. The artifact is bound to the exact commit it was built from, and a pull-request or locally installed build is never accepted for publication.
 
 ### Release manifest
 
@@ -82,22 +84,24 @@ It contains no host paths, user names or environment contents. `SHA256SUMS.txt` 
 
 ## Publishing a tag
 
-The tag pipeline accepts only a production manifest whose `runId` equals the run named in the annotated tag, so verification is recorded in the tag itself.
-
-1. From a successful `main` candidate run, download the same installer and manifest and verify the SHA-256.
-2. Record the verification locally (tested commit/run/installer SHA-256, current Windows build, checklist), without speech data, keys or profile contents.
-3. Create the annotated tag and push only that tag:
+`scripts/publish-tag.ps1` is the single entry point for a release. From a clean `main` checkout it dispatches exactly one candidate run, waits for it and only then tags:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/publish-tag.ps1 `
-  -Version 0.2.0 -CandidateRun <run-id> -VerificationReport <absolute-path>
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/publish-tag.ps1 -Version 0.2.0
 ```
 
-The tag message must contain `candidate-run:<id> installer-sha256:<hex>`. `scripts/publish-tag.ps1` verifies the clean `main` branch, the exact commit/run/artifact and a completed checklist, then creates and pushes the annotated `vX.Y.Z` tag. It does not fill in the verification for you. If the candidate artifact has expired, run a new candidate and re-verify that file; a stale report is not carried over.
+The script:
+
+1. requires the checkout to be on `main` at the version it publishes, the version mirrors to equal `-Version`, and the tracked tree to be clean;
+2. dispatches `.github/workflows/candidate.yml` once with the `commit` input set to that `main` HEAD (the GitHub workflow-dispatch API) and waits for the run to conclude;
+3. accepts only a successful run that belongs to this repository, uses the candidate workflow, is a `workflow_dispatch` event on `main` with a `head_sha` equal to the published commit, and whose unexpired `windows-x64-<commit>` artifact carries a production manifest whose installer bytes match both the manifest and `SHA256SUMS.txt`;
+4. creates the annotated tag `vX.Y.Z`, whose message records `candidate-run:<id> installer-sha256:<hex>`, and pushes only that tag.
+
+The tag pipeline accepts only that recorded candidate, so the published file is exactly the one the candidate build produced and is never rebuilt. No local verification report and no local installer smoke is required: installing a candidate by hand is not a release gate. If the candidate run fails, or its artifact has expired before the tag is pushed, resolve the problem and dispatch a new candidate; a tag is never created for a file that was not verified.
 
 ## Release workflow
 
-`.github/workflows/release.yml` runs only on a push of a single `v[0-9]*` tag, never on pull requests. It validates that the tag is `vX.Y.Z`, that all manifests agree, that the CHANGELOG has a section for the version, and that the tag commit is on `main`. Through the GitHub API it then confirms that the named candidate run belongs to the current public repository, uses the candidate workflow, was an event `push` to `main`, concluded `success`, has a `head_sha` equal to the peeled tag commit, and still has the `windows-x64-<SHA>` artifact, unexpired.
+`.github/workflows/release.yml` runs only on a push of a single `v[0-9]*` tag, never on pull requests. It validates that the tag is `vX.Y.Z`, that all manifests agree, that the CHANGELOG has a section for the version, and that the tag commit is on `main`. Through the GitHub API it then confirms that the candidate run named in the annotated tag belongs to the current public repository, uses the candidate workflow, was a `workflow_dispatch` event on `main`, concluded `success`, has a `head_sha` equal to the peeled tag commit, and still has the `windows-x64-<SHA>` artifact, unexpired.
 
 The publish job receives `contents:write` and `actions:read` only after those checks pass. It builds release notes from the matching CHANGELOG section, adds the fixed footer (Windows 11 x64, install, manual-download update, unsigned, accepted hang risks, SHA-256), attaches the exact same setup executable and checksum, and publishes the release as latest within the tag workflow. Downloaded scripts are never executed — only bytes and documents are validated. If any check fails, the release is not rebuilt from scratch and no substitute file is uploaded.
 

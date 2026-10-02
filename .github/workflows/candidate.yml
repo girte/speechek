@@ -1,29 +1,37 @@
 name: candidate
 
-# Candidate check for the public release pipeline.
+# On-demand production candidate build for the public release pipeline.
 #
-# Triggers: pushes to main, pull requests and manual dispatch.
-# Permissions: read-only. This workflow never publishes, never reads secrets
-# and never installs the production application.
+# Trigger: `workflow_dispatch` only, started from `main`, with the required
+# `commit` input set to the full SHA of that exact `main` commit (`github.sha`).
+# This repository runs no automatic CI: there are no branch or pull-request
+# triggers, and the release helper dispatches a candidate when a release is
+# prepared.
 #
-# The production artifact is only *built* here (an x64 NSIS installer plus its
-# checksum and manifest). It is uploaded as the Actions artifact
-# `windows-x64-<full commit SHA>`. Only a successful run triggered by a push to
-# main is eligible as the source of a public release; pull-request artifacts
-# are never accepted for publication (see .github/workflows/release.yml).
+# The run performs the source/license/static checks and then one deterministic
+# production build (x64 PE with the static CRT, followed by
+# `tauri bundle --bundles nsis`). It uploads the exact production setup
+# executable plus `SHA256SUMS.txt` and `release-manifest.json` as the Actions
+# artifact `windows-x64-<full commit SHA>`, with 30-day retention. The
+# installer is never executed or installed here and no debug, Test-profile or
+# fake-provider staging exists in this workflow.
 #
-# The NSIS installer is a Windows 11 x64 product. The GitHub-hosted runner is
-# Windows Server, which is never claimed to be a supported production platform:
-# the only installer exercised on this runner is the isolated Test fixture
-# (`SPEECHEK_TEST_INSTALLER=1`, identifier `app.speechek.test`), and the
-# production precheck (Windows 11 build >= 22000, VER_NT_WORKSTATION) is not
-# weakened anywhere. The fixture artifacts are never uploaded or published.
+# Permissions are read-only; no secrets are read and nothing is published. Only
+# a successful dispatch run on `main` whose artifact belongs to exactly the
+# commit named in the annotated tag can be the source of a public release (see
+# .github/workflows/release.yml).
+#
+# The runner is Windows Server, which is never claimed to be a supported
+# production platform: it only builds the artifact. The Windows 11 x64 gate
+# lives in the installer itself and is not weakened by this workflow.
 
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
+    inputs:
+      commit:
+        description: "Full 40-hex SHA of the main commit to build (must equal the dispatched commit)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -39,10 +47,42 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 120
     steps:
+      # The dispatch contract is checked before anything is built: the run must
+      # come from `main` and the required input must be exactly the commit this
+      # dispatch runs at (`github.sha`). Any other value fails here.
+      - name: Validate dispatch contract
+        shell: pwsh
+        env:
+          REQUESTED_COMMIT: ${{ inputs.commit }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $requested = [string]$env:REQUESTED_COMMIT
+          if ($requested -notmatch '^[0-9a-f]{40}$') {
+            throw "the 'commit' input '$requested' is not a full lowercase 40-hex commit SHA."
+          }
+          if ($requested -ne [string]$env:GITHUB_SHA) {
+            throw "the 'commit' input '$requested' does not equal the dispatched commit '$env:GITHUB_SHA'."
+          }
+          if ([string]$env:GITHUB_REF -ne 'refs/heads/main') {
+            throw "the candidate workflow must be dispatched from 'main' (got '$env:GITHUB_REF')."
+          }
+          Write-Host "candidate accepted: $requested on $env:GITHUB_REF"
+
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Confirm checked-out commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = (& git rev-parse HEAD | Out-String).Trim()
+          if ($head -ne [string]$env:GITHUB_SHA) {
+            throw "checked out commit '$head' does not equal the dispatched commit '$env:GITHUB_SHA'."
+          }
 
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
@@ -57,79 +97,16 @@ jobs:
           rustc --version
           rustc -vV
 
-      - name: Resolve application version
-        id: version
-        shell: pwsh
-        run: |
-          $conf = Get-Content 'src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json
-          $version = [string]$conf.version
-          if ($version -notmatch '^\d+\.\d+\.\d+$') {
-            throw "src-tauri/tauri.conf.json has an unexpected version '$version'."
-          }
-          "version=$version" >> $env:GITHUB_OUTPUT
-
-      - name: Install JS dependencies (frozen lockfile)
-        run: bun install --frozen-lockfile
-
-      # Debug checks and tests only: test-provider is enabled and no RUSTFLAGS
-      # (no static CRT) is applied to debug artifacts. Tests use fake keys.
-      - name: cargo check
-        run: cargo check --manifest-path src-tauri/Cargo.toml --locked --no-default-features
-
-      - name: cargo test (test-provider, fake keys)
-        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --no-default-features --features test-provider
-
+      # Source, license and static gates: version mirrors, locked graph and
+      # notices, public file manifest, no test-provider/custom-protocol, index
+      # hygiene and a clean tracked tree.
       - name: Source and license checks
         shell: pwsh
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/check-release.ps1
 
-      # ------------------------------------------------------------------
-      # Test fixture on the Server runner. This is the only installer that is
-      # ever exercised here; its payload carries SPEECHEK_TEST_INSTALLER=1 and
-      # the Test identity, so the production Windows 11 gate stays untouched.
-      # ------------------------------------------------------------------
-      - name: Build Test fixture installer (Server, test-only)
-        shell: pwsh
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build-test-installer.ps1 -Version ${{ steps.version.outputs.version }}
-
-      - name: Assert the fixture is the Test identity only
-        shell: pwsh
-        run: |
-          $path = "src-tauri/target/debug/speechek-test-fixture-${{ steps.version.outputs.version }}.json"
-          $manifest = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
-          if ([string]$manifest.identifier -ne 'app.speechek.test') {
-            throw "fixture identifier '$($manifest.identifier)' is not app.speechek.test."
-          }
-          if ([string]$manifest.productName -ne 'Speechek Test') {
-            throw "fixture product '$($manifest.productName)' is not 'Speechek Test'."
-          }
-          if ([string]$manifest.flavor -ne 'test') {
-            throw "fixture flavor '$($manifest.flavor)' is not 'test'."
-          }
-
-      - name: Smoke - ownership gate self-test
-        shell: pwsh
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke.ps1 -Scenario GateSelfTest
-
-      - name: Smoke - fixture provider contract
-        shell: pwsh
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke.ps1 -Scenario FixtureSelfTest
-
-      - name: Smoke - fake provider end to end (Test executable)
-        shell: pwsh
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke.ps1 -Scenario FakeProvider
-
-      - name: Smoke - Test installer fresh install (Server, test-only)
-        shell: pwsh
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke.ps1 -Scenario FreshInstall -Fixture "src-tauri/target/debug/speechek-test-fixture-${{ steps.version.outputs.version }}.json"
-
-      - name: Smoke - Test installer uninstall keeping data
-        shell: pwsh
-        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke.ps1 -Scenario UninstallKeep
-
-      # ------------------------------------------------------------------
-      # Production artifact. Built only; it is never installed here.
-      # ------------------------------------------------------------------
+      # One deterministic production build: static-CRT x64 executable plus the
+      # NSIS installer, its SHA256SUMS.txt and release-manifest.json. The
+      # installer is only built, never run.
       - name: Build release executable and NSIS installer
         shell: pwsh
         run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1
@@ -150,6 +127,12 @@ jobs:
           $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
           if ([string]$manifest.flavor -ne 'production') {
             throw "release manifest flavor '$($manifest.flavor)' is not 'production'."
+          }
+          if ([string]$manifest.commit -ne [string]$env:GITHUB_SHA) {
+            throw "release manifest commit '$($manifest.commit)' does not equal the dispatched commit '$env:GITHUB_SHA'."
+          }
+          if ([string]$manifest.runId -ne [string]$env:GITHUB_RUN_ID) {
+            throw "release manifest runId '$($manifest.runId)' does not equal this run '$env:GITHUB_RUN_ID'."
           }
           $installerName = [string]$manifest.installer.file
           $installerPath = Join-Path $bundle $installerName

@@ -3,6 +3,10 @@ name: Release
 # Publishes a verified candidate artifact. The tag pipeline never rebuilds:
 # it downloads the exact candidate-produced installer, validates it against the
 # annotated tag, and only then publishes it. See docs/releasing.md.
+#
+# The tagged candidate must be a manual workflow_dispatch of candidate.yml on
+# `main` (dispatched by scripts/publish-tag.ps1 with the full commit SHA in its
+# `commit` input); push and pull-request runs are never eligible.
 
 on:
   push:
@@ -117,8 +121,8 @@ jobs:
           Write-Host "tag $tag validated: commit $tagCommit, candidate run $candidateRun, installer $installerSha"
 
       # GitHub API: the named run must belong to this repository, use the
-      # candidate workflow, be a successful push to main, and still hold the
-      # unexpired artifact for exactly this commit SHA.
+      # candidate workflow, be a successful workflow_dispatch of main, and still
+      # hold the unexpired artifact for exactly this commit SHA.
       - name: Verify candidate run and artifact
         id: candidate
         env:
@@ -143,7 +147,7 @@ jobs:
           $fail = @()
           if ([string]$run.repository.id -ne $repoId) { $fail += "run belongs to repository id $($run.repository.id), expected $repoId" }
           if ([string]$run.path -ne '.github/workflows/candidate.yml') { $fail += "run workflow '$($run.path)' is not candidate.yml" }
-          if ([string]$run.event -ne 'push') { $fail += "run event '$($run.event)' is not push" }
+          if ([string]$run.event -ne 'workflow_dispatch') { $fail += "run event '$($run.event)' is not workflow_dispatch" }
           if ([string]$run.head_branch -ne 'main') { $fail += "run branch '$($run.head_branch)' is not main" }
           if ([string]$run.status -ne 'completed') { $fail += "run status '$($run.status)' is not completed" }
           if ([string]$run.conclusion -ne 'success') { $fail += "run conclusion '$($run.conclusion)' is not success" }
