@@ -152,6 +152,10 @@ $cargoEnvironment = New-SpeechekEnvironment @{}
 foreach ($key in $vs.Environment.Keys) { $cargoEnvironment[$key] = $vs.Environment[$key] }
 $cargoEnvironment['RUSTFLAGS'] = '-C target-feature=+crt-static'
 if ($rustOverride) { $cargoEnvironment['RUSTUP_TOOLCHAIN'] = $rustOverride }
+$bundleEnvironment = New-SpeechekEnvironment @{}
+foreach ($key in $vs.Environment.Keys) { $bundleEnvironment[$key] = $vs.Environment[$key] }
+if ($rustOverride) { $bundleEnvironment['RUSTUP_TOOLCHAIN'] = $rustOverride }
+[void]$bundleEnvironment.Remove('RUSTFLAGS')
 
 Write-Host '-- cargo build --locked --release --no-default-features'
 $cargoExit = Invoke-SpeechekProcess -FilePath $cargoExe `
@@ -191,7 +195,7 @@ function Invoke-SpeechekBundle {
     Write-Host '-- tauri bundle --bundles nsis --no-binary-patching --no-sign --ci'
     $exit = Invoke-SpeechekProcess -FilePath $bunExe `
         -Arguments @('run', 'tauri', 'bundle', '--bundles', 'nsis', '--no-binary-patching', '--no-sign', '--ci') `
-        -WorkingDirectory $repoRoot -Environment $vs.Environment
+        -WorkingDirectory $repoRoot -Environment $bundleEnvironment
     if ($exit -ne 0) { throw "tauri bundle failed with exit code $exit." }
 }
 
@@ -221,6 +225,7 @@ if (-not (Test-SpeechekBytesEqual $cargoSnapshot $cargoAfter)) {
     }
 }
 
+Assert-SpeechekCleanTree $repoRoot
 # 9. Locate the real installer and write the checksum + manifest.
 if (-not (Test-Path -LiteralPath $bundleOutDir)) { throw "the bundle output directory was not produced: $bundleOutDir" }
 $expectedInstaller = Join-Path $bundleOutDir ("Speechek_{0}_x64-setup.exe" -f $version)
