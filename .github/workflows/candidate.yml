@@ -1,9 +1,13 @@
 name: candidate
+run-name: "release-${{ inputs.requestId }}"
 
 # On-demand production candidate build for the public release pipeline.
 #
 # Trigger: `workflow_dispatch` only, started from `main`, with the required
-# `commit` input set to the full SHA of that exact `main` commit (`github.sha`).
+# `commit` input set to the full SHA of that exact `main` commit (`github.sha`)
+# and a required unique `requestId` (32 lowercase hex). The run name is
+# `release-<requestId>` (see run-name above), so scripts/publish-tag.ps1 can
+# correlate this run even if the dispatch API answers HTTP 204 without a run id.
 # This repository runs no automatic CI: there are no branch or pull-request
 # triggers, and the release helper dispatches a candidate when a release is
 # prepared.
@@ -32,6 +36,10 @@ on:
         description: "Full 40-hex SHA of the main commit to build (must equal the dispatched commit)"
         required: true
         type: string
+      requestId:
+        description: "Unique correlation token: 32 lowercase hex; the run is named release-<requestId>"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -48,17 +56,25 @@ jobs:
     timeout-minutes: 120
     steps:
       # The dispatch contract is checked before anything is built: the run must
-      # come from `main` and the required input must be exactly the commit this
-      # dispatch runs at (`github.sha`). Any other value fails here.
+      # come from `main`, the required `commit` input must be exactly the commit
+      # this dispatch runs at (`github.sha`), and the required `requestId` input
+      # must be 32 lowercase hex - it is already part of this run's name
+      # (`release-<requestId>`), which is how scripts/publish-tag.ps1 correlates
+      # a dispatch response that carries no run id. Any other value fails here.
       - name: Validate dispatch contract
         shell: pwsh
         env:
           REQUESTED_COMMIT: ${{ inputs.commit }}
+          REQUESTED_REQUEST_ID: ${{ inputs.requestId }}
         run: |
           $ErrorActionPreference = 'Stop'
           $requested = [string]$env:REQUESTED_COMMIT
           if ($requested -notmatch '^[0-9a-f]{40}$') {
             throw "the 'commit' input '$requested' is not a full lowercase 40-hex commit SHA."
+          }
+          $requestId = [string]$env:REQUESTED_REQUEST_ID
+          if ($requestId -notmatch '^[0-9a-f]{32}$') {
+            throw "the 'requestId' input '$requestId' is not 32 lowercase hex characters."
           }
           if ($requested -ne [string]$env:GITHUB_SHA) {
             throw "the 'commit' input '$requested' does not equal the dispatched commit '$env:GITHUB_SHA'."
@@ -66,7 +82,7 @@ jobs:
           if ([string]$env:GITHUB_REF -ne 'refs/heads/main') {
             throw "the candidate workflow must be dispatched from 'main' (got '$env:GITHUB_REF')."
           }
-          Write-Host "candidate accepted: $requested on $env:GITHUB_REF"
+          Write-Host "candidate accepted: $requested on $env:GITHUB_REF as release-$requestId"
 
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

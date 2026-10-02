@@ -17,9 +17,13 @@
       * the tag vX.Y.Z does not exist locally or on origin yet - checked before
         anything is dispatched;
       * POST /repos/{owner}/{repo}/actions/workflows/candidate.yml/dispatches for
-        ref `main` with input commit=<HEAD> answers HTTP 200 with a JSON body
-        carrying workflow_run_id (any other status or body aborts the script; no
-        run is inferred and no previous/"latest" candidate is ever reused);
+        ref `main` with inputs commit=<HEAD> and a fresh unique requestId is sent
+        exactly once; the documented HTTP 200 body with workflow_run_id is used
+        when present, and the observed HTTP 204 empty body is recovered by
+        locating the single run named `release-<requestId>` through the
+        workflow-runs API (repository, workflow path, event, branch and head_sha
+        re-checked) - a missing, ambiguous or mismatched run aborts the script,
+        no run is inferred, and no previous/"latest" candidate is ever reused;
       * that exact run belongs to this repository (repository id), runs
         .github/workflows/candidate.yml, is a workflow_dispatch of `main` that
         concluded success at exactly this HEAD, and still holds the unexpired
@@ -78,6 +82,62 @@ function Get-SpeechekGhApiJson {
     }
     catch {
         throw "gh api $Endpoint returned invalid JSON: $($_.Exception.Message)"
+    }
+}
+
+# Locates the single candidate run carrying this invocation's unique requestId
+# in its run name (`release-<requestId>`). Used when the dispatch API returns no
+# workflow_run_id (the observed HTTP 204 empty body, or an unusable 200 body).
+# The listing is filtered to this workflow, `workflow_dispatch`, `main` and the
+# exact head commit; only an exact display_title match counts. Zero matches keep
+# polling until the bounded $Deadline, more than one match is an error, and a
+# run is never chosen by recency.
+function Find-SpeechekCandidateRun {
+    param(
+        [Parameter(Mandatory = $true)][string]$RequestId,
+        [Parameter(Mandatory = $true)][string]$HeadSha,
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [Parameter(Mandatory = $true)][int]$PollSeconds
+    )
+    $expectedTitle = 'release-' + $RequestId
+    $endpoint = "repos/$slug/actions/workflows/candidate.yml/runs" +
+                "?event=workflow_dispatch&branch=main&head_sha=$HeadSha&per_page=100"
+    $consecutiveFailures = 0
+    while ($true) {
+        $listed = $false
+        $runs = @()
+        try {
+            $runsJson = Get-SpeechekGhApiJson $endpoint
+            $runs = @(Get-SpeechekJsonProperty $runsJson 'workflow_runs' | Where-Object { $null -ne $_ })
+            $listed = $true
+            $consecutiveFailures = 0
+        }
+        catch {
+            $consecutiveFailures++
+            if ($consecutiveFailures -ge 5) {
+                throw "could not list candidate runs for '$expectedTitle' five times in a row: $($_.Exception.Message)"
+            }
+            Write-Warning "listing candidate runs failed (attempt $consecutiveFailures): $($_.Exception.Message)"
+        }
+        if ($listed) {
+            # Exact, case-sensitive token match: the requestId is only ever
+            # produced by this script, so no other run can carry this name.
+            $titleMatches = @($runs | Where-Object { [string](Get-SpeechekJsonProperty $_ 'display_title') -ceq $expectedTitle })
+            if ($titleMatches.Count -eq 1) {
+                return $titleMatches[0]
+            }
+            if ($titleMatches.Count -gt 1) {
+                throw ("found $($titleMatches.Count) candidate runs named '$expectedTitle' at $HeadSha; " +
+                       "refusing to guess which one to tag. No tag was created.")
+            }
+        }
+        if ((Get-Date) -ge $Deadline) {
+            throw ("no candidate run named '$expectedTitle' (workflow_dispatch, main, head_sha $HeadSha) " +
+                   "appeared before the wait window expired; no tag was created. The dispatch may still " +
+                   "start a run later; do not reuse this invocation - dispatch a new candidate instead.")
+        }
+        Write-Host "waiting for candidate run '$expectedTitle' to appear..."
+        Start-Sleep -Seconds $PollSeconds
     }
 }
 
@@ -148,9 +208,18 @@ if ($repoId -notmatch '^[0-9]+$') {
 
 # ── 4. Dispatch exactly one candidate run for this commit ──────────────────
 
+# A fresh random requestId travels both as a dispatch input and (through the
+# workflow `run-name`) as this run's name, so a body-less response can still be
+# correlated to exactly this invocation.
+$requestId = [System.Guid]::NewGuid().ToString('N')
+$runDisplayTitle = 'release-' + $requestId
+
 $payload = @{
     ref    = 'main'
-    inputs = @{ commit = $head }
+    inputs = @{
+        commit    = $head
+        requestId = $requestId
+    }
 } | ConvertTo-Json -Depth 4 -Compress
 
 $payloadPath = Join-Path ([System.IO.Path]::GetTempPath()) ('speechek-dispatch-' + [System.Guid]::NewGuid().ToString('N') + '.json')
@@ -184,13 +253,17 @@ if ($blankMatches.Count -gt 0) {
     $bodyText = $response.Substring($lastBlank.Index + $lastBlank.Length)
 }
 
-if ($statusCode -ne '200') {
-    throw ("the workflow dispatch API answered HTTP $statusCode instead of HTTP 200, so no " +
-           "workflow run id was returned; no tag was created. A successful dispatch is HTTP 200 " +
-           "with a JSON body (GitHub REST API: workflows, create a workflow dispatch event). " +
-           "Response body:`n$bodyText")
+if ($statusCode -ne '200' -and $statusCode -ne '204') {
+    throw ("the workflow dispatch API answered HTTP $statusCode; expected HTTP 200 with a " +
+           "workflow_run_id body or HTTP 204 with no body, so no candidate run could be " +
+           "correlated and no tag was created. Response body:`n$bodyText")
 }
 
+# The documented success response is HTTP 200 with workflow_run_id, but the real
+# endpoint has been observed answering HTTP 204 with an empty body. Use the
+# returned id only when it is present and well formed; otherwise locate exactly
+# the run this invocation created by its unique name - never a "latest" or
+# otherwise guessed run.
 $dispatchJson = $null
 try {
     if (-not [string]::IsNullOrWhiteSpace($bodyText)) {
@@ -198,26 +271,46 @@ try {
     }
 }
 catch {
-    throw "the dispatch response body is not valid JSON: $($_.Exception.Message). Body:`n$bodyText"
-}
-$runId = [string](Get-SpeechekJsonProperty $dispatchJson 'workflow_run_id')
-if ($runId -notmatch '^[0-9]+$') {
-    throw ("the dispatch response carries no usable workflow_run_id (got '$runId'); no run is " +
-           "inferred and no tag was created. Response body:`n$bodyText")
-}
-$runUrl = [string](Get-SpeechekJsonProperty $dispatchJson 'run_url')
-$runHtmlUrl = [string](Get-SpeechekJsonProperty $dispatchJson 'html_url')
-if ($runUrl -notmatch ('/runs/' + [regex]::Escape($runId) + '$')) {
-    throw "the dispatch response run_url '$runUrl' does not reference run id $runId; no tag was created."
+    Write-Warning "the dispatch response body is not valid JSON; correlating by requestId instead: $($_.Exception.Message)"
 }
 
-Write-Host "Dispatched candidate run $runId for commit $head"
+$returnedRunId = ''
+if ($null -ne $dispatchJson) {
+    $returnedRunId = [string](Get-SpeechekJsonProperty $dispatchJson 'workflow_run_id')
+}
+$runId = ''
+$runHtmlUrl = ''
+if ($returnedRunId -match '^[0-9]+$') {
+    $runUrl = [string](Get-SpeechekJsonProperty $dispatchJson 'run_url')
+    if ($runUrl -notmatch ('/runs/' + [regex]::Escape($returnedRunId) + '$')) {
+        throw "the dispatch response run_url '$runUrl' does not reference run id $returnedRunId; no tag was created."
+    }
+    $runId = $returnedRunId
+    $runHtmlUrl = [string](Get-SpeechekJsonProperty $dispatchJson 'html_url')
+}
+else {
+    Write-Host ("the dispatch response returned no usable workflow_run_id (HTTP $statusCode); " +
+                "correlating the run by requestId $requestId instead.")
+}
+
+$deadline = (Get-Date).AddMinutes($WaitMinutes)
+if ($runId -eq '') {
+    $dispatchedRun = Find-SpeechekCandidateRun -RequestId $requestId -HeadSha $head -Deadline $deadline -PollSeconds $PollSeconds
+    $runId = [string](Get-SpeechekJsonProperty $dispatchedRun 'id')
+    if ($runId -notmatch '^[0-9]+$') {
+        throw "the correlated candidate run carries no usable id (got '$runId'); no tag was created."
+    }
+    $runHtmlUrl = [string](Get-SpeechekJsonProperty $dispatchedRun 'html_url')
+}
+
+Write-Host "Dispatched candidate run $runId for commit $head (requestId $requestId)"
 if (-not [string]::IsNullOrWhiteSpace($runHtmlUrl)) { Write-Host "Run: $runHtmlUrl" }
 
 # ── 5. Wait for that exact run and require success ─────────────────────────
 
+# The $deadline set when the dispatch was resolved (section 4) bounds this
+# completion wait as well.
 $runEndpoint = "repos/$slug/actions/runs/$runId"
-$deadline = (Get-Date).AddMinutes($WaitMinutes)
 $consecutiveFailures = 0
 $run = $null
 while ($true) {
@@ -266,6 +359,9 @@ if ([string](Get-SpeechekJsonProperty $run 'head_branch') -ne 'main') {
 }
 if ([string](Get-SpeechekJsonProperty $run 'head_sha') -ne $head) {
     $failures += "the run head_sha '$([string](Get-SpeechekJsonProperty $run 'head_sha'))' is not this checkout's HEAD '$head'"
+}
+if ([string](Get-SpeechekJsonProperty $run 'display_title') -cne $runDisplayTitle) {
+    $failures += "the run display_title '$([string](Get-SpeechekJsonProperty $run 'display_title'))' is not this dispatch's '$runDisplayTitle' (requestId $requestId)"
 }
 if ($failures.Count -gt 0) {
     foreach ($failure in $failures) { Write-Host "FAIL: $failure" }
