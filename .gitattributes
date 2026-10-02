@@ -1,0 +1,13 @@
+# Normalize line endings: LF for text, CRLF only for Windows scripts.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets must never receive text/line-ending conversion.
+*.png binary
+*.ico binary
+*.zip binary
+*.exe binary
+*.wav binary
+*.pcm binary
+*.webm binary

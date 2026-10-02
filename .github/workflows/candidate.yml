@@ -1,0 +1,172 @@
+name: candidate
+
+# Candidate check for the public release pipeline.
+#
+# Triggers: pushes to main, pull requests and manual dispatch.
+# Permissions: read-only. This workflow never publishes, never reads secrets
+# and never installs the production application.
+#
+# The production artifact is only *built* here (an x64 NSIS installer plus its
+# checksum and manifest). It is uploaded as the Actions artifact
+# `windows-x64-<full commit SHA>`. Only a successful run triggered by a push to
+# main is eligible as the source of a public release; pull-request artifacts
+# are never accepted for publication (see .github/workflows/release.yml).
+#
+# The NSIS installer is a Windows 11 x64 product. The GitHub-hosted runner is
+# Windows Server, which is never claimed to be a supported production platform:
+# the only installer exercised on this runner is the isolated Test fixture
+# (`SPEECHEK_TEST_INSTALLER=1`, identifier `app.speechek.test`), and the
+# production precheck (Windows 11 build >= 22000, VER_NT_WORKSTATION) is not
+# weakened anywhere. The fixture artifacts are never uploaded or published.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BUN_VERSION: "1.4.2"
+  RUST_VERSION: "1.97.1"
+  TARGET_TRIPLE: "x86_64-pc-windows-msvc"
+
+jobs:
+  candidate:
+    name: windows-x64 candidate
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Pin Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install "$env:RUST_VERSION" --profile minimal --target "$env:TARGET_TRIPLE" --no-self-update
+          rustup default "$env:RUST_VERSION"
+          rustc --version
+          rustc -vV
+
+      - name: Resolve application version
+        id: version
+        shell: pwsh
+        run: |
+          $conf = Get-Content 'src-tauri/tauri.conf.json' -Raw | ConvertFrom-Json
+          $version = [string]$conf.version
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            throw "src-tauri/tauri.conf.json has an unexpected version '$version'."
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Install JS dependencies (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      # Debug checks and tests only: test-provider is enabled and no RUSTFLAGS
+      # (no static CRT) is applied to debug artifacts. Tests use fake keys.
+      - name: cargo check
+        run: cargo check --manifest-path src-tauri/Cargo.toml --locked --no-default-features
+
+      - name: cargo test (test-provider, fake keys)
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --no-default-features --features test-provider
+
+      - name: Source and license checks
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/check-release.ps1
+
+      # ------------------------------------------------------------------
+      # Test fixture on the Server runner. This is the only installer that is
+      # ever exercised here; its payload carries SPEECHEK_TEST_INSTALLER=1 and
+      # the Test identity, so the production Windows 11 gate stays untouched.
+      # ------------------------------------------------------------------
+      - name: Build Test fixture installer (Server, test-only)
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build-test-installer.ps1 -Version ${{ steps.version.outputs.version }}
+
+      - name: Assert the fixture is the Test identity only
+        shell: pwsh
+        run: |
+          $path = "src-tauri/target/debug/speechek-test-fixture-${{ steps.version.outputs.version }}.json"
+          $manifest = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+          if ([string]$manifest.identifier -ne 'app.speechek.test') {
+            throw "fixture identifier '$($manifest.identifier)' is not app.speechek.test."
+          }
+          if ([string]$manifest.productName -ne 'Speechek Test') {
+            throw "fixture product '$($manifest.productName)' is not 'Speechek Test'."
+          }
+          if ([string]$manifest.flavor -ne 'test') {
+            throw "fixture flavor '$($manifest.flavor)' is not 'test'."
+          }
+
+      - name: Smoke - ownership gate self-test
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke.ps1 -Scenario GateSelfTest
+
+      - name: Smoke - fixture provider contract
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke.ps1 -Scenario FixtureSelfTest
+
+      - name: Smoke - fake provider end to end (Test executable)
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke.ps1 -Scenario FakeProvider
+
+      - name: Smoke - Test installer fresh install (Server, test-only)
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke.ps1 -Scenario FreshInstall -Fixture "src-tauri/target/debug/speechek-test-fixture-${{ steps.version.outputs.version }}.json"
+
+      - name: Smoke - Test installer uninstall keeping data
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/smoke.ps1 -Scenario UninstallKeep
+
+      # ------------------------------------------------------------------
+      # Production artifact. Built only; it is never installed here.
+      # ------------------------------------------------------------------
+      - name: Build release executable and NSIS installer
+        shell: pwsh
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1
+
+      - name: Collect candidate assets
+        id: assets
+        shell: pwsh
+        run: |
+          $bundle = 'src-tauri/target/release/bundle/nsis'
+          $manifestPath = Join-Path $bundle 'release-manifest.json'
+          $sumsPath = Join-Path $bundle 'SHA256SUMS.txt'
+          if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+            throw "release-manifest.json was not produced at $manifestPath."
+          }
+          if (-not (Test-Path -LiteralPath $sumsPath -PathType Leaf)) {
+            throw "SHA256SUMS.txt was not produced at $sumsPath."
+          }
+          $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+          if ([string]$manifest.flavor -ne 'production') {
+            throw "release manifest flavor '$($manifest.flavor)' is not 'production'."
+          }
+          $installerName = [string]$manifest.installer.file
+          $installerPath = Join-Path $bundle $installerName
+          if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
+            throw "installer '$installerName' named by the manifest is missing."
+          }
+          "installer=$installerPath" >> $env:GITHUB_OUTPUT
+          "sums=$sumsPath" >> $env:GITHUB_OUTPUT
+          "manifest=$manifestPath" >> $env:GITHUB_OUTPUT
+
+      - name: Upload candidate artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-x64-${{ github.sha }}
+          path: |
+            ${{ steps.assets.outputs.installer }}
+            ${{ steps.assets.outputs.sums }}
+            ${{ steps.assets.outputs.manifest }}
+          retention-days: 30
+          if-no-files-found: error

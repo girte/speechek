@@ -1,0 +1,80 @@
+[package]
+name = "speechek"
+version = "0.2.0"
+description = "Speechek desktop shell: global dictation hotkey, tray menu and the native overlay."
+license = "MIT"
+edition = "2021"
+
+[lib]
+# The shell lives in the library so src/main.rs stays a thin per-platform entry point.
+name = "speechek_lib"
+
+[build-dependencies]
+# Pinned with tauri: 2.6.3 is the build/codegen generation that ships with tauri 2.11.5.
+tauri-build = { version = "=2.6.3", features = [] }
+
+[dependencies]
+tauri = { version = "=2.11.5", features = ["tray-icon", "image-png"] }
+tauri-plugin-global-shortcut = "=2.3.1"
+tauri-plugin-single-instance = "2"
+tauri-plugin-clipboard-manager = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+zeroize = "1.9"
+enigo = "0.6.1"
+windows = { version = "0.61.3", features = [
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Shell",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Security_Cryptography",
+  "Win32_System_Threading",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Registry",
+  # The receipt-sequenced clipboard paste (src/paste.rs): the clipboard API and
+  # its delayed-render promise, the process-module handle the message-only owner
+  # window is created from, and the global-memory blocks the text is written into.
+  "Win32_System_DataExchange",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
+  # The in-process loopback backend (src/backend.rs) sets SO_EXCLUSIVEADDRUSE so
+  # no second process can bind (or steal) the port it is serving.
+  "Win32_Networking_WinSock",
+  # The recording mute (src/audio.rs): the COM apartment, the device
+  # enumerator and the default render endpoint's volume interface that the
+  # system's master mute is read from and written to. `Activate` carries a
+  # PROPVARIANT in its signature, which is why StructuredStorage and Variant
+  # are part of this even though neither is passed.
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Variant",
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
+] }
+# The `#[implement]` attribute of the callback in src/audio.rs emits paths into
+# `windows_core`, so the companion crate has to be a direct dependency at the
+# exact version `windows 0.61.3` is built on.
+windows-core = "=0.61.2"
+# The overlay stays non-activating, so Windows never answers its getUserMedia
+# request; the shell opens the default input device itself instead.
+cpal = "0.17"
+base64 = "0.22"
+# The loopback backend (src/backend.rs): one Axum service with WebSocket upgrades,
+# a Tokio runtime on its own thread, and the shared reqwest client that talks to
+# Gemini over rustls. Pinned to the versions the port was written against.
+axum = { version = "=0.8.6", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
+reqwest = { version = "=0.12.24", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "=0.28.0", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+# Needed for the loopback socket's exclusive-address option (see backend::bind_exclusive).
+socket2 = { version = "0.6", features = ["all"] }
+
+[features]
+# Local fake-provider harness only: `SPEECHEK_TEST_PROVIDER_HTTP`/`_WSS` are
+# honoured by src/provider.rs under this feature in debug builds, never in the
+# released EXE (which does not enable it).
+test-provider = []

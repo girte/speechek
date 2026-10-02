@@ -1,0 +1,428 @@
+name: Release
+
+# Publishes a verified candidate artifact. The tag pipeline never rebuilds:
+# it downloads the exact candidate-produced installer, validates it against the
+# annotated tag, and only then publishes it. See docs/releasing.md.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+# Least privilege by default; only the publish job widens permissions, and only
+# after the verify job has passed.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  verify:
+    name: Verify candidate artifact
+    runs-on: windows-2022
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+      tag_commit: ${{ steps.validate.outputs.tag_commit }}
+      candidate_run: ${{ steps.validate.outputs.candidate_run }}
+      installer_name: ${{ steps.manifest.outputs.installer_name }}
+      installer_sha256: ${{ steps.validate.outputs.installer_sha256 }}
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Strict tag shape, annotated-tag message, main ancestry, version mirrors,
+      # and a dated CHANGELOG section. Pure repository reads, no secrets.
+      - name: Validate tag, ancestry, versions and changelog
+        id: validate
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repoRoot = $env:GITHUB_WORKSPACE
+          Set-Location $repoRoot
+
+          $tag = [string]$env:GITHUB_REF_NAME
+          $tagMatch = [regex]::Match($tag, '^v(?<version>\d+\.\d+\.\d+)$')
+          if (-not $tagMatch.Success) {
+            Write-Error "tag '$tag' is not a strict vX.Y.Z tag."
+            exit 1
+          }
+          $version = $tagMatch.Groups['version'].Value
+
+          # The verification record must live in an annotated tag object.
+          $objectType = (& git for-each-ref "refs/tags/$tag" --format='%(objecttype)' | Out-String).Trim()
+          if ($objectType -ne 'tag') {
+            Write-Error "tag '$tag' is not annotated (objecttype '$objectType'); the candidate run id and installer hash must be in the tag message."
+            exit 1
+          }
+          $message = (& git for-each-ref "refs/tags/$tag" --format='%(contents)' | Out-String)
+
+          # Exactly one record, in the fixed order and format emitted by
+          # scripts/publish-tag.ps1 (extra tag text is allowed).
+          $records = [regex]::Matches($message, '(?m)candidate-run:(?<run>[0-9]+)[ ]installer-sha256:(?<sha>[0-9a-f]{64})')
+          if ($records.Count -ne 1) {
+            Write-Error "the annotated tag message must contain exactly one 'candidate-run:<id> installer-sha256:<64-hex>' record (found $($records.Count))."
+            exit 1
+          }
+          $candidateRun = $records[0].Groups['run'].Value
+          $installerSha = $records[0].Groups['sha'].Value
+
+          $tagCommit = (& git rev-parse "$tag^{commit}" | Out-String).Trim()
+          if (-not ($tagCommit -match '^[0-9a-f]{40}$')) {
+            Write-Error "could not resolve the peeled commit of '$tag'."
+            exit 1
+          }
+
+          # The tag commit must be reachable from main.
+          if (-not (& git rev-parse --verify --quiet refs/remotes/origin/main)) {
+            Write-Error "origin/main is not available in the checkout; cannot verify ancestry."
+            exit 1
+          }
+          & git merge-base --is-ancestor $tagCommit refs/remotes/origin/main
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "tag commit $tagCommit is not an ancestor of main."
+            exit 1
+          }
+
+          # Every version mirror must equal the tag version.
+          . (Join-Path $repoRoot 'scripts/release-common.ps1')
+          $appVersion = Assert-SpeechekVersionMirrors $repoRoot
+          if ($appVersion -ne $version) {
+            Write-Error "tag version '$version' does not match the manifest version '$appVersion'."
+            exit 1
+          }
+
+          # A dated section for this version must exist; it becomes the notes.
+          $changelog = Get-Content -LiteralPath (Join-Path $repoRoot 'CHANGELOG.md') -Raw
+          $heading = '(?m)^## \[' + [regex]::Escape($version) + '\] - \d{4}-\d{2}-\d{2}\s*$'
+          if ($changelog -notmatch $heading) {
+            Write-Error "CHANGELOG.md has no dated '## [$version]' section."
+            exit 1
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag_commit=$tagCommit" >> $env:GITHUB_OUTPUT
+          "candidate_run=$candidateRun" >> $env:GITHUB_OUTPUT
+          "installer_sha256=$installerSha" >> $env:GITHUB_OUTPUT
+          Write-Host "tag $tag validated: commit $tagCommit, candidate run $candidateRun, installer $installerSha"
+
+      # GitHub API: the named run must belong to this repository, use the
+      # candidate workflow, be a successful push to main, and still hold the
+      # unexpired artifact for exactly this commit SHA.
+      - name: Verify candidate run and artifact
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Invoke-Gh([string[]]$GhArgs) {
+            $output = (& gh @GhArgs 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) { throw "gh $($GhArgs -join ' ') failed: $output" }
+            return $output
+          }
+
+          $repo = $env:REPO
+          $runId = '${{ steps.validate.outputs.candidate_run }}'
+          $tagCommit = '${{ steps.validate.outputs.tag_commit }}'
+          $artName = "windows-x64-$tagCommit"
+
+          $repoId = [string]((Invoke-Gh @('api', "repos/$repo") | ConvertFrom-Json).id)
+
+          $run = Invoke-Gh @('api', "repos/$repo/actions/runs/$runId") | ConvertFrom-Json
+          $fail = @()
+          if ([string]$run.repository.id -ne $repoId) { $fail += "run belongs to repository id $($run.repository.id), expected $repoId" }
+          if ([string]$run.path -ne '.github/workflows/candidate.yml') { $fail += "run workflow '$($run.path)' is not candidate.yml" }
+          if ([string]$run.event -ne 'push') { $fail += "run event '$($run.event)' is not push" }
+          if ([string]$run.head_branch -ne 'main') { $fail += "run branch '$($run.head_branch)' is not main" }
+          if ([string]$run.status -ne 'completed') { $fail += "run status '$($run.status)' is not completed" }
+          if ([string]$run.conclusion -ne 'success') { $fail += "run conclusion '$($run.conclusion)' is not success" }
+          if ([string]$run.head_sha -ne $tagCommit) { $fail += "run head_sha '$($run.head_sha)' != tag commit '$tagCommit'" }
+          if ($fail.Count -gt 0) {
+            $fail | ForEach-Object { Write-Host "FAIL: $_" }
+            Write-Error "the named candidate run does not satisfy the publication policy."
+            exit 1
+          }
+
+          $artifacts = ((Invoke-Gh @('api', "repos/$repo/actions/runs/$runId/artifacts")) | ConvertFrom-Json).artifacts
+          $artifact = $artifacts | Where-Object { $_.name -eq $artName } | Select-Object -First 1
+          if (-not $artifact) {
+            $names = ($artifacts | ForEach-Object { $_.name }) -join ', '
+            Write-Error "artifact '$artName' was not found on run $runId. Available: $names"
+            exit 1
+          }
+          if ([bool]$artifact.expired) {
+            Write-Error "artifact '$artName' on run $runId has expired; run a new candidate and re-verify that file."
+            exit 1
+          }
+          if ([string]$artifact.workflow_run.id -ne $runId) {
+            Write-Error "artifact '$artName' does not belong to run $runId."
+            exit 1
+          }
+
+          "artifact_name=$artName" >> $env:GITHUB_OUTPUT
+          "artifact_id=$([string]$artifact.id)" >> $env:GITHUB_OUTPUT
+          Write-Host "candidate run $runId and artifact '$artName' accepted."
+
+      - name: Download candidate artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = $env:REPO
+          $runId = '${{ steps.validate.outputs.candidate_run }}'
+          $artName = '${{ steps.candidate.outputs.artifact_name }}'
+          if (Test-Path -LiteralPath candidate) { Remove-Item -Recurse -Force candidate }
+          & gh run download $runId --repo $repo --name $artName --dir candidate
+          if ($LASTEXITCODE -ne 0) { Write-Error "downloading artifact '$artName' failed."; exit 1 }
+          if (-not (Get-ChildItem -Path candidate -Recurse -File)) { Write-Error "the artifact is empty."; exit 1 }
+
+      # The downloaded manifest must describe exactly this tag's commit, version
+      # and candidate run, and the installer bytes must match both the manifest
+      # and the hash recorded in the annotated tag.
+      - name: Verify manifest and installer checksum
+        id: manifest
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repoRoot = $env:GITHUB_WORKSPACE
+          . (Join-Path $repoRoot 'scripts/release-common.ps1')
+
+          $version = '${{ steps.validate.outputs.version }}'
+          $tagCommit = '${{ steps.validate.outputs.tag_commit }}'
+          $candidateRun = '${{ steps.validate.outputs.candidate_run }}'
+          $tagInstallerSha = '${{ steps.validate.outputs.installer_sha256 }}'
+
+          $manifestFile = Get-ChildItem -Path candidate -Recurse -File -Filter 'release-manifest.json' | Select-Object -First 1
+          if (-not $manifestFile) { Write-Error "release-manifest.json is missing from the artifact."; exit 1 }
+          $manifest = Get-Content -LiteralPath $manifestFile.FullName -Raw | ConvertFrom-Json
+
+          $fail = @()
+          if ([int]$manifest.schemaVersion -ne 1) { $fail += "schemaVersion is not 1" }
+          if ([string]$manifest.flavor -ne 'production') { $fail += "flavor '$($manifest.flavor)' is not production" }
+          if ([string]$manifest.target -ne 'x86_64-pc-windows-msvc') { $fail += "target '$($manifest.target)' is not x86_64-pc-windows-msvc" }
+          if ([string]$manifest.commit -ne $tagCommit) { $fail += "commit '$($manifest.commit)' != tag commit '$tagCommit'" }
+          if ([string]$manifest.version -ne $version) { $fail += "version '$($manifest.version)' != tag version '$version'" }
+          if ([string]$manifest.runId -ne $candidateRun) { $fail += "runId '$($manifest.runId)' is not the tagged candidate run '$candidateRun'" }
+          if ([string]$manifest.exe.file -ne 'speechek.exe') { $fail += "exe.file '$($manifest.exe.file)' is not speechek.exe" }
+          if (-not ([string]$manifest.exe.sha256 -match '^[0-9a-f]{64}$')) { $fail += "exe.sha256 is not lowercase 64-hex" }
+          if (-not ([string]$manifest.installer.sha256 -match '^[0-9a-f]{64}$')) { $fail += "installer.sha256 is not lowercase 64-hex" }
+          if ($fail.Count -gt 0) {
+            $fail | ForEach-Object { Write-Host "FAIL: $_" }
+            Write-Error "the candidate manifest is not a valid production manifest for this tag."
+            exit 1
+          }
+
+          $installerName = [string]$manifest.installer.file
+          $installer = Get-ChildItem -Path candidate -Recurse -File | Where-Object { $_.Name -eq $installerName } | Select-Object -First 1
+          if (-not $installer) { Write-Error "installer '$installerName' is missing from the artifact."; exit 1 }
+
+          $installerSha = Get-SpeechekSha256 -Path $installer.FullName
+          if ($installerSha -ne [string]$manifest.installer.sha256) {
+            Write-Error "installer SHA-256 '$installerSha' != manifest '$($manifest.installer.sha256)'."
+            exit 1
+          }
+          if ($installerSha -ne $tagInstallerSha) {
+            Write-Error "installer SHA-256 '$installerSha' != annotated tag '$tagInstallerSha'."
+            exit 1
+          }
+
+          $exe = Get-ChildItem -Path candidate -Recurse -File | Where-Object { $_.Name -eq 'speechek.exe' } | Select-Object -First 1
+          if ($exe -and ((Get-SpeechekSha256 -Path $exe.FullName) -ne [string]$manifest.exe.sha256)) {
+            Write-Error "the packaged speechek.exe does not match the manifest hash."
+            exit 1
+          }
+
+          $sumsFile = Get-ChildItem -Path candidate -Recurse -File -Filter 'SHA256SUMS.txt' | Select-Object -First 1
+          if (-not $sumsFile) { Write-Error "SHA256SUMS.txt is missing from the artifact."; exit 1 }
+          $sums = (Get-Content -LiteralPath $sumsFile.FullName -Raw) -replace "`r`n", "`n"
+          $expected = "$installerSha  $installerName`n"
+          if ($sums -ne $expected) {
+            Write-Error "SHA256SUMS.txt does not match '$expected'."
+            exit 1
+          }
+
+          if (Test-Path -LiteralPath verified) { Remove-Item -Recurse -Force verified }
+          New-Item -ItemType Directory -Force -Path verified | Out-Null
+          Copy-Item -LiteralPath $installer.FullName -Destination (Join-Path 'verified' $installerName)
+          Copy-Item -LiteralPath $sumsFile.FullName -Destination (Join-Path 'verified' 'SHA256SUMS.txt')
+          Copy-Item -LiteralPath $manifestFile.FullName -Destination (Join-Path 'verified' 'release-manifest.json')
+
+          "installer_name=$installerName" >> $env:GITHUB_OUTPUT
+          Write-Host "manifest accepted: $installerName $installerSha"
+
+      # Release notes are the matching CHANGELOG section plus a fixed footer.
+      - name: Build release notes
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repoRoot = $env:GITHUB_WORKSPACE
+          $version = '${{ steps.validate.outputs.version }}'
+          $installerName = '${{ steps.manifest.outputs.installer_name }}'
+          $sha = '${{ steps.validate.outputs.installer_sha256 }}'
+
+          $lines = Get-Content -LiteralPath (Join-Path $repoRoot 'CHANGELOG.md')
+          $start = $null
+          for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match ('^## \[' + [regex]::Escape($version) + '\]')) { $start = $i; break }
+          }
+          if ($null -eq $start) { Write-Error "CHANGELOG.md has no section for $version."; exit 1 }
+          $end = $lines.Count
+          for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^## \[') { $end = $i; break }
+          }
+          $section = ($lines[$start..($end - 1)] -join "`n").TrimEnd()
+
+          $footer = @(
+            '---'
+            ''
+            '### Install'
+            ''
+            'Windows 11 x64 only. Download the setup executable below, run it, and choose English or Russian.'
+            'The installer is **unsigned**, so Windows SmartScreen or Smart App Control may warn or block it; a security policy can refuse to launch it.'
+            'It installs for the current user and offers an optional desktop shortcut and start-at-sign-in.'
+            ''
+            '### Updating'
+            ''
+            'Speechek has no auto-updater. To update, download a newer installer from the releases page; it upgrades in place and keeps your settings and API keys.'
+            ''
+            '### Known limitations'
+            ''
+            'If a running instance does not respond, the installer waits five seconds and then force-terminates it; the latest settings may then be saved only partially and the Windows mute state may be left unchanged.'
+            ''
+            '### Integrity'
+            ''
+            "- ``$installerName``"
+            "- SHA-256: ``$sha``"
+          ) -join "`n"
+
+          $notes = $section + "`n`n" + $footer + "`n"
+          [System.IO.File]::WriteAllText((Join-Path $repoRoot 'verified/release-notes.md'), $notes, (New-Object System.Text.UTF8Encoding($false)))
+          Write-Host "release notes generated for $version."
+
+      - name: Upload verified release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.4.3
+        with:
+          name: verified-release-assets
+          path: verified/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: verify
+    runs-on: windows-2022
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Download verified release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.1.8
+        with:
+          name: verified-release-assets
+          path: verified
+
+      # The downloaded bytes are re-hashed before anything is uploaded, so the
+      # published file is provably the file that passed verification.
+      - name: Re-verify verified assets
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repoRoot = $env:GITHUB_WORKSPACE
+          . (Join-Path $repoRoot 'scripts/release-common.ps1')
+
+          $installerName = '${{ needs.verify.outputs.installer_name }}'
+          $expectedSha = '${{ needs.verify.outputs.installer_sha256 }}'
+
+          $installer = Get-ChildItem -Path verified -Recurse -File | Where-Object { $_.Name -eq $installerName } | Select-Object -First 1
+          if (-not $installer) { Write-Error "verified installer '$installerName' is missing."; exit 1 }
+          $sha = Get-SpeechekSha256 -Path $installer.FullName
+          if ($sha -ne $expectedSha) { Write-Error "verified installer hash '$sha' != '$expectedSha'."; exit 1 }
+          foreach ($required in @('SHA256SUMS.txt', 'release-manifest.json', 'release-notes.md')) {
+            if (-not (Get-ChildItem -Path verified -Recurse -File | Where-Object { $_.Name -eq $required })) {
+              Write-Error "verified asset '$required' is missing."
+              exit 1
+            }
+          }
+          Write-Host "verified assets intact ($sha)."
+
+      # Draft first, attach the exact same files, then publish/latest. The
+      # write token exists only in this job.
+      - name: Create draft release and attach assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Invoke-Gh([string[]]$GhArgs) {
+            $output = (& gh @GhArgs 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) { throw "gh $($GhArgs -join ' ') failed: $output" }
+            return $output
+          }
+          $repo = $env:REPO
+          $version = '${{ needs.verify.outputs.version }}'
+          $installerName = '${{ needs.verify.outputs.installer_name }}'
+          $tag = "v$version"
+
+          Invoke-Gh @('release', 'create', $tag, '--repo', $repo, '--draft', '--verify-tag', '--title', "Speechek $version", '--notes-file', 'verified/release-notes.md') | Out-Null
+          Invoke-Gh @('release', 'upload', $tag, (Join-Path 'verified' $installerName), 'verified/SHA256SUMS.txt', 'verified/release-manifest.json', '--repo', $repo) | Out-Null
+          Write-Host "draft release $tag created with assets."
+
+      - name: Publish release as latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Invoke-Gh([string[]]$GhArgs) {
+            $output = (& gh @GhArgs 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) { throw "gh $($GhArgs -join ' ') failed: $output" }
+            return $output
+          }
+          $repo = $env:REPO
+          $version = '${{ needs.verify.outputs.version }}'
+          $tag = "v$version"
+
+          Invoke-Gh @('release', 'edit', $tag, '--repo', $repo, '--draft=false', '--latest') | Out-Null
+          $release = (Invoke-Gh @('api', "repos/$repo/releases/tags/$tag")) | ConvertFrom-Json
+          if ([bool]$release.draft) { Write-Error "release $tag is still a draft."; exit 1 }
+          Write-Host "published release $tag: $($release.html_url)"
+
+      # Download the published asset through the API and confirm the bytes.
+      - name: Confirm published asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repoRoot = $env:GITHUB_WORKSPACE
+          . (Join-Path $repoRoot 'scripts/release-common.ps1')
+          function Invoke-Gh([string[]]$GhArgs) {
+            $output = (& gh @GhArgs 2>&1 | Out-String)
+            if ($LASTEXITCODE -ne 0) { throw "gh $($GhArgs -join ' ') failed: $output" }
+            return $output
+          }
+          $repo = $env:REPO
+          $version = '${{ needs.verify.outputs.version }}'
+          $installerName = '${{ needs.verify.outputs.installer_name }}'
+          $expectedSha = '${{ needs.verify.outputs.installer_sha256 }}'
+          $tag = "v$version"
+
+          $latest = ((Invoke-Gh @('api', "repos/$repo/releases/latest")) | ConvertFrom-Json).tag_name
+          if ([string]$latest -ne $tag) { Write-Error "latest release is '$latest', expected '$tag'."; exit 1 }
+
+          if (Test-Path -LiteralPath published) { Remove-Item -Recurse -Force published }
+          Invoke-Gh @('release', 'download', $tag, '--repo', $repo, '--pattern', $installerName, '--dir', 'published') | Out-Null
+          $published = Get-ChildItem -Path published -Recurse -File | Where-Object { $_.Name -eq $installerName } | Select-Object -First 1
+          if (-not $published) { Write-Error "the published installer '$installerName' was not found."; exit 1 }
+          $sha = Get-SpeechekSha256 -Path $published.FullName
+          if ($sha -ne $expectedSha) { Write-Error "published installer hash '$sha' != verified '$expectedSha'."; exit 1 }
+          Write-Host "published asset confirmed: $installerName $sha"

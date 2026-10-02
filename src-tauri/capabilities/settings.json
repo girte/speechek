@@ -1,0 +1,21 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "settings",
+  "description": "The settings window alone can edit native settings and encrypted credentials.",
+  "windows": ["settings"],
+  "permissions": [
+    "core:event:allow-listen",
+    "allow-settings-open",
+    "allow-settings-update-general",
+    "allow-settings-list-input-devices",
+    "allow-settings-set-keys",
+    "allow-settings-reveal-keys",
+    "allow-settings-clear-keys",
+    "allow-settings-check-keys",
+    "allow-settings-apply-keys",
+    "allow-settings-close",
+    "allow-settings-action",
+    "allow-settings-update-hotkey",
+    "allow-settings-hotkey-capture"
+  ]
+}

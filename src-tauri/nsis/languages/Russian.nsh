@@ -1,0 +1,68 @@
+; ═══════════════════════════════════════════════════════════════════════════
+; Speechek — Russian NSIS messages
+;
+; Complete set of the pinned upstream language file
+; (tauri-cli-v2.12.0 crates/tauri-bundler/src/bundle/windows/nsis/languages/Russian.nsh)
+; plus the Speechek-specific messages used by installer.nsi / common.nsh.
+; Every string present here must also be present in English.nsh.
+; ═══════════════════════════════════════════════════════════════════════════
+
+; ── Pinned upstream strings ────────────────────────────────────────────────
+LangString addOrReinstall ${LANG_RUSSIAN} "Добавить/Переустановить компоненты"
+LangString alreadyInstalled ${LANG_RUSSIAN} "Уже установлено"
+LangString alreadyInstalledLong ${LANG_RUSSIAN} "${PRODUCTNAME} ${VERSION} уже установлен. Выберите действие, которое вы хотите выполнить и нажмите Далее для продолжения."
+LangString appRunning ${LANG_RUSSIAN} "${PRODUCTNAME} запущен! Пожалуйста, закройте приложение и попробуйте еще раз."
+LangString appRunningOkKill ${LANG_RUSSIAN} "${PRODUCTNAME} запущен!$\nНажмите OK чтобы закрыть приложение"
+LangString chooseMaintenanceOption ${LANG_RUSSIAN} "Выберите действие, которое вы хотите выполнить."
+LangString choowHowToInstall ${LANG_RUSSIAN} "Выберите, как вы хотите установить ${PRODUCTNAME}."
+LangString createDesktop ${LANG_RUSSIAN} "Добавить ярлык на рабочий стол"
+LangString dontUninstall ${LANG_RUSSIAN} "Не удалять"
+LangString dontUninstallDowngrade ${LANG_RUSSIAN} "Не удалять (Установка более ранних версий без удаления невозможна)"
+LangString failedToKillApp ${LANG_RUSSIAN} "Не удалось закрыть ${PRODUCTNAME}. Пожалуйста, закройте приложение и попробуйте еще раз"
+LangString installingWebview2 ${LANG_RUSSIAN} "Установка WebView2..."
+LangString newerVersionInstalled ${LANG_RUSSIAN} "Более новая версия ${PRODUCTNAME} уже установлена! Не рекомендуется устанавливать более раннюю версию. Если вы действительно хотите установить эту версию, рекомендуется сначала удалить текущую. Выберите действие, которое вы хотите выполнить и нажмите Далее для продолжения."
+LangString older ${LANG_RUSSIAN} "Более ранняя"
+LangString olderOrUnknownVersionInstalled ${LANG_RUSSIAN} "$R4 версия ${PRODUCTNAME} уже установлена в вашей системе. Рекомендуется удалить текущую версию перед установкой. Выберите действие, которое вы хотите выполнить и нажмите Далее для продолжения."
+LangString silentDowngrades ${LANG_RUSSIAN} "Установка более ранних версий в фоне невозможна, используйте установщик.$\n"
+LangString unableToUninstall ${LANG_RUSSIAN} "Не удалось удалить!"
+LangString uninstallApp ${LANG_RUSSIAN} "Удалить ${PRODUCTNAME}"
+LangString uninstallBeforeInstalling ${LANG_RUSSIAN} "Удалить перед установкой"
+LangString unknown ${LANG_RUSSIAN} "Неизвестная"
+LangString webview2AbortError ${LANG_RUSSIAN} "Не удалось установить WebView2! Приложение не может работать без него. Попробуйте перезапустить установщик."
+LangString webview2DownloadError ${LANG_RUSSIAN} "Ошибка: Не удалось загрузить WebView2 - $0"
+LangString webview2DownloadSuccess ${LANG_RUSSIAN} "WebView2 успешно загружен"
+LangString webview2Downloading ${LANG_RUSSIAN} "Загрузка WebView2..."
+LangString webview2InstallError ${LANG_RUSSIAN} "Ошибка: Не удалось установить WebView2, код выхода: $1"
+LangString webview2InstallSuccess ${LANG_RUSSIAN} "WebView2 успешно установлен"
+LangString deleteAppData ${LANG_RUSSIAN} "Удалить данные приложения"
+
+; ── Speechek strings ───────────────────────────────────────────────────────
+LangString speechekInstallerRunning ${LANG_RUSSIAN} "Установка Speechek уже выполняется в другом окне. Закройте его и запустите установщик снова."
+LangString speechekPlatformUnsupported ${LANG_RUSSIAN} "Speechek требует Windows 11 (x64). Установка на этой версии Windows или на этой архитектуре не поддерживается."
+LangString speechekRepairRequired ${LANG_RUSSIAN} "Не удалось надёжно определить версию установленного Speechek. Требуется ручная диагностика: запустите установщик текущей или более новой версии, чтобы восстановить установку."
+LangString speechekDowngradeBlocked ${LANG_RUSSIAN} "Установлена более новая версия Speechek ($R4). Этот установщик ($R5) старше и не может её заменить. Используйте установщик той же или более новой версии."
+LangString speechekHashMismatch ${LANG_RUSSIAN} "Установщик повреждён: контрольная сумма или версия встроенного файла не совпадают с ожидаемыми. Загрузите установщик заново."
+LangString speechekPayloadMissing ${LANG_RUSSIAN} "Не удалось подготовить встроенные файлы установщика во временном каталоге. Установка отменена, изменения не внесены."
+LangString speechekPrecheckHeader ${LANG_RUSSIAN} "Обнаружена существующая установка"
+LangString speechekPrecheckTitle ${LANG_RUSSIAN} "Speechek будет установлен на месте; ваши данные и настройки сохранятся."
+LangString speechekPrecheckUpgrade ${LANG_RUSSIAN} "Сейчас установлена версия $R4. Будет установлена версия ${VERSION}. Ваши данные и настройки сохранятся."
+LangString speechekPrecheckReinstall ${LANG_RUSSIAN} "Версия ${VERSION} уже установлена. Будет выполнена переустановка на месте без удаления данных и настроек."
+LangString speechekContinue ${LANG_RUSSIAN} "Продолжить"
+LangString speechekOptionsHeader ${LANG_RUSSIAN} "Параметры установки"
+LangString speechekOptionsTitle ${LANG_RUSSIAN} "Выберите дополнительные параметры для Speechek."
+LangString speechekDesktopShortcutOption ${LANG_RUSSIAN} "Создать ярлык на рабочем столе"
+LangString speechekStartupOption ${LANG_RUSSIAN} "Запускать Speechek при входе в Windows"
+LangString speechekRunAfterInstall ${LANG_RUSSIAN} "Запустить Speechek"
+LangString speechekCloseWarning ${LANG_RUSSIAN} "Speechek будет закрыт. Текущая диктовка и неприменённые изменения API-ключей будут потеряны. После 5 секунд ожидания зависшее приложение будет завершено принудительно; последние настройки могут сохраниться частично, а звук Windows может остаться выключенным. Продолжить?"
+LangString speechekCloseCancelled ${LANG_RUSSIAN} "Установка отменена. Ничего не изменено."
+LangString speechekFileInUse ${LANG_RUSSIAN} "Файл Speechek.exe используется другим процессом или не может быть закрыт. Закройте его вручную и запустите установщик снова."
+LangString speechekCannotConfirmExit ${LANG_RUSSIAN} "Не удалось подтвердить завершение Speechek. Установка отменена, файлы не изменены."
+LangString speechekRunValueTooLong ${LANG_RUSSIAN} "Не удалось включить автозагрузку: путь к приложению слишком длинный для записи автозагрузки Windows. Установка будет отменена."
+LangString speechekRollbackDone ${LANG_RUSSIAN} "Установка не завершена, прежняя версия восстановлена; все изменения отменены."
+LangString speechekRollbackFailed ${LANG_RUSSIAN} "Установка не завершена, и прежнее состояние полностью восстановить не удалось. Запустите установщик текущей или более новой версии для восстановления установки. Каталог установки: $INSTDIR"
+LangString speechekDeleteData ${LANG_RUSSIAN} "Удалить настройки и API-ключи"
+LangString speechekDataDeleteFailed ${LANG_RUSSIAN} "Часть данных не удалось удалить, они остались на диске: $R0"
+LangString speechekDataDeleteUnsafe ${LANG_RUSSIAN} "Данные не удалены: путь небезопасно удалять: $R0"
+LangString speechekUninstallEntryKept ${LANG_RUSSIAN} "Запись реестра об этой установке указывает на другой каталог и не была удалена. Проверьте установки Speechek вручную."
+LangString speechekBackupFailed ${LANG_RUSSIAN} "Не удалось сохранить текущую установку во временную резервную копию, поэтому ничего не было заменено. Закройте программы, которые могут блокировать файлы установки, и запустите установщик снова."
+LangString speechekUninstallIncomplete ${LANG_RUSSIAN} "Часть установленных файлов не удалось удалить, они остались на диске. Запись об удалении сохранена, чтобы установку можно было восстановить или удалить повторно."

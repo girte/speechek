@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-settings-close"
+description = "Enables the settings_close command without any pre-configured scope."
+commands.allow = ["settings_close"]
+
+[[permission]]
+identifier = "deny-settings-close"
+description = "Denies the settings_close command without any pre-configured scope."
+commands.deny = ["settings_close"]

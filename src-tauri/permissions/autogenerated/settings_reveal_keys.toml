@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-settings-reveal-keys"
+description = "Enables the settings_reveal_keys command without any pre-configured scope."
+commands.allow = ["settings_reveal_keys"]
+
+[[permission]]
+identifier = "deny-settings-reveal-keys"
+description = "Denies the settings_reveal_keys command without any pre-configured scope."
+commands.deny = ["settings_reveal_keys"]

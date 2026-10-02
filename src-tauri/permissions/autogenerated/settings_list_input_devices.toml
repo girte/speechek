@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-settings-list-input-devices"
+description = "Enables the settings_list_input_devices command without any pre-configured scope."
+commands.allow = ["settings_list_input_devices"]
+
+[[permission]]
+identifier = "deny-settings-list-input-devices"
+description = "Denies the settings_list_input_devices command without any pre-configured scope."
+commands.deny = ["settings_list_input_devices"]

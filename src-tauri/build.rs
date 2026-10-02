@@ -1,0 +1,37 @@
+fn main() {
+    println!("cargo:rerun-if-changed=icons/icon.png");
+    println!("cargo:rerun-if-changed=icons/icon.ico");
+    tauri_build::try_build(
+        tauri_build::Attributes::new()
+            .windows_attributes(
+                tauri_build::WindowsAttributes::new().window_icon_path("icons/icon.ico"),
+            )
+            .app_manifest(tauri_build::AppManifest::new().commands(&[
+                "overlay_ready",
+                "capture_started",
+                "capture_finalizing",
+                "finish_session",
+                "insert_text",
+                "start_native_capture",
+                "stop_native_capture",
+                "mute_warning_shown",
+                "lab_prepare_capture",
+                "lab_start_capture",
+                "lab_stop_capture",
+                "dictation_context",
+                "settings_open",
+                "settings_update_general",
+                "settings_list_input_devices",
+                "settings_set_keys",
+                "settings_reveal_keys",
+                "settings_clear_keys",
+                "settings_check_keys",
+                "settings_apply_keys",
+                "settings_close",
+                "settings_action",
+                "settings_update_hotkey",
+                "settings_hotkey_capture",
+            ])),
+    )
+    .expect("Tauri command permission generation failed");
+}

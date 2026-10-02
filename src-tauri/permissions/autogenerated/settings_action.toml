@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-settings-action"
+description = "Enables the settings_action command without any pre-configured scope."
+commands.allow = ["settings_action"]
+
+[[permission]]
+identifier = "deny-settings-action"
+description = "Denies the settings_action command without any pre-configured scope."
+commands.deny = ["settings_action"]

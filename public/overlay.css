@@ -1,0 +1,256 @@
+/*
+ * Speechek's recording overlay.
+ *
+ * One compact pill, one wider notice: the shell gives this page a 240x64
+ * transparent window for a recording and a 360x64 one while a notice shows;
+ * the card has a clear 8px margin on every side. The recording pill is 224x48;
+ * error, clipboard-fallback and warning notices widen it to 344x48. The single
+ * row is the nine-bar meter, the two-line readout — the status line the shell
+ * announces, over the mode that records — and the right-aligned elapsed time.
+ * While recognition runs, a spinner replaces the meter and the timer is hidden.
+ * No transcript is drawn here; notices take the room of the meter and the timer.
+ *
+ * Geometry (a rounded floating pill with a row of level bars) follows Handy's
+ * recording overlay by CJ Pais (MIT); the colours, the wording and every bar
+ * position are Speechek's own, and no Handy asset or name is used.
+ * third_party/Handy.LICENSE holds the licence.
+ */
+
+:root {
+  color-scheme: dark;
+  --bg: #242424;
+  --surface: #303030;
+  --line: #545454;
+  --text: #F5F5F5;
+  --muted: #BDBDBD;
+  --accent: #8A2BE2;
+  --accent-text: #CBA5F5;
+  --error: #ffbdad;
+  --line-soft: rgba(245, 245, 245, 0.14);
+  --error-bg: #3C2724;
+  --error-line: #9E5851;
+  --radius: 24px;
+  font-family: Inter, "Segoe UI", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  /* The window is transparent; only the pill may paint. */
+  background: transparent;
+  overflow: hidden;
+}
+
+body {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.3;
+  -webkit-font-smoothing: antialiased;
+}
+
+p { margin: 0; }
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Frame: 224x48 pill in a 240x64 window; 344x48 for notices                  */
+/* -------------------------------------------------------------------------- */
+
+.overlay {
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* A clear transparent margin keeps the rounded outline off the window edge. */
+  padding: 8px;
+}
+
+.pill {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  /* The normal 240x64 window leaves an 8px edge around this compact card;
+     notices alone get a 344x48 card in the 360x64 window. */
+  width: 224px;
+  height: 48px;
+  padding: 0 16px;
+  background: var(--surface);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  transition: border-color 140ms ease;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Meter: nine bars between 3 and 18 pixels, driven by the recorder's samples   */
+/* -------------------------------------------------------------------------- */
+
+.meter {
+  flex: 0 0 52px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  height: 18px;
+}
+
+.bar {
+  width: 3px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--accent);
+  /* The height is written per frame from the level samples; nothing animates it
+     on its own, and no transition may interpolate it a second time. */
+}
+
+.processing-indicator {
+  display: none;
+  flex: 0 0 52px;
+  align-items: center;
+  justify-content: center;
+  height: 18px;
+}
+
+.processing-indicator::before {
+  content: "";
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: processing-spin 800ms linear infinite;
+}
+
+@keyframes processing-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Readout: the status line, over the mode that records                        */
+/* -------------------------------------------------------------------------- */
+
+.readout {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.status {
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+  /* The line never overruns the timer: a long idle chord or status ellipsizes
+     instead of painting over the elapsed time (the notice states clamp it). */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: color 140ms ease;
+}
+
+.mode {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  /* The mute warning of a running take lands on this line: in the compact pill
+     it ellipsizes instead of pushing the status line or the timer. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.timer {
+  flex: 0 0 auto;
+  font-family: Consolas, "Cascadia Code", monospace;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* -------------------------------------------------------------------------- */
+/* States                                                                      */
+/* -------------------------------------------------------------------------- */
+
+.overlay[data-state="idle"] .bar,
+.overlay[data-state="preview"] .bar { opacity: 0.45; }
+
+.overlay[data-state="preview"] .pill { border-style: dashed; }
+
+.overlay[data-state="arming"] .bar { opacity: 0.7; }
+
+.overlay[data-state="transcribing"] .meter,
+.overlay[data-state="transcribing"] .timer { display: none; }
+
+.overlay[data-state="transcribing"] .processing-indicator { display: flex; }
+
+/* Errors, the clipboard fallback and the sound a cancelled take could not give
+   back use the room of the meter and timer for their reason, with the second
+   line explaining the outcome. */
+.overlay[data-state="error"] .meter,
+.overlay[data-state="copied"] .meter,
+.overlay[data-state="warning"] .meter,
+.overlay[data-state="error"] .timer,
+.overlay[data-state="copied"] .timer,
+.overlay[data-state="warning"] .timer { display: none; }
+
+.overlay[data-state="error"] .pill { border-color: var(--error-line); }
+
+/* A notice reads at length, so it keeps the wider card: the shell gives these
+   states a 360x64 window. The next recording returns to the compact 224x48
+   card in its 240x64 window.
+   The card and the window are written in two separate steps, and either one may
+   still be on its old size when the other changes: a failure is painted while
+   the compact window is on screen, and this card is still on the page when the
+   shell shows the window of the next recording. The clamp keeps the card inside
+   the window it really is in — 344 px only fit in the notice window — instead
+   of drawing it past both window edges until the resize lands. */
+.overlay[data-state="error"] .pill,
+.overlay[data-state="copied"] .pill,
+.overlay[data-state="warning"] .pill {
+  width: 344px;
+  /* The window's clear 8 px margin on every side. */
+  max-width: calc(100vw - 16px);
+}
+
+.overlay[data-state="error"] .readout,
+.overlay[data-state="copied"] .readout,
+.overlay[data-state="warning"] .readout,
+.overlay[data-state="transcribing"] .readout { flex: 1 1 auto; }
+
+.overlay[data-state="error"] .status,
+.overlay[data-state="copied"] .status,
+.overlay[data-state="warning"] .status {
+  /* The message is clamped to what the pill can hold: a provider error may be
+     any length at all. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  white-space: normal;
+  font-size: 12px;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.overlay[data-state="error"] .status { color: var(--error); }
+
+/* The clipboard fallback and a warning the user still has to act on — the take
+   it belongs to is already gone — are accents, not failures. */
+.overlay[data-state="copied"] .status,
+.overlay[data-state="warning"] .status { color: var(--accent-text); }
+
+.overlay[data-state="error"] .mode { color: var(--error); opacity: 0.72; }
+
+@media (prefers-reduced-motion: reduce) {
+  .pill, .status { transition: none; }
+  .processing-indicator::before { animation: none; }
+}

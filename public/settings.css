@@ -1,0 +1,300 @@
+/*
+ * The settings window.
+ *
+ * styles.css carries the palette and the shared controls (mode picker, hint,
+ * error, focus ring); this file only adds the layout of the two-section window,
+ * the question-mark help panels and the settings-only pieces built on top of
+ * them. No new custom properties and no new breakpoints: the window follows the
+ * same 850px and 550px steps as the rest of the application.
+ */
+
+/* Every container here sets its own display, so the hidden attribute needs a
+   rule of its own rather than the user agent's default. */
+body.settings-body [hidden] { display: none !important; }
+
+.settings-shell {
+  height: 100dvh;
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 24px 30px 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* The global footer rule of styles.css caps the width at 800px and dims the
+   whole element; the settings footer only carries the status line and the
+   partial-persistence warning, without an action bar of its own. */
+.settings-shell section { padding: 0; border-bottom: 0; }
+.settings-foot { max-width: none; color: inherit; line-height: 1.4; padding-top: 0; }
+
+.settings-head { border-bottom: 1px solid var(--line); padding-bottom: 12px; }
+.settings-head-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.settings-shell h1 { font-size: clamp(24px, 3.4vw, 32px); font-weight: 620; letter-spacing: -.04em; line-height: 1.1; margin: 10px 0 6px; }
+.settings-lead { color: var(--muted); font-size: 13px; line-height: 1.5; max-width: 680px; margin: 0; }
+
+.settings-preview { margin: 16px 0 0; border: 1px solid var(--line); background: var(--surface); border-radius: 7px; padding: 16px 18px; }
+.settings-preview h2 { font-size: 17px; font-weight: 600; margin: 0 0 8px; }
+.settings-preview p { color: var(--muted); font-size: 13px; line-height: 1.6; margin: 0; }
+
+.settings-layout {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  gap: 0 22px;
+  padding-top: 14px;
+}
+
+.settings-nav { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.settings-tab {
+  text-align: left;
+  font: inherit;
+  font-weight: 600;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  padding: 11px 14px;
+  cursor: pointer;
+}
+.settings-tab:hover { color: var(--text); background: var(--surface); }
+.settings-tab[aria-selected="true"] { color: var(--accent-text); border-color: var(--accent-text); background: var(--surface); }
+.settings-tab:focus-visible { outline: 3px solid var(--accent-text); outline-offset: 3px; }
+
+.settings-panels { min-width: 0; min-height: 0; overflow: auto; scrollbar-gutter: stable; padding: 6px 6px 10px; }
+.settings-panel:focus-visible { outline: 3px solid var(--accent-text); outline-offset: 3px; }
+
+.settings-block { margin: 0 0 22px; }
+.settings-panel .mode-picker { margin: 0; }
+.settings-panel .mode-picker .settings-options { display: flex; flex-wrap: wrap; gap: 8px; }
+.settings-panel .mode-picker label { min-width: 150px; }
+.settings-panel .mode-picker span { min-height: 46px; padding: 6px 12px; font-size: 14px; }
+.settings-lab-row { margin-top: 10px; }
+.settings-lab-row .settings-button { padding: 8px 14px; font-size: 13px; }
+
+.settings-field { margin: 0 0 20px; }
+.settings-block-head { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; }
+.settings-field-title, .settings-block-title { font-size: 14px; font-weight: 600; letter-spacing: 0; margin: 0; }
+.settings-check-row { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.settings-check-row input[type="checkbox"] { width: 18px; height: 18px; margin: 0; flex: none; accent-color: var(--accent); }
+.settings-check-row input[type="checkbox"]:focus-visible { outline: 3px solid var(--accent-text); outline-offset: 3px; }
+.settings-check-row label { font-size: 14px; cursor: pointer; }
+.settings-panel .hint { margin-top: 8px; }
+.settings-panel .error { margin-top: 10px; }
+
+/* The question-mark help: one button per block and one panel per button. The
+   panel is described to a screen reader through aria-describedby and its
+   aria-expanded says whether it is on screen now. An open panel is moved into
+   the body and placed by geometry, so the scrollable settings area can neither
+   clip it nor grow for it, and opening a hint never shifts the control a
+   reader is about to click; closed panels leave the page with [hidden]. */
+.settings-help {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--accent-text);
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  padding: 0;
+  cursor: pointer;
+}
+.settings-help:hover { border-color: var(--accent-text); color: var(--text); }
+.settings-help:focus-visible { outline: 3px solid var(--accent-text); outline-offset: 2px; }
+
+.settings-help-panel {
+  /* An open panel is moved into the body and positioned by the page, so it is
+     never clipped by the scrolling settings area and never takes clicks: the
+     pointer leaving the trigger must always close it. */
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 4;
+  box-sizing: border-box;
+  width: min(420px, calc(100% - 16px));
+  max-height: calc(100vh - 16px);
+  overflow: auto;
+  pointer-events: none;
+  padding: 10px 12px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.55;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent-text);
+  border-radius: 7px;
+}
+
+.settings-hotkey-input {
+  width: 100%;
+  max-width: 320px;
+  font-family: Consolas, "Cascadia Code", monospace;
+  font-size: 16px;
+  padding: 10px 16px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+.settings-hotkey-input:focus-visible { outline: 3px solid var(--accent-text); outline-offset: 2px; }
+.settings-hotkey-state { color: var(--accent-text); font-size: 13px; line-height: 1.5; margin: 8px 0 0; min-height: 1.5em; }
+.settings-hotkey-state:empty { margin-top: 0; }
+
+/* The port field: a narrow numeric text field with its own line, which carries
+   the temporary-port and restart notices. It never moves a control: the line
+   keeps its height, so a notice appearing above the footer does not shift the
+   fields the user is about to reach. */
+.settings-port-input {
+  width: 100%;
+  max-width: 160px;
+  font-family: Consolas, "Cascadia Code", monospace;
+  font-size: 16px;
+  padding: 10px 16px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+.settings-port-input:focus-visible { outline: 3px solid var(--accent-text); outline-offset: 2px; }
+.settings-port-notice { color: var(--accent-text); font-size: 13px; line-height: 1.5; margin: 8px 0 0; min-height: 1.5em; }
+.settings-port-notice:empty { margin-top: 0; }
+
+/* The device picker: the host's input devices plus the system-default entry.
+   Like the port field it has a line of its own for the unavailable-device
+   notice, so an absent device never shifts the fields below it. */
+.settings-device-select {
+  width: 100%;
+  max-width: 420px;
+  font: inherit;
+  font-size: 14px;
+  padding: 10px 12px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+}
+.settings-device-select:focus-visible { outline: 3px solid var(--accent-text); outline-offset: 2px; }
+.settings-device-select:disabled { opacity: .5; cursor: not-allowed; }
+/* Customizable select is progressive enhancement: classic select stays intact
+   when the host WebView lacks base-select / ::picker(select). */
+@supports (appearance: base-select) and selector(::picker(select)) {
+  .settings-device-select,
+  .settings-device-select::picker(select) { appearance: base-select; }
+  .settings-device-select { cursor: pointer; }
+  .settings-device-select::picker(select) {
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    max-width: min(420px, calc(100vw - 16px));
+    max-height: min(320px, 60vh);
+    overflow: auto;
+  }
+  .settings-device-select option { padding: 10px 12px; color: var(--text); white-space: normal; overflow-wrap: anywhere; }
+  .settings-device-select option:hover { background: var(--accent); color: var(--text); }
+  .settings-device-select option:checked { background: var(--accent); color: var(--text); }
+  .settings-device-select option:focus-visible { outline: 3px solid var(--accent-text); outline-offset: -3px; }
+}
+.settings-device-notice { color: var(--accent-text); font-size: 13px; line-height: 1.5; margin: 8px 0 0; min-height: 1.5em; }
+.settings-device-notice:empty { margin-top: 0; }
+
+.settings-button {
+  font: inherit;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 10px 16px;
+  cursor: pointer;
+}
+.settings-button:hover:not(:disabled) { border-color: var(--accent-text); color: var(--accent-text); }
+.settings-button:disabled { opacity: .5; cursor: not-allowed; }
+.settings-primary { background: var(--accent); border-color: var(--accent); }
+.settings-primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--text); }
+
+.settings-summary { font-size: 13px; line-height: 1.55; margin: 0 0 12px; }
+.settings-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 0 0 14px; }
+.settings-actions .settings-button { flex: none; padding: 8px 12px; font-size: 13px; }
+#keys-reveal { min-width: 132px; }
+
+.settings-editor { margin: 0 0 18px; }
+.settings-editor-label { display: block; color: var(--muted); font-size: 13px; margin: 0; }
+.settings-textarea {
+  width: 100%;
+  min-height: 140px;
+  resize: vertical;
+  display: block;
+  font-family: Consolas, "Cascadia Code", monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 12px 14px;
+}
+.settings-textarea:focus-visible { outline: 3px solid var(--accent-text); outline-offset: 2px; }
+
+.settings-results { list-style: none; display: flex; flex-direction: column; gap: 6px; margin: 0 0 16px; padding: 0; }
+.settings-result { display: flex; align-items: baseline; gap: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 7px; padding: 10px 14px; font-size: 13px; line-height: 1.5; }
+.settings-result-line { color: var(--muted); font-family: Consolas, "Cascadia Code", monospace; font-size: 11px; white-space: nowrap; }
+.settings-result-ok { border-color: var(--accent-text); }
+.settings-result-denied { border-color: var(--error-line); }
+.settings-result-denied .settings-result-text { color: var(--error); }
+
+.settings-foot {
+  border-top: 1px solid var(--line);
+  padding: 14px 0 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  background: var(--bg);
+}
+.settings-foot-status { display: flex; flex-direction: column; gap: 8px; min-width: 0; flex: 1 1 260px; }
+.settings-partial { color: var(--error); font-size: 12px; line-height: 1.5; margin: 0; max-width: 560px; }
+
+.settings-dialog {
+  width: calc(100% - 32px);
+  max-width: 520px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 24px;
+}
+.settings-dialog::backdrop { background: rgba(0, 0, 0, .62); }
+.settings-dialog h2 { font-size: 20px; font-weight: 600; letter-spacing: -.02em; margin: 0 0 12px; }
+.settings-dialog p { color: var(--muted); font-size: 14px; line-height: 1.6; margin: 0 0 22px; overflow-wrap: anywhere; }
+.settings-dialog-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 10px; }
+
+@media (max-width: 850px) {
+  .settings-shell { padding: 20px 20px 0; }
+  .settings-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); gap: 12px 0; }
+  .settings-nav { flex-direction: row; gap: 6px; overflow-x: auto; padding-bottom: 4px; }
+  .settings-tab { white-space: nowrap; }
+}
+
+@media (max-width: 550px) {
+  .settings-shell { padding: 14px 14px 0; }
+  .settings-shell h1 { font-size: 22px; margin: 8px 0 5px; }
+  .settings-lead { font-size: 13px; }
+  .settings-foot { padding: 12px 0 14px; }
+  .settings-panel .mode-picker label { flex: 1 1 auto; min-width: 120px; }
+  .settings-help-panel { padding: 9px 11px; }
+  .settings-dialog { padding: 18px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .settings-tab, .settings-button { transition: none; }
+}

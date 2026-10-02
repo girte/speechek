@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-lab-start-capture"
+description = "Enables the lab_start_capture command without any pre-configured scope."
+commands.allow = ["lab_start_capture"]
+
+[[permission]]
+identifier = "deny-lab-start-capture"
+description = "Denies the lab_start_capture command without any pre-configured scope."
+commands.deny = ["lab_start_capture"]

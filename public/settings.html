@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Speechek — Настройки</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/settings.css">
+  <script type="module" src="/settings.js"></script>
+</head>
+<body class="settings-body">
+  <main class="settings-shell">
+    <header class="settings-head">
+      <div class="settings-head-bar">
+        <div class="brand"><span class="brand-mark" aria-hidden="true">◉</span> SPEECHEK <span class="edition">SETTINGS</span></div>
+      </div>
+      <h1>Настройки</h1>
+      <p class="settings-lead">Общие настройки применяются сразу. API-ключи — кнопкой «Применить ключи».</p>
+    </header>
+
+    <section class="settings-preview" id="preview-notice" hidden aria-labelledby="preview-title">
+      <h2 id="preview-title">Настройки доступны в окне Speechek</h2>
+      <p>Страница открыта в обычном браузере: она не может прочитать или изменить настройки приложения, а ключи здесь недоступны. Окно настроек открывается правым щелчком по значку Speechek в области уведомлений Windows → «Настройка».</p>
+    </section>
+
+    <div class="settings-layout">
+      <nav class="settings-nav" role="tablist" aria-label="Разделы настроек">
+        <button type="button" class="settings-tab" id="tab-general" role="tab" aria-selected="true" aria-controls="panel-general">Общие настройки</button>
+        <button type="button" class="settings-tab" id="tab-keys" role="tab" aria-selected="false" aria-controls="panel-keys" tabindex="-1">API-ключи</button>
+      </nav>
+
+      <div class="settings-panels">
+        <section class="settings-panel" id="panel-general" role="tabpanel" aria-labelledby="tab-general" tabindex="-1">
+          <div class="settings-block">
+            <div class="settings-block-head">
+              <h2 class="settings-block-title" id="mode-title">Режим распознавания</h2>
+              <button type="button" class="settings-help" aria-label="Подсказка: режим распознавания" aria-expanded="false" aria-controls="help-mode" aria-describedby="help-mode">?</button>
+              <div class="settings-help-panel" role="tooltip" id="help-mode" hidden>Live Smart работает во время речи. Smart обрабатывает запись после остановки, а «Дословно» сохраняет слова без Smart-правки. Новый режим действует со следующей записи.</div>
+            </div>
+            <fieldset class="mode-picker" id="mode-picker" aria-labelledby="mode-title">
+              <div class="settings-options">
+                <label><input type="radio" name="transcription-mode" value="live"><span>Live Smart <small>текст во время речи</small></span></label>
+                <label><input type="radio" name="transcription-mode" value="smart"><span>Smart <small>после записи, с обработкой</small></span></label>
+                <label><input type="radio" name="transcription-mode" value="verbatim"><span>Дословно <small>после записи, без правки</small></span></label>
+              </div>
+            </fieldset>
+            <div class="settings-lab-row">
+              <button type="button" class="settings-button" id="action-lab">Сравнить режимы в реальном времени</button>
+            </div>
+          </div>
+
+          <div class="error" id="general-error" role="alert" hidden></div>
+
+          <div class="settings-field">
+            <div class="settings-check-row">
+              <input type="checkbox" id="mute-during-recording">
+              <label for="mute-during-recording">Отключать звук во время записи</label>
+              <button type="button" class="settings-help" aria-label="Подсказка: отключение звука во время записи" aria-expanded="false" aria-controls="help-mute" aria-describedby="help-mute">?</button>
+              <div class="settings-help-panel" role="tooltip" id="help-mute" hidden>Во время записи Speechek отключает звук Windows на устройстве воспроизведения по умолчанию. Потом возвращает прежнее состояние, если вы сами не меняли звук. Если отключить его не удалось, запись продолжится.</div>
+            </div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-block-head">
+              <label class="settings-field-title" for="input-device">Микрофон</label>
+              <button type="button" class="settings-help" aria-label="Подсказка: выбор микрофона" aria-expanded="false" aria-controls="help-device" aria-describedby="help-device">?</button>
+              <div class="settings-help-panel" role="tooltip" id="help-device" hidden>Выберите микрофон для следующей записи. Если он отключится, Speechek временно запишет с системного и предупредит вас; ваш выбор останется сохранённым.</div>
+            </div>
+            <select class="settings-device-select" id="input-device" aria-describedby="device-notice device-error"></select>
+            <p class="settings-device-notice" id="device-notice" role="status" aria-live="polite"></p>
+            <div class="error" id="device-error" role="alert" hidden></div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-block-head">
+              <label class="settings-field-title" for="hotkey-input">Горячая клавиша</label>
+              <button type="button" class="settings-help" aria-label="Подсказка: горячая клавиша" aria-expanded="false" aria-controls="help-hotkey" aria-describedby="help-hotkey">?</button>
+              <div class="settings-help-panel" role="tooltip" id="help-hotkey" hidden>Запускает и останавливает запись даже в открытых настройках. Введите F2 или Ctrl+Shift+Space и нажмите Enter либо уйдите из поля. Во время диктовки менять клавишу нельзя.</div>
+            </div>
+            <input type="text" class="settings-hotkey-input" id="hotkey-input" autocomplete="off" spellcheck="false" placeholder="F2" aria-describedby="hotkey-state hotkey-error">
+            <p class="settings-hotkey-state" id="hotkey-state" role="status" aria-live="polite"></p>
+            <div class="error" id="hotkey-error" role="alert" hidden></div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-block-head">
+              <label class="settings-field-title" for="port-input">Локальный порт</label>
+              <button type="button" class="settings-help" aria-label="Подсказка: локальный порт" aria-expanded="false" aria-controls="help-port" aria-describedby="help-port">?</button>
+              <div class="settings-help-panel" role="tooltip" id="help-port" hidden>Через этот порт работают окна приложения. Новое значение сохраняется сразу, но начинает действовать после перезапуска. Если порт занят, приложение временно использует свободный.</div>
+            </div>
+            <input type="text" class="settings-port-input" id="port-input" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="4173" aria-describedby="port-notice port-error">
+            <p class="settings-port-notice" id="port-notice" role="status" aria-live="polite"></p>
+            <div class="error" id="port-error" role="alert" hidden></div>
+          </div>
+        </section>
+
+        <section class="settings-panel" id="panel-keys" role="tabpanel" aria-labelledby="tab-keys" tabindex="-1" hidden>
+          <div class="settings-block-head">
+            <h2 class="settings-block-title">API-ключи</h2>
+            <button type="button" class="settings-help" aria-label="Подсказка: список ключей" aria-expanded="false" aria-controls="help-keys-list" aria-describedby="help-keys-list">?</button>
+            <div class="settings-help-panel" role="tooltip" id="help-keys-list" hidden>Один ключ на строку. Ключи хранятся в защищённом хранилище Windows; посмотреть их можно только здесь по кнопке «Показать ключи».</div>
+          </div>
+          <p class="settings-summary" id="keys-summary"></p>
+          <div class="error" id="keys-error" role="alert" hidden></div>
+
+          <div class="settings-actions">
+            <button type="button" class="settings-button" id="keys-reveal">Показать ключи</button>
+            <button type="button" class="settings-button settings-primary" id="keys-apply">Применить ключи</button>
+            <button type="button" class="settings-button" id="keys-clear">Очистить список</button>
+            <button type="button" class="settings-button" id="keys-check">Проверить ключи</button>
+            <button type="button" class="settings-help" aria-label="Подсказка: действия с ключами" aria-expanded="false" aria-controls="help-keys-actions" aria-describedby="help-keys-actions">?</button>
+            <div class="settings-help-panel" role="tooltip" id="help-keys-actions" hidden>«Применить ключи» сохраняет список, «Очистить список» меняет только черновик. «Проверить ключи» проверяет доступ к API, но не квоту и не качество распознавания. Удаление всех ключей потребует подтверждения.</div>
+          </div>
+
+          <div class="settings-editor" id="keys-editor" hidden>
+            <div class="settings-block-head">
+              <label class="settings-editor-label" for="keys-text" id="keys-editor-label">Список ключей</label>
+            </div>
+            <textarea id="keys-text" class="settings-textarea" rows="8" spellcheck="false" autocomplete="off" autocapitalize="off" aria-describedby="keys-editor-help"></textarea>
+            <p class="hint" id="keys-editor-help"></p>
+          </div>
+
+          <p class="settings-summary" id="keys-check-summary" role="status" aria-live="polite"></p>
+          <ul class="settings-results" id="keys-check-results" aria-label="Результаты проверки ключей" hidden></ul>
+        </section>
+      </div>
+    </div>
+
+    <footer class="settings-foot">
+      <div class="settings-foot-status">
+        <span class="status" id="status" role="status" aria-live="polite">Загрузка настроек…</span>
+        <p class="settings-partial" id="partial-warning" hidden></p>
+      </div>
+    </footer>
+  </main>
+
+  <dialog class="settings-dialog" id="dialog-close" aria-labelledby="dialog-close-title">
+    <h2 id="dialog-close-title">Неприменённые изменения API-ключей</h2>
+    <p id="dialog-close-text">В черновике API-ключей есть изменения. Применить их перед закрытием?</p>
+    <div class="settings-dialog-actions">
+      <button type="button" class="settings-button" id="dialog-close-return">Вернуться</button>
+      <button type="button" class="settings-button" id="dialog-close-discard">Не применять</button>
+      <button type="button" class="settings-button settings-primary" id="dialog-close-save">Применить ключи</button>
+    </div>
+  </dialog>
+
+  <dialog class="settings-dialog" id="dialog-confirm" aria-labelledby="dialog-confirm-title">
+    <h2 id="dialog-confirm-title">Подтверждение</h2>
+    <p id="dialog-confirm-text"></p>
+    <div class="settings-dialog-actions">
+      <button type="button" class="settings-button" id="dialog-confirm-cancel">Отмена</button>
+      <button type="button" class="settings-button settings-primary" id="dialog-confirm-ok">Продолжить</button>
+    </div>
+  </dialog>
+</body>
+</html>

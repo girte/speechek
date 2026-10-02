@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-settings-apply-keys"
+description = "Enables the settings_apply_keys command without any pre-configured scope."
+commands.allow = ["settings_apply_keys"]
+
+[[permission]]
+identifier = "deny-settings-apply-keys"
+description = "Denies the settings_apply_keys command without any pre-configured scope."
+commands.deny = ["settings_apply_keys"]

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="ru" data-state="idle">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Speechek — диктовка</title>
+  <link rel="stylesheet" href="/overlay.css">
+  <script type="module" src="/overlay.js"></script>
+</head>
+<body>
+  <!--
+    One compact pill, one wider notice: the shell gives this page a 240x64
+    transparent window for a recording and a 360x64 one while a notice shows.
+    The 224x48 recording pill sits in the middle of its window with a clear 8px
+    margin on every side; error, clipboard-fallback and warning notices widen it
+    to 344x48. The single row is the nine-bar meter, the two-line readout — the
+    status line the shell announces, over the mode that records — and the elapsed
+    time. No transcript is ever drawn here: while recognition finishes, the meter
+    is replaced by a spinner and the status says that processing is in progress.
+    The shell hides the pill before insertion. Nothing is clickable; the
+    configured global hotkey is the only recording trigger.
+  -->
+  <main class="overlay" id="overlay" data-state="idle">
+    <section class="pill" aria-label="Диктовка">
+      <!-- Decorative: the status line below says what the bars cannot. -->
+      <div class="meter" id="meter" aria-hidden="true">
+        <span class="bar"></span><span class="bar"></span><span class="bar"></span>
+        <span class="bar"></span><span class="bar"></span><span class="bar"></span>
+        <span class="bar"></span><span class="bar"></span><span class="bar"></span>
+      </div>
+      <div class="processing-indicator" aria-hidden="true"></div>
+      <div class="readout">
+        <p class="status" id="status" role="status" aria-live="polite">Готовим оверлей…</p>
+        <p class="mode" id="mode"></p>
+      </div>
+      <span class="timer" id="timer" role="timer"><span class="visually-hidden">Длительность записи </span><span id="elapsed">00:00</span></span>
+    </section>
+  </main>
+</body>
+</html>

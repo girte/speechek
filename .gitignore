@@ -1,0 +1,31 @@
+node_modules/
+
+# Local secrets are never committed.
+.env
+.env.*
+!.env.example
+/config/settings.json
+secrets.bin
+keys.txt
+
+# Native build output.
+src-tauri/target/
+src-tauri/gen/
+
+# Never persist recordings.
+*.wav
+*.pcm
+*.webm
+
+# Local noise.
+*.log
+.DS_Store
+Thumbs.db
+
+# Private working set: pre-cutover snapshot, local notes/tools, internal docs.
+# Kept on disk, never published. See scripts/public-files.json for the
+# explicit public allowlist that the public repository is built from.
+.private/
+.agents/
+/docs/backlog.md
+/docs/release-research.md

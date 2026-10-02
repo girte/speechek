@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Speechek — сравнение Gemini Transcribe</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <main class="shell">
+    <header class="masthead">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">◉</span> SPEECHEK <span class="edition">LAB</span></div>
+      <h1>Говорите свободно.<br><em>Выберите результат.</em></h1>
+      <p class="intro">Три режима Gemini 3.5 Transcribe на одной записи: быстрый Live Smart, Smart с обработкой и дословный результат. Все три результата появляются рядом — выбирайте подходящий.</p>
+    </header>
+
+    <section class="recorder" aria-labelledby="record-title">
+      <div class="section-heading"><span class="section-index">01 / ЗАПИСЬ</span><h2 id="record-title">Микрофон</h2></div>
+      <div class="controls">
+        <button id="record-button" class="record-button" type="button"><span class="record-dot" aria-hidden="true"></span><span id="record-label">Начать запись</span></button>
+        <span id="timer" class="timer" aria-label="Длительность записи">00:00</span>
+        <span id="status" class="status" role="status" aria-live="polite">Готово к записи</span>
+      </div>
+      <p class="hint">Лаборатория сравнивает все три режима на одной записи: это три запроса к Gemini. Выбранный режим обычной диктовки задаётся в настройках Speechek. Аудио и ключ через браузер не сохраняются. Максимальная длительность — 10 минут. Микрофон выбирается в настройках Speechek (раздел «Общие») и действует со следующей записи — во встроенной лаборатории.</p>
+      <p id="browser-note" class="hint" hidden>Страница открыта в обычном браузере, а не в окне Speechek: запись идёт с микрофона, который браузер запросит у вас сейчас, и выбранное в настройках Speechek устройство здесь не применяется.</p>
+      <div id="warning" class="notice" role="status" hidden></div>
+      <div id="error" class="error" role="alert" hidden></div>
+    </section>
+
+    <section class="results" aria-labelledby="results-title">
+      <div class="section-heading"><span class="section-index">02 / РЕЗУЛЬТАТ</span><h2 id="results-title">Расшифровка</h2></div>
+      <div class="result-grid">
+        <article class="result" id="live-card" aria-labelledby="live-title"><div class="result-head"><span class="result-tag">01 · ПОТОК</span><h3 id="live-title">Live Smart</h3><span class="model-name">gemini-3.5-transcribe-live</span></div><p id="live-text" class="transcript empty" aria-live="polite">Начните запись, чтобы увидеть текст в реальном времени.</p><div id="live-meta" class="result-meta">Ожидание записи</div></article>
+        <article class="result" id="smart-card" aria-labelledby="smart-title"><div class="result-head"><span class="result-tag">02 · ПОСЛЕ ЗАПИСИ</span><h3 id="smart-title">Smart</h3><span class="model-name">gemini-3.5-transcribe</span></div><p id="smart-text" class="transcript empty">Уберёт повторы, запинки и оформит текст.</p><div id="smart-meta" class="result-meta">Ожидание записи</div></article>
+        <article class="result" id="verbatim-card" aria-labelledby="verbatim-title"><div class="result-head"><span class="result-tag">03 · ПОСЛЕ ЗАПИСИ</span><h3 id="verbatim-title">Дословно</h3><span class="model-name">gemini-3.5-transcribe</span></div><p id="verbatim-text" class="transcript empty">Сохранит произнесённые слова без умной обработки.</p><div id="verbatim-meta" class="result-meta">Ожидание записи</div></article>
+      </div>
+      <p class="interpretation">Live Smart и пакетный Smart используют разные варианты модели и могут оформлять одинаковую речь по-разному. Дословный режим полезен для проверки слов, которые Smart мог изменить. Ошибка соединения не считается результатом распознавания.</p>
+    </section>
+
+    <footer><p><strong>Приватность:</strong> бесплатный тариф Google Free-tier может использовать отправленную речь и ответы для улучшения сервисов, в том числе с участием проверяющих. Не диктуйте личные или конфиденциальные сведения. Ключ Gemini хранится в защищённом хранилище Windows (DPAPI текущего пользователя) рядом с %APPDATA%/Speechek/settings.json; посмотреть или изменить его можно в окне настроек — правый щелчок по значку Speechek в области уведомлений, приложение читает ключ локально и браузеру не передаёт. Часть кода вставки основана на стороннем проекте — <a href="/licenses/Handy.LICENSE">уведомление о лицензии MIT</a>; полный список — <a href="/licenses/THIRD-PARTY-NOTICES.txt">лицензии компонентов</a>.</p></footer>
+  </main>
+</body>
+</html>

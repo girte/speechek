@@ -1,0 +1,68 @@
+; ═══════════════════════════════════════════════════════════════════════════
+; Speechek — English NSIS messages
+;
+; Complete set of the pinned upstream language file
+; (tauri-cli-v2.12.0 crates/tauri-bundler/src/bundle/windows/nsis/languages/English.nsh)
+; plus the Speechek-specific messages used by installer.nsi / common.nsh.
+; Every string present here must also be present in Russian.nsh.
+; ═══════════════════════════════════════════════════════════════════════════
+
+; ── Pinned upstream strings ────────────────────────────────────────────────
+LangString addOrReinstall ${LANG_ENGLISH} "Add/Reinstall components"
+LangString alreadyInstalled ${LANG_ENGLISH} "Already Installed"
+LangString alreadyInstalledLong ${LANG_ENGLISH} "${PRODUCTNAME} ${VERSION} is already installed. Select the operation you want to perform and click Next to continue."
+LangString appRunning ${LANG_ENGLISH} "${PRODUCTNAME} is running! Please close it first then try again."
+LangString appRunningOkKill ${LANG_ENGLISH} "${PRODUCTNAME} is running!$\nClick OK to kill it"
+LangString chooseMaintenanceOption ${LANG_ENGLISH} "Choose the maintenance option to perform."
+LangString choowHowToInstall ${LANG_ENGLISH} "Choose how you want to install ${PRODUCTNAME}."
+LangString createDesktop ${LANG_ENGLISH} "Create desktop shortcut"
+LangString dontUninstall ${LANG_ENGLISH} "Do not uninstall"
+LangString dontUninstallDowngrade ${LANG_ENGLISH} "Do not uninstall (Downgrading without uninstall is disabled for this installer)"
+LangString failedToKillApp ${LANG_ENGLISH} "Failed to kill ${PRODUCTNAME}. Please close it first then try again"
+LangString installingWebview2 ${LANG_ENGLISH} "Installing WebView2..."
+LangString newerVersionInstalled ${LANG_ENGLISH} "A newer version of ${PRODUCTNAME} is already installed! It is not recommended that you install an older version. If you really want to install this older version, it's better to uninstall the current version first. Select the operation you want to perform and click Next to continue."
+LangString older ${LANG_ENGLISH} "older"
+LangString olderOrUnknownVersionInstalled ${LANG_ENGLISH} "An $R4 version of ${PRODUCTNAME} is installed on your system. It's recommended that you uninstall the current version before installing. Select the operation you want to perform and click Next to continue."
+LangString silentDowngrades ${LANG_ENGLISH} "Downgrades are disabled for this installer, can't proceed with the silent installer, please use the graphical interface installer instead.$\n"
+LangString unableToUninstall ${LANG_ENGLISH} "Unable to uninstall!"
+LangString uninstallApp ${LANG_ENGLISH} "Uninstall ${PRODUCTNAME}"
+LangString uninstallBeforeInstalling ${LANG_ENGLISH} "Uninstall before installing"
+LangString unknown ${LANG_ENGLISH} "unknown"
+LangString webview2AbortError ${LANG_ENGLISH} "Failed to install WebView2! The app can't run without it. Try restarting the installer."
+LangString webview2DownloadError ${LANG_ENGLISH} "Error: Downloading WebView2 Failed - $0"
+LangString webview2DownloadSuccess ${LANG_ENGLISH} "WebView2 bootstrapper downloaded successfully"
+LangString webview2Downloading ${LANG_ENGLISH} "Downloading WebView2 bootstrapper..."
+LangString webview2InstallError ${LANG_ENGLISH} "Error: Installing WebView2 failed with exit code $1"
+LangString webview2InstallSuccess ${LANG_ENGLISH} "WebView2 installed successfully"
+LangString deleteAppData ${LANG_ENGLISH} "Delete the application data"
+
+; ── Speechek strings ───────────────────────────────────────────────────────
+LangString speechekInstallerRunning ${LANG_ENGLISH} "An installation of Speechek is already running in another window. Close it and run the installer again."
+LangString speechekPlatformUnsupported ${LANG_ENGLISH} "Speechek requires Windows 11 x64. Installing on this Windows version or architecture is not supported."
+LangString speechekRepairRequired ${LANG_ENGLISH} "The installed Speechek version could not be determined reliably. Manual diagnosis is required: run the installer of the current or a newer version to repair the installation."
+LangString speechekDowngradeBlocked ${LANG_ENGLISH} "A newer version of Speechek ($R4) is installed. This installer ($R5) is older and cannot replace it. Use the installer of the same or a newer version."
+LangString speechekHashMismatch ${LANG_ENGLISH} "The installer is corrupted: the embedded file checksum or version does not match the expected values. Download the installer again."
+LangString speechekPayloadMissing ${LANG_ENGLISH} "The installer could not prepare its embedded files in the temporary directory. The installation was cancelled and nothing was changed."
+LangString speechekPrecheckHeader ${LANG_ENGLISH} "Existing installation detected"
+LangString speechekPrecheckTitle ${LANG_ENGLISH} "Speechek will be installed in place; your data and settings are kept."
+LangString speechekPrecheckUpgrade ${LANG_ENGLISH} "Version $R4 is currently installed. Version ${VERSION} will be installed. Your data and settings are kept."
+LangString speechekPrecheckReinstall ${LANG_ENGLISH} "Version ${VERSION} is already installed. It will be reinstalled in place without deleting your data or settings."
+LangString speechekContinue ${LANG_ENGLISH} "Continue"
+LangString speechekOptionsHeader ${LANG_ENGLISH} "Installation options"
+LangString speechekOptionsTitle ${LANG_ENGLISH} "Choose additional options for Speechek."
+LangString speechekDesktopShortcutOption ${LANG_ENGLISH} "Create a desktop shortcut"
+LangString speechekStartupOption ${LANG_ENGLISH} "Start Speechek when I sign in to Windows"
+LangString speechekRunAfterInstall ${LANG_ENGLISH} "Run Speechek"
+LangString speechekCloseWarning ${LANG_ENGLISH} "Speechek will be closed. A dictation in progress and unapplied API key changes will be lost. After a 5 second wait, a hung application is terminated forcefully; the latest settings may only be partially saved and Windows audio may stay muted. Continue?"
+LangString speechekCloseCancelled ${LANG_ENGLISH} "Installation cancelled. Nothing was changed."
+LangString speechekFileInUse ${LANG_ENGLISH} "Speechek.exe is in use by another process or cannot be closed. Close it manually and run the installer again."
+LangString speechekCannotConfirmExit ${LANG_ENGLISH} "Could not confirm that Speechek has finished. The installation was cancelled and no files were changed."
+LangString speechekRunValueTooLong ${LANG_ENGLISH} "Autostart could not be enabled: the application path is too long for the Windows Run entry. The installation will be cancelled."
+LangString speechekRollbackDone ${LANG_ENGLISH} "The installation did not complete and the previous version was restored; all changes were rolled back."
+LangString speechekRollbackFailed ${LANG_ENGLISH} "The installation did not complete and the previous state could not be fully restored. Run the installer of the current or a newer version to repair the installation. Install directory: $INSTDIR"
+LangString speechekDeleteData ${LANG_ENGLISH} "Delete settings and API keys"
+LangString speechekDataDeleteFailed ${LANG_ENGLISH} "Some data could not be deleted and remains on disk: $R0"
+LangString speechekDataDeleteUnsafe ${LANG_ENGLISH} "Data was not deleted because the path is not safe to remove: $R0"
+LangString speechekUninstallEntryKept ${LANG_ENGLISH} "The registry entry for this installation points to a different directory and was not removed. Check the Speechek installations manually."
+LangString speechekBackupFailed ${LANG_ENGLISH} "The installer could not save the current installation to a temporary backup, so nothing was replaced. Close other programs that may lock the installation files and run the installer again."
+LangString speechekUninstallIncomplete ${LANG_ENGLISH} "Some installed files could not be deleted and remain on disk. The uninstall entry was kept so the installation can be repaired or removed again."

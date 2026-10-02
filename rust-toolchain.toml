@@ -1,0 +1,7 @@
+# Pinned release toolchain (see docs/releasing.md).
+# The release helper asserts this exact channel and target; cargo refuses to
+# build with a different toolchain because rustup honours this file.
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+targets = ["x86_64-pc-windows-msvc"]

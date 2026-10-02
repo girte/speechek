@@ -1,0 +1,60 @@
+name: Bug report
+description: Report a problem with Speechek
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem.
+
+        **Do not attach or paste** Gemini API keys, `secrets.bin`, `settings.json`, audio recordings or other personal data. This form does not require any of them.
+  - type: input
+    id: version
+    attributes:
+      label: Speechek version
+      description: Shown in the installer or in the release name, for example `0.2.0`.
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows build and architecture
+      description: Run `winver` and include the build number and architecture.
+      placeholder: "Windows 11 23H2 (build 22631.4317), x64"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What you did, in order.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What happened instead, including any message shown on screen.
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Optional. Screenshots without personal data are welcome.
+    validations:
+      required: false
