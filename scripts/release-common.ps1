@@ -76,7 +76,7 @@ function Get-SpeechekWorkTreeStatus {
 function Assert-SpeechekCleanTree {
     param([Parameter(Mandatory = $true)][string]$RepoRoot)
 
-    $dirty = Get-SpeechekWorkTreeStatus $RepoRoot
+    $dirty = @(Get-SpeechekWorkTreeStatus $RepoRoot)
     if ($dirty.Count -gt 0) {
         $shown = ($dirty | Select-Object -First 20) -join "`n  "
         throw ("the source tree is not clean; commit or stash every change before a release build" +
