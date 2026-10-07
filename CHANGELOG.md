@@ -5,6 +5,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 The text of each GitHub Release is generated from the matching version section below plus a fixed install/unsigned/known-limitations/SHA-256 footer.
 
+## [Unreleased]
+
+### Changed
+
+- Rewrote the English and Russian user guides for everyday users: task-oriented sections, a troubleshooting list by symptom, and the developer-only profile details moved to `CONTRIBUTING.md`. Bug reports can now note the recognition mode, and both issue forms accept English or Russian.
+
 ## [0.3.0] - 2026-10-07
 
 ### Added

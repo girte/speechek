@@ -21,6 +21,16 @@ The debug executable appears at `src-tauri\target\debug\speechek.exe`.
 
 The debug build is **portable**: double-click `src-tauri\target\debug\speechek.exe` to run it — no installer, shortcuts, uninstall entry or registry write. The Development profile keeps its `settings.json` and `secrets.bin` beside that EXE (inside `src-tauri\target\debug`), separate from the installed production app, which keeps them under `%APPDATA%\Speechek`; the two profiles never read each other's files.
 
+The three build profiles never share files, hotkeys or ports:
+
+| Profile | Settings and keys | Default hotkey | First port | Interface language on first start |
+| --- | --- | --- | --- | --- |
+| Production (installed) | `%APPDATA%\Speechek` | `F2` | `4173` | Installer choice (`1033` English / `1049` Russian), else Windows UI language |
+| Development (debug EXE) | Beside the EXE | `Ctrl+Shift+F9` | `4174` | Ignores installer registry entries; Windows UI language |
+| Test | `%APPDATA%\Speechek-Test` or an absolute `SPEECHEK_CONFIG_PATH` | `Ctrl+Shift+F10` | `4175` | Reads only its own isolated installer entry, never Production's |
+
+A saved `language` in the profile always wins; changing it in the app never writes the installer registry value. The uninstaller removes only the Production profile, and the installer closes only a copy running from the install folder.
+
 For a release build, link the C runtime statically for that command only:
 
 ```bat

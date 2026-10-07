@@ -7,15 +7,15 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for reporting a problem.
+        Thanks for reporting a problem. You can write in English or Russian.
 
         **Do not attach or paste** Gemini API keys, `secrets.bin`, `settings.json`, audio recordings or other personal data. This form does not require any of them.
   - type: input
     id: version
     attributes:
       label: Speechek version
-      description: Shown in the installer or in the release name, for example `0.2.0`.
-      placeholder: "0.2.0"
+      description: "Find it in Windows Settings → Apps → Installed apps → Speechek, or in the installer file name, for example `0.3.0`."
+      placeholder: "0.3.0"
     validations:
       required: true
   - type: input
@@ -26,6 +26,19 @@ body:
       placeholder: "Windows 11 23H2 (build 22631.4317), x64"
     validations:
       required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Recognition mode
+      description: Optional. The mode selected in Settings → General settings when the problem happened.
+      options:
+        - Live Smart
+        - Smart
+        - Verbatim
+        - Not related to recognition
+        - Not sure
+    validations:
+      required: false
   - type: textarea
     id: steps
     attributes:

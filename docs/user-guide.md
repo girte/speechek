@@ -2,149 +2,236 @@
 
 [English](user-guide.md) | [Русский](user-guide.ru.md) · Back to [README](../README.md)
 
-This guide covers installation, your Gemini API key, the settings window, the settings files, privacy, updating, uninstalling, autostart and diagnostics.
+The [README](../README.md) gets you from download to your first dictation. This guide covers the rest: every setting, how several keys work together, what happens to your recordings, updating, uninstalling and fixing common problems.
+
+**Contents:** [Requirements](#requirements) · [Install](#install) · [Gemini API key](#gemini-api-key) · [Dictating](#dictating) · [Recognition modes and the lab](#recognition-modes-and-the-lab) · [Settings](#settings) · [The settings file](#the-settings-file) · [Privacy and limitations](#privacy-and-limitations) · [Start at sign-in and the taskbar](#start-at-sign-in-and-the-taskbar) · [Updating](#updating) · [Uninstalling](#uninstalling) · [Troubleshooting](#troubleshooting)
 
 ## Requirements
 
-- **Windows 11 x64** (the installer also runs on ARM64 through Windows emulation only for non-target use; the supported platform is x64).
-- **Microsoft WebView2 Runtime.** The installer downloads the bootstrapper if it is missing, so the first download needs internet access.
-- **Internet access** for recognition, and a Gemini region where the Google AI API is available.
-- A **microphone** visible to Windows.
+- **Windows 11 x64.** The installer refuses to run on ARM64 PCs, Windows 10 and Windows Server.
+- **Microsoft WebView2 Runtime.** Windows 11 usually has it. If it's missing, the installer downloads it, so install with the internet on.
+- **An internet connection** and a country where the [Gemini API is available](https://ai.google.dev/gemini-api/docs/available-regions).
+- **A microphone** that Windows can see.
 
-## Install and first run
+## Install
 
-Run the `*-setup.exe` downloaded from [Releases](https://github.com/girte/speechek/releases). The installer:
+Download `Speechek_<version>_x64-setup.exe` from [Releases](https://github.com/girte/speechek/releases) and run it.
 
-- installs into your user profile (`%LOCALAPPDATA%\Speechek`), without administrator rights;
-- offers a **desktop shortcut** and **start at sign-in** on a first install, both unchecked;
-- has a **Run Speechek** box on the final page, checked by default;
-- is not code-signed, so SmartScreen or Smart App Control may warn or block.
+- It installs for your user only, into `%LOCALAPPDATA%\Speechek`. No administrator rights needed.
+- On a first install it offers **Create a desktop shortcut** and **Start Speechek when I sign in to Windows**. Both are unchecked; tick what you want.
+- **Run Speechek** on the last page is checked, so the app starts right away.
+- The installer isn't code-signed. SmartScreen may warn you: click **More info → Run anyway**. Smart App Control or a strict company policy can block it completely.
 
-On the first launch Speechek creates `%APPDATA%\Speechek\settings.json` with an annotated template and **keeps running**: the process does not exit and no separate text file for keys is created. The settings window opens on the **API keys / API-ключи** section — enter at least one Gemini key, one per line, and click **Apply keys / Применить ключи**. No restart is required. Do not keep keys in `settings.json` or in Git.
+Speechek has no main window. After the first start it lives in the system tray (the area by the clock; look under the **^** arrow if the icon is hidden) and opens the settings window on the **API keys** tab, so you can add your key straight away.
 
-There is no main window: the icon lives in the system tray. The app needs Microsoft WebView2 Runtime, microphone access and a free local port (default `127.0.0.1:4173`, changeable in General settings and applied after a restart). If the saved port is busy at startup, the app temporarily listens on a free port and reports it in the window. Keys are encrypted for the current Windows user; another account cannot read them.
+## Gemini API key
 
-## Getting a Gemini API key
+Speechek has no servers of its own. It sends audio straight to Google Gemini under your own key, so you need one.
 
-1. Sign in with a Google account and open the [Gemini keys page in AI Studio](https://aistudio.google.com/apikey).
-2. Accept the terms. On your first visit AI Studio creates a default project and a key. If it doesn't, or you want another project, create a project right in AI Studio (no Google Cloud console needed) and click "Create API key" in it. AI Studio also shows each project's usage. New AI Studio keys are issued as authorization (auth) keys.
-3. Billing is not required: the Free Tier is available to an active project without a linked payment method and gives free input and output for the available models. Limits depend on the model and are counted **per project, not per key**, so several keys in one project share one quota; for more headroom create a separate AI Studio project for each key. Current values are on the [rate limits page](https://ai.google.dev/gemini-api/docs/rate-limits), available models and prices on the [pricing page](https://ai.google.dev/gemini-api/docs/pricing). The listed limits are not guaranteed and can change.
-4. Copy the key (you can copy several), paste them one per line in the settings window under **API keys / API-ключи**, and click **Apply keys / Применить ключи**. **Check keys / Проверить ключи** confirms only API access (`models.list`), not quota, model choice or recognition quality.
+### Getting a key
 
-The Gemini API Free Tier and AI Studio are not available in every country — check the [available regions list](https://ai.google.dev/gemini-api/docs/available-regions). On the free tier Google may use the content you send to improve its products — see the [terms](https://ai.google.dev/gemini-api/terms) and the privacy section below.
+1. Open [Google AI Studio → API keys](https://aistudio.google.com/apikey) and sign in with your Google account.
+2. Accept the terms. On your first visit AI Studio creates a project and a key for you. If it doesn't, create a project right there in AI Studio (you don't need the Google Cloud console) and click **Create API key**.
+3. Copy the key.
 
-## Quick start
+You don't need to add a payment method: the Free Tier works on a project without billing. Free limits depend on the model and can change; current numbers are on Google's [rate limits](https://ai.google.dev/gemini-api/docs/rate-limits) and [pricing](https://ai.google.dev/gemini-api/docs/pricing) pages. AI Studio shows how much each project has used.
 
-1. Put the cursor in the text field you want.
-2. Press **F2** (or your configured hotkey), speak, and press it again.
-3. While recording, the overlay pill occupies 224×48 CSS pixels: indicator, status and timer separated by equal 12-pixel gaps. After you stop, a "Processing / Обработка" label and a spinning indicator remain; on an error the pill widens to show the reason. When the result is ready the pill hides before the text is pasted. It does not take focus: the text is pasted into the field active at paste time and stays in the clipboard.
-4. **Escape** during recording or while waiting for the transcript cancels the current dictation: the pill hides, the microphone is released, the result is not pasted and the clipboard is not changed. If Gemini processing has already started, the sent request cannot be recalled. Outside dictation, Escape is an ordinary key of the active application.
+### Adding it to Speechek
 
-If the app cannot confirm the automatic paste, it shows "Copied — paste manually / Скопировано — вставьте вручную" for a few seconds. The text is already in the clipboard: press **Ctrl+V** in the target field. If you copied something else during the operation, Speechek will not overwrite the newer copy. Once the text handover has begun, Windows cannot recall the Ctrl+V already sent; press Escape during recording or while waiting for the transcript instead.
+Right-click the tray icon → **Settings** → **API keys** → paste the key → **Apply keys**. No restart needed.
 
-Until at least one key is saved, dictation does not start: pressing the hotkey opens the settings window on **API keys / API-ключи** instead of recording.
+Until at least one key is saved, the hotkey doesn't record. It opens this tab instead.
 
-## Tray and settings window
+### Several keys
 
-Right-clicking the tray icon opens a native menu with two items — **Settings / Настройка** and **Exit / Выход**, in that order; the click itself does not open the window. **Settings / Настройка** shows the single settings window and gives it focus **at any time, including during dictation**: a recording in progress is not cancelled or stopped and continues as usual; closing the window during dictation does not affect the session either. The hotkey starts and stops recording even with settings open, except while the cursor is in the hotkey field itself, where you can enter the active combination without starting a recording. The paste target is chosen only when the text is ready: if settings are active at that moment, Speechek does not paste into its own fields and keeps the text in the clipboard instead.
+Google counts free limits **per project, not per key**. Two keys from the same project share one quota and give you nothing extra. To get more free dictation, create a **separate project for each key** in AI Studio and add all the keys to Speechek, one per line.
 
-- General settings — mode, mute during recording, microphone and hotkey — apply immediately, **no restart needed**; the local port is saved immediately but applied after a restart. API keys are applied with the separate **Apply keys / Применить ключи** button. Recording parameters and the key list changed during dictation take effect from the next recording: the current session finishes with the snapshot captured at its start. Interface language is separate from that snapshot and changes immediately, including during recording.
-- Closing the settings or lab window does not exit the app. If the key draft contains a genuinely changed or not-yet-submitted list, closing the window (and the **Exit / Выход** item) asks **Apply keys / Применить ключи**, **Do not apply / Не применять** or **Return / Вернуться**; **Do not apply / Не применять** destroys only the key draft and does not roll back already-applied general settings. Viewing and hiding the saved list without edits does not count as a change, so the question does not appear on close.
-- The tray **Exit / Выход** item exits the app: the microphone, global hotkeys and port are released. An unapplied key draft and an unfinished apply are not lost silently.
-- While recording, the hotkey cannot be changed: the combination field is disabled and submitting a new value is rejected with a clear hint until dictation finishes or is cancelled. Other recording settings — mode, mute and key operations — are available during recording but take effect from the next dictation and do not change the current one. The interface-language selector remains available and changes UI text immediately.
-- The "?" hints next to settings open on hover or keyboard focus; a click does not pin the card, and moving the pointer away, losing focus, pressing Escape or switching sections hides it. The key-list field itself has no extra hint: the "apply keys" rule stays in the **API keys / API-ключи** section. The expanded microphone list uses the app colours if WebView2 supports a stylable `<select>`; other versions keep the system list. The settings and lab scrollbars stay visible and use the app palette.
-- The lab always compares all three modes on one recording; there is no separate comparison toggle, and its button is unavailable while dictation is running. A lab recording uses the same native capture as dictation, one microphone at a time; closing the lab window stops its recording instead of leaving the microphone to a hidden page.
+Speechek then uses them in turn: the first dictation goes to the first key, the next one to the second, and so on in a circle. A few details:
+
+- If you change the list, counting starts again from the first key. A dictation already in progress finishes on the old list.
+- If Gemini rejects the key chosen for a dictation (quota used up, key revoked), that dictation ends with an error. Speechek doesn't retry it on another key; the next dictation simply gets the next key.
+- A request that fails before it reaches Gemini, for example because the recording is damaged, doesn't use up a turn.
+
+## Dictating
+
+1. Click into the text field where the text should go.
+2. Press **F2** (or your own hotkey) and speak. A small pill at the bottom of the screen shows **Recording**, a level meter and a timer.
+3. Press **F2** again. The pill switches to **Processing**.
+4. When the text is ready, the pill disappears and the text is pasted into whatever field is active at that moment. The text also stays on your clipboard.
+
+The pill never takes focus, so you can keep working while it's visible. One recording can be up to 10 minutes long.
+
+### Cancelling
+
+Press **Esc** while recording or while the pill says **Processing**. The pill disappears, the microphone turns off, nothing is pasted, and your clipboard stays as it was.
+
+Two limits:
+
+- Audio already sent to Gemini can't be called back. Esc only guarantees that the answer won't be pasted.
+- Once the paste has started, it's too late: Windows has already received Ctrl+V.
+
+Outside a dictation, Esc works as usual in your other apps.
+
+### When the text isn't pasted automatically
+
+Sometimes Speechek can't confirm that the target app accepted the paste. Then the pill shows **Copied — paste manually** for a few seconds. The text is on your clipboard: click into the field and press **Ctrl+V**.
+
+This also happens when:
+
+- the Speechek settings window is the active window when the text is ready (Speechek doesn't paste into its own fields);
+- the target app runs as administrator, and Windows blocks a normal app from pasting into it.
+
+If you copy something else while Speechek is working, your newer copy wins: Speechek won't overwrite it.
+
+## Recognition modes and the lab
+
+| Mode | When the text arrives | What you get |
+|---|---|---|
+| **Live Smart** | Recognized while you speak, pasted after you stop | Clean text without filler words, formatted by meaning |
+| **Smart** | The whole recording is processed after you stop | Clean text without filler words, formatted by meaning |
+| **Verbatim** | The whole recording is processed after you stop | Your exact words, without Smart editing |
+
+Live Smart pastes only the final text, never the partial results it sees along the way.
+
+**The lab** helps you choose. In **Settings → General settings**, click **Compare modes in real time**: you record once and see the results of all three modes side by side. One lab recording costs three Gemini requests. The lab button is unavailable while a dictation is running, and closing the lab window stops its recording.
+
+## Settings
+
+Right-click the tray icon → **Settings**. Left-clicking the icon does nothing. The menu has just two items: **Settings** and **Exit**.
+
+You can open settings at any time, even mid-dictation; the recording carries on. Closing the window doesn't quit Speechek. Only **Exit** in the tray menu does that, and it frees the microphone, the hotkey and the local port.
+
+Most settings apply the moment you change them. API keys are the exception: they apply only when you click **Apply keys**.
+
+If you change settings during a dictation, the current recording finishes with the settings it started with. The changes apply from the next one. The interface language is the only thing that switches immediately.
 
 ### Interface language
 
-The **Language / Язык интерфейса** selector is in the settings header, above both **General settings / Общие настройки** and **API keys / API-ключи**. Its two choices always read **English** and **Русский**; there is no automatic third option.
+The **Language** switch sits at the top of the window: **English** or **Русский**. The choice is saved and applied at once to every window, the pill and the tray menu, with no restart. It doesn't stop a recording, doesn't touch unapplied keys, and doesn't translate your dictated text.
 
-A successful choice is saved and immediately updates settings, the built-in lab, overlay, tray menu, window titles, hints and messages, including already displayed statuses and errors. It needs no restart and does not stop recording, reset its timer, lose an API-key draft or translate speech or transcripts. Recognition mode, microphone and key list for an active recording stay pinned to that session. The choice does not change the NSIS installer or uninstaller language. A lab opened separately in an ordinary browser refreshes the language when its window regains focus; it does not receive the instant native-window settings event.
-
-Initial language is resolved in this order:
-
-1. The app's saved `language` choice (`en` or `ru`).
-2. A supported installer choice: English (`1033`) or Russian (`1049`). A missing, unreadable, malformed or unsupported installer value is treated as absent.
-3. The Windows **UI** language, not the region or keyboard layout: a Russian primary language selects Russian, and every other language selects English.
-
-Development ignores installer registry entries and, without a saved app choice, uses Windows UI language. Test reads only its isolated installer entry, never Production's; it also keeps an independent saved choice. Changing the app language does not write the installer registry value.
-
-Switching language does not apply, clear or replace the key draft. Existing hotkey and port commits are unchanged: if you leave either field to reach the selector, its usual blur commit still runs. A translation refresh itself does not submit fields or overwrite their unsubmitted text.
+On the very first start Speechek picks the language you chose in the installer. Without one, it follows the Windows display language: Russian if Windows is in Russian, English otherwise.
 
 ### General settings
 
-- **Recognition mode / Режим распознавания**: **Live Smart** — streaming recognition during speech, the result arrives after you stop; **Smart** — recognition after recording with filler-word removal and formatting by meaning; **Verbatim / Дословно** — recognition after recording without editing. Switching applies immediately to the settings used for the next recording.
-- **Hotkey / Горячая клавиша**: a plain text field with the current applied value. Enter `F2` or a combination such as `Ctrl+Shift+Space` and press Enter or move focus out of the field — the finished value applies immediately, there is no separate button; typing character by character only edits the field. Single letters and digits are not accepted, a modifier is required (Ctrl, Alt, Shift, Super); single function keys F1–F11 and F13–F24 are allowed, `F12` is reserved by the app and `Fn` is not reported to applications by Windows. An empty string, `Fn`, `F12` and a combination of modifiers only are rejected with an error next to the field, and the previous working combination keeps working. If the combination is taken by another program, the value is not applied and the previous key stays active. By default the hotkey is `F2`. **Escape without modifiers** is rejected: Escape is reserved for cancelling dictation.
-- **Mute sound while recording / Отключать звук во время записи** — when enabled, Speechek mutes the overall Windows sound on the default playback device (the same control as the mute key) only for the actual microphone recording and restores the previous state after stopping or cancelling; outside recording the sound is untouched. If you changed the sound yourself during recording, Speechek keeps your decision. A failed mute or restore does not interrupt dictation: the pill shows a localized warning. Off by default; the change applies from the next dictation.
-- **Start Speechek when signing in to Windows / Запускать Speechek при входе в Windows** — the same current-user autostart registration the installer can create: the switch is on when Speechek's own entry points to this executable and Windows has not disabled it, off when the entry is absent or disabled, and mixed/disabled while the registration cannot be read. Turning it on here re-enables an autostart that was disabled in Windows, so there is no need to open **Settings → Apps → Startup**; signing in may take slightly longer. The installer and this switch write the same registry value.
-- **Microphone / Микрофон** — a dropdown of recording devices: **System default device / Системное устройство по умолчанию** plus connected devices with their identifiers; the list refreshes when the window opens and is activated. The choice is saved immediately and applies from the next recording — for both normal dictation and the built-in lab; a recording in progress finishes on the previous device. If the selected device is disconnected, recording uses the system microphone and the pill and window warn about it; the saved choice is not replaced by itself — select the device again when it reappears. The lab opened in an ordinary browser without the Speechek window uses the browser microphone. This selects the **input** device; it is unrelated to mute-during-recording, which targets the playback device.
-- **Local port / Локальный порт** — the port of the built-in server, default `4173`. Typing digits only edits the field; Enter or leaving the field saves a whole number in the range 1–65535, and it applies after an app restart. If the saved port is busy at startup, the app temporarily listens on a free port and reports it in the settings window without overwriting the saved value.
+**Recognition mode.** Live Smart, Smart or Verbatim; see [the table above](#recognition-modes-and-the-lab).
+
+**Hotkey.** Type a key or a combination, for example `F2` or `Ctrl+Shift+Space`, then press Enter or click elsewhere. It applies immediately.
+
+- You can use a letter (A–Z), a digit (0–9), F1–F24 except F12, Space, Enter, Tab, the arrows, Home/End, PageUp/PageDown, Insert, Delete or Backspace. Add `Ctrl`, `Alt`, `Shift` or `Super` (the Windows key) in front if you like.
+- A modifier is optional, but a bare letter, digit or Space would take that key away from every other app. Function keys or combinations are the safer choice.
+- Not allowed: F12 (reserved), Fn (Windows doesn't report it to apps), Esc on its own (it cancels dictation), modifiers on their own.
+- If the combination is invalid or taken by another program, you'll see why next to the field, and the old key keeps working.
+- The hotkey can't be changed while a dictation is running.
+- While your cursor is in this field, pressing the hotkey types it instead of starting a recording.
+
+**Microphone.** The system default or a specific device. The choice applies to the next recording, in both dictation and the lab. If the selected microphone gets disconnected, Speechek records from the system default and warns you. Your choice stays saved, so once the device is back, Speechek uses it again. If the warning doesn't go away after you reconnect it, select the device in the list again.
+
+**Mute sound while recording.** Silences Windows audio on the default playback device while the microphone is on, then restores the previous state. If you change the volume yourself during a recording, Speechek leaves it as you set it. If muting fails, the recording still goes on and the pill shows a warning. Off by default.
+
+**Start Speechek when signing in to Windows.** The same autostart setting as the installer's checkbox. If you disabled Speechek in Windows startup apps, turning this on enables it again. If Speechek can't read its autostart entry (for example, another program's entry has the same name), the switch is greyed out and says so instead of guessing.
+
+**Local port.** The port Speechek's windows use internally. Default `4173`; you'll rarely need to touch it. A new value is saved immediately but applies after a restart. If the port is busy at startup, Speechek borrows a free one for that session and tells you.
 
 ### API keys
 
-- Values are hidden: the summary shows only the number of saved keys. **Show keys / Показать ключи** is the only action that displays the list; switching sections, applying keys or closing the window hides it again. Opening, viewing and hiding the list does not change the draft: the close question appears only if the normalised list genuinely differs from the saved one, or the entered text has not reached the app yet.
-- The single field opens with an explicit **Show keys / Показать ключи** and is editable. **Clear list / Очистить список** is a confirmed action on the draft: an empty field becomes a clear only after **Apply keys / Применить ключи**; with no saved key, dictation is disabled.
-- **Apply keys / Применить ключи** is the only action that writes the entered (or empty) list to the DPAPI store. General settings, including interface language, and the hotkey apply independently and never read or replace the key draft. If the container is unavailable, the **Show keys / Показать ключи** button is labelled **Enter keys / Ввести ключи** and opens an empty editor without revealing unknown saved values; replacing them requires separate confirmation.
-- **Check keys / Проверить ключи** checks access to the Gemini API (`models.list`) for the current draft, one key at a time. Success confirms only access, not model choice, recognition quality or quota. The check saves nothing, does not consume the key queue and is not needed to apply.
-- One key per line; empty lines and duplicates are dropped, a space inside a key is an error for that line with its number.
+- Saved keys are hidden; the tab shows only how many there are. **Show keys** reveals the list. Switching tabs, applying or closing the window hides it again.
+- Edit the list in the text box, one key per line. Empty lines and duplicates are dropped; a key with a space inside is flagged with its line number.
+- **Apply keys** saves the list. Nothing else does.
+- **Clear list** empties the box after you confirm. The saved keys are deleted only when you then click **Apply keys**. With no keys left, dictation stops working until you add one.
+- **Check keys** tests whether each key in the box can reach the Gemini API. It saves nothing and doesn't spend a dictation turn. Passing the check doesn't tell you how much quota is left.
+- If you close the window or exit with unapplied changes, Speechek asks: **Apply keys**, **Do not apply** (discards only the key changes) or **Return**.
+- If the saved key file can't be read (for example, it was copied from another Windows account), the button says **Enter keys**: you can type a new list, and Speechek asks before replacing the old one.
 
-## Settings file
+## The settings file
 
-`%APPDATA%\Speechek\settings.json` is ordinary JSON you can open in any editor. On first launch it is written from the annotated template `config/settings.example.json` (embedded into the EXE), with `language` set to the detected initial language rather than blindly copying the template's `en` placeholder. Only `//` comments on a **separate line** are allowed; trailing comments and extra commas are not. The `hotkey` and `mode` fields are required and must appear exactly once: a missing or duplicated field makes the file invalid instead of substituting a default. `mute_during_recording`, `port` and `input_device` may be omitted — then `false`, `4173` and the system input device apply. `language` may also be omitted: the initial-language rules above supply its default. Older files are read without being rewritten at startup; missing optional fields, including the resolved `language`, are inserted on the next successful settings write. A no-op apply that performs no write does not migrate the file. Writes update only managed values and preserve unrelated properties, comments, BOM and line endings. An explicit `null`, number, unsupported string or duplicate `language` is invalid, not a request for automatic detection.
+You never have to edit files by hand, since the settings window covers everything. If you want to, settings live in `%APPDATA%\Speechek\settings.json`. Paste that path into the Explorer address bar to open the folder.
 
-| Field | Meaning |
-| --- | --- |
-| `hotkey` | Global record/stop key, default `F2`. Combinations such as `Ctrl+Shift+F9` are possible; before the key you may use `Ctrl`, `Alt`, `Shift`, `Super`. Single letters and digits, `Fn`, `F12`, modifier-only combinations and **Escape without modifiers** are rejected: Escape is reserved for cancelling dictation. |
-| `mode` | `live` — Live Smart (streaming recognition during speech); `smart` — process the finished recording: remove filler words and format by meaning; `verbatim` — verbatim transcription without editing. |
-| `mute_during_recording` | `true` — mute the overall Windows sound on the default playback device for the actual recording and restore the previous state after stopping or cancelling; `false` — leave the sound alone. Optional: absence means `false`. |
-| `port` | Local port of the built-in server, default `4173`; an integer from 1 to 65535. A new value applies on the next app start; a busy saved port does not block startup — the app temporarily listens on a free port. Optional: absence means `4173`. |
-| `input_device` | Identifier of the selected microphone as Windows reports it; `null` or a missing field means the default system input device. The choice is set from the **Microphone / Микрофон** list in **General settings / Общие настройки**, saved immediately, takes effect from the next recording and is not replaced by itself if the device is unavailable. |
-| `language` | Interface language: `"en"` for English or `"ru"` for Russian. Optional: absence uses the initial-language precedence above without a startup rewrite. Set it with **Language / Язык интерфейса** for immediate application and saving; it does not translate dictated text or change the installer/uninstaller language. |
+- It's plain JSON. Comments are allowed only as whole lines starting with `//`. Trailing commas aren't allowed.
+- `hotkey` and `mode` must appear exactly once. Other fields can be left out; then the defaults apply.
+- When Speechek saves settings, it changes only its own values and keeps your comments and any other text in the file.
 
-There are no keys or paths to them in the file: the list is encrypted separately in `secrets.bin` next to `settings.json`.
+| Field | Values | Default |
+|---|---|---|
+| `hotkey` | A key or combination, same rules as in [General settings](#general-settings) | `"F2"` |
+| `mode` | `"live"` (Live Smart), `"smart"`, `"verbatim"` | `"live"` |
+| `mute_during_recording` | `true` or `false` | `false` |
+| `port` | A whole number from 1 to 65535 | `4173` |
+| `input_device` | A microphone ID as Windows reports it, or `null` for the system default | `null` |
+| `language` | `"en"` or `"ru"` | Picked on first start, see [Interface language](#interface-language) |
 
-Startup errors fall into two kinds. An invalid `settings.json` — including a port outside the range 1–65535 — stops the app with a native message: the file is not overwritten and no other port is substituted. A busy saved port no longer stops startup: the app temporarily listens on a free port and reports it in the settings window while the saved value stays. Missing keys, a corrupted `secrets.bin` or a hotkey taken at startup are not fatal: the app starts, dictation stays unavailable, and the settings window opens on the section where this is fixed — **API keys / API-ключи** for a key problem, **General settings / Общие настройки** for a hotkey-only problem; if both are broken, **API keys / API-ключи** takes priority.
+API keys are never in this file. They're stored encrypted in `secrets.bin` in the same folder.
 
-### Partial apply
+If `settings.json` is broken (bad JSON, a duplicated field, a port out of range), Speechek shows an error at startup and doesn't start. It never overwrites your file; fix it and start Speechek again. Missing keys or a hotkey taken by another program don't stop the app: it starts and opens the settings tab where you can fix the problem.
 
-Each of the two files is replaced atomically on its own, but the pair `settings.json` + `secrets.bin` is not a single crash-safe transaction: they are written sequentially and a failure between them is possible. If a previous apply could not be fully rolled back, the window shows a localized warning about partially changed files while the app continues using the previous settings. It is not cleared by closing or reopening the window; the next successful apply — of general settings, the hotkey or keys — forcibly rewrites and re-reads all potentially affected files, and only then is the warning cleared. Until a successful apply, the app runs on the previous settings.
-
-## How a Gemini key is chosen
-
-Keys are stored in `secrets.bin` next to `settings.json` and read at startup. The list is normalised when keys are applied: empty lines and duplicate keys are dropped, keeping the first occurrence.
-
-For each **accepted** request the next key is taken in a circle: first, second, third, first again. A Live stream uses the chosen key until the connection closes. A batch request uses the same key for uploading the audio, recognising it and deleting the temporary file. If the applied list is unchanged, the queue continues from the previous position; after the list changes, counting starts from the first key, and a dictation already in progress finishes on the previous set. Keys of one project share its limits: rotation does not increase the total quota and does not reset exhausted limits.
-
-A failed request that is rejected before reaching Gemini (for example, a bad WAV) does not advance the queue. If Gemini rejects the already-chosen key, the attempt counts as spent: there is no automatic switch to another key and no retry. In the lab, comparing three modes fires one Live and two batch requests; which of the simultaneous requests gets the next key depends on their arrival order.
+Speechek writes `settings.json` and `secrets.bin` one after the other. If something interrupts the save between the two, the settings window warns that the save was only partial. Speechek keeps running on your previous settings, and the next successful apply rewrites both files and clears the warning.
 
 ## Privacy and limitations
 
-- Keys are encrypted with Windows DPAPI **for the current user** (`CryptProtectData`, without machine scope, without an extra password or environment variables) and stored in `secrets.bin` next to `settings.json`. The file is created with a protected access descriptor: full access only for SYSTEM and the current user. This protects the profile, not the EXE: any code running under the same account can decrypt the file with the same Windows facilities.
-- There is no plaintext key on disk and no fallback path: a foreign, truncated or undecryptable container counts as an error, not as an "empty list". `/api/settings` returns only `hotkey`, `mode`, `language` and the runtime `revision` — no keys, no count, no paths. Keys are sent to the settings window only via the explicit **Show keys / Показать ключи** button; app error messages strip key values. The app does not promise to erase every copy of a key from WebView processes, network buffers and system logs.
-- Audio is not saved by the app as a file. A batch recording is temporarily uploaded to the Gemini Files API and deleted after the request; for Interactions, `store:false` is used. The maximum recording length is 10 minutes.
-- The **Google Free-tier** terms may allow the speech and responses you send to be used to improve the services, including human review. Do not dictate confidential information without weighing these terms.
-- Batch text is pasted only after the result is confirmed; the intermediate Live text is never pasted. When the app cannot prove that the target window read the clipboard, it leaves the text for manual insertion.
-- The paste mechanism is adapted from Handy under MIT; the full text is `third_party/Handy.LICENSE`, and in the running app `/licenses/Handy.LICENSE`.
+> [!IMPORTANT]
+> Speechek sends your speech to Google for recognition. On the Free Tier, Google may use what you send to improve its products, including human review; see the [Gemini API terms](https://ai.google.dev/gemini-api/terms). Don't dictate anything confidential unless you accept that.
 
-## Autostart and taskbar
+**Your keys**
 
-- **Start at sign-in** is offered once during a first install (a checked-by-default **Run Speechek** box is separate). Change it later with the **Start Speechek when signing in to Windows / Запускать Speechek при входе в Windows** switch in **General settings / Общие настройки**: it writes the same per-user `Run` entry, so there is no manual Windows Settings step, and if autostart was disabled in Windows, turning the switch on re-enables it. When the registration cannot be read (a foreign or damaged value owns the name), the switch is mixed and disabled and says so instead of reporting a state Windows did not confirm. The installer does not re-create or re-enable the entry during an in-place upgrade, and it does not override a manual removal or a change made in Windows.
-- **Taskbar pinning** is a user action, not an installer action. Find Speechek in the Start menu, open its context menu (**More options**), and choose **Pin to taskbar** if your Windows policy allows it. The installer does not pin anything through Shell scripts.
+- They're encrypted with Windows DPAPI for your Windows account and stored in `%APPDATA%\Speechek\secrets.bin`. Only your account and SYSTEM can open the file. There's no plain-text copy on disk.
+- DPAPI protects the keys from other Windows accounts, not from programs running under your own account. Any program you run can decrypt them the same way Speechek does.
+- Keys appear on screen only when you click **Show keys**. Error messages never include them. Speechek can't guarantee that no copy is ever left in memory or system logs.
 
-## Update
+**Your recordings**
 
-Speechek has no built-in auto-updater and makes no hidden self-update network calls. To update, download the newer `*-setup.exe` from [Releases](https://github.com/girte/speechek/releases) and run it: the installer detects the installed version and performs an in-place upgrade, keeping your settings and keys. Only a program currently running from the installed folder can be closed by the installer; a standalone portable EXE outside the install folder is not terminated — close it yourself before running the installed version. A newer installer can also be run for repair if a version check or the uninstall entry looks damaged.
+- Speechek doesn't save audio files.
+- For Smart and Verbatim, the recording is uploaded to Gemini temporarily and deleted after recognition. Speechek also asks Gemini not to store the request.
+- Live Smart streams the audio to Gemini while you speak.
 
-## Uninstall
+**Limits**
 
-Use **Settings → Apps → Installed apps → Speechek → Uninstall**, or the `uninstall.exe` next to the installed executable. The uninstaller warns that Speechek will be closed before files are removed. By default your settings and API keys are kept; a separate unchecked **Delete settings and API keys** box removes the real `%APPDATA%\Speechek` profile and the WebView2 data for the app. The uninstaller never touches Speechek-Dev or Speechek-Test data, and it does not recursively delete arbitrary folders.
+- No offline mode: recognition always happens at Google.
+- Speechek depends on Google's Free Tier, quotas and model availability, and Google can change any of them. On a project with billing enabled, requests may be charged.
+- Several keys add headroom only if they come from different projects. A rejected request isn't retried on another key.
 
-## Diagnostics
+## Start at sign-in and the taskbar
 
-If the tray icon did not appear, check the native message at startup: the most common causes are an invalid `settings.json` or a port outside the range 1–65535. If F2 does not start recording, there is probably no saved key or the startup combination was taken: the app opens the settings window on the relevant section, and the key can be reassigned in **General settings / Общие настройки** without a restart. If the overlay does not appear, check the Windows microphone permission. If the text was not pasted, check the active field and the clipboard; failure to paste into an elevated application is not counted as a successful paste.
+The installer offers **start at sign-in** once, on the first install. Later, use **Start Speechek when signing in to Windows** in General settings: it changes the same Windows setting. Updates don't turn autostart back on if you switched it off.
+
+To pin Speechek to the taskbar, find it in the Start menu, right-click it and choose **Pin to taskbar**. The installer doesn't pin anything itself.
+
+## Updating
+
+Speechek doesn't update itself and doesn't check for updates in the background. To update, download the new `*-setup.exe` from [Releases](https://github.com/girte/speechek/releases) and run it. It updates in place and keeps your settings and keys. If the installed copy is damaged, running the installer again also repairs it.
+
+The installer closes the running Speechek automatically, but only the installed copy; it warns you first. A dictation in progress and unapplied key changes are lost, so finish them before updating. If you run a separate portable build, close it yourself first.
+
+## Uninstalling
+
+Open **Windows Settings → Apps → Installed apps → Speechek → Uninstall**. The uninstaller closes Speechek first.
+
+By default your settings and keys stay on the PC, in case you reinstall. To remove them too, tick **Delete settings and API keys**: that deletes `%APPDATA%\Speechek` and Speechek's WebView2 data. Nothing else is touched.
+
+## Troubleshooting
+
+**Windows won't run the installer.** It isn't code-signed. On a SmartScreen warning, click **More info → Run anyway**. If Smart App Control or a company policy blocks unsigned apps, Speechek can't run on that PC.
+
+**Speechek shows an error at startup and no tray icon appears.** Usually `settings.json` is broken; the message says what's wrong. Fix the file (see [The settings file](#the-settings-file)) or delete it: Speechek creates a fresh one with defaults on the next start, and your keys stay intact.
+
+**The hotkey opens settings instead of recording.** No key is saved yet, or the saved key file can't be read. Add a key on the **API keys** tab and click **Apply keys**.
+
+**The hotkey does nothing.** Another program may have taken the combination. Speechek then opens **General settings** at startup; choose a different hotkey there. No restart needed.
+
+**"Recording did not start" or a microphone error.** Check that Windows lets apps use the microphone: **Windows Settings → Privacy & security → Microphone**. Also check which microphone is selected in General settings.
+
+**The pill warns that it's recording from the system microphone.** Your selected microphone is disconnected. Plug it back in; your choice stays saved.
+
+**The pill says "Copied — paste manually".** The text is on the clipboard: click into the field and press Ctrl+V. See [above](#when-the-text-isnt-pasted-automatically) for why.
+
+**The pill says Smart and Verbatim fail on Google's side.** Google is rejecting these modes; Speechek can't fix that from its end. Switch to **Live Smart** in General settings for now. Once Google fixes the problem, Smart and Verbatim work again without an update.
+
+**An error says the key was rejected by Google.** The key was deleted, restricted or mistyped. Check it in AI Studio, and click **Check keys** after fixing the list.
+
+**An error mentions Google HTTP 429.** The quota for that key's project is used up. Wait until it resets (daily limits reset at midnight Pacific time) or add a key from another project, which has its own quota.
+
+**Settings say the port is busy and another one is used.** Something else took port 4173 before Speechek started. Speechek works normally on the temporary port; nothing to do. If it keeps happening, pick another port in General settings.
+
+**Still stuck?** Open an issue using the [bug report form](https://github.com/girte/speechek/issues/new/choose). Never attach your API keys, `secrets.bin`, `settings.json` or audio recordings.
 
 ## Building from source
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md) for the toolchain, build and test commands.
-
-The owner preview runs GUI-free localization control before the final Development build; the standalone command is `scripts/check-localization.ps1`. Bun is a development tool for these checks, not an app runtime dependency. Native UI and text smoke remain exclusively owner-run.
+See [CONTRIBUTING.md](../CONTRIBUTING.md).
