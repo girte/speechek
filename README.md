@@ -68,7 +68,7 @@ The installer isn't code-signed yet: there is no paid signing certificate. Smart
 ### 2. Get a free Gemini API key
 
 1. Open **[Google AI Studio → API keys](https://aistudio.google.com/apikey)** and sign in with your Google account.
-2. Accept the terms. If you're new to AI Studio, it creates a project and a key for you. If you already have Google Cloud projects, import one (**Dashboard → Projects → Import projects**) and click **Create API key**.
+2. Accept the terms. On your first visit AI Studio creates a project and a key for you. If it doesn't, create a project right in AI Studio and click **Create API key**.
 3. Copy the key.
 
 You don't need to add a payment method: the Free Tier works on a project without billing.
@@ -76,7 +76,7 @@ You don't need to add a payment method: the Free Tier works on a project without
 <details>
 <summary>How to get more headroom with several keys</summary>
 
-Google applies limits to the whole project, not to each key. To actually get more free dictation, put each extra key in a **different project**: create a project in the [Google Cloud console](https://console.cloud.google.com/projectcreate), import it in AI Studio (**Dashboard → Projects → Import projects**) and create the key there. Speechek then takes the keys in turn, one per dictation.
+Google applies limits to the whole project, not to each key, so several keys inside one project share one quota. For more free dictation, create a **separate project for each key** right in AI Studio and make one key in each. AI Studio also shows each project's usage. Speechek then takes the keys in turn, one per dictation.
 
 If Gemini rejects the key chosen for a dictation, that dictation ends with an error. Speechek doesn't retry it on the next key.
 
