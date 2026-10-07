@@ -2,7 +2,7 @@
 //!
 //! One Axum service owns the loopback socket this process reserved: the
 //! configured port, or a temporary one when it was already taken. It hands the
-//! eleven `public/` files to the overlay, lab and settings windows from memory
+//! fifteen `public/` files to the overlay, lab and settings windows from memory
 //! and proxies transcription to Gemini through [`crate::provider`] and
 //! [`crate::live`].
 //!
@@ -43,6 +43,7 @@ use serde_json::{json, Value};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::sync::{oneshot, Semaphore};
 
+use crate::i18n::{render, Language, MessageId, UiError, UiMessage};
 use crate::live;
 use crate::provider::Provider;
 use crate::secrets::SecretKey;
@@ -95,21 +96,27 @@ const MIME_TEXT: &str = "text/plain;charset=utf-8";
 /* Errors and redaction                                                       */
 /* -------------------------------------------------------------------------- */
 
-/// An HTTP-visible failure. `code` is a stable machine-readable string the
-/// browser switches on; `message` is already safe to show a user.
+/// An HTTP-visible failure. `status` and `code` are the stable machine-readable
+/// fields the browser switches on; `message` is the English diagnostic rendered
+/// from `ui`, and `ui` is the descriptor the interface language renders.
 #[derive(Debug, Clone)]
 pub struct ApiError {
     pub status: u16,
     pub code: &'static str,
     pub message: String,
+    pub ui: UiMessage,
 }
 
 impl ApiError {
-    pub fn new(status: u16, code: &'static str, message: impl Into<String>) -> Self {
+    /// Build a failure from its semantic descriptor; the English diagnostic is
+    /// rendered from that descriptor, not kept as a second source of copy.
+    pub fn new(status: u16, code: &'static str, ui: UiMessage) -> Self {
+        let message = render(Language::En, &ui).into_owned();
         Self {
             status,
             code,
-            message: message.into(),
+            message,
+            ui,
         }
     }
 }
@@ -128,30 +135,84 @@ impl std::error::Error for ApiError {}
 /// would insert `[redacted]` between every single character.
 pub fn redact(message: &str, keys: &[Arc<SecretKey>]) -> String {
     let mut safe = message.to_string();
-    for key in keys {
-        let key = key.as_str();
-        if key.is_empty() || !safe.contains(key) {
-            continue;
-        }
-        safe = safe.replace(key, "[redacted]");
-    }
+    redact_string(&mut safe, keys);
     safe
 }
 
+/// Replaces every configured key inside one string, in place.
+fn redact_string(text: &mut String, keys: &[Arc<SecretKey>]) {
+    for key in keys {
+        let key = key.as_str();
+        if key.is_empty() || !text.contains(key) {
+            continue;
+        }
+        *text = text.replace(key, "[redacted]");
+    }
+}
+
+/// Redacts one descriptor in place: every string argument, however deeply nested
+/// behind a nested `UiMessage`, is cleaned against the same ring the message's
+/// own HTTP or WebSocket boundary selected. Numbers and identifiers are left
+/// alone, and the keys stay borrowed handles rather than copies of a secret.
+pub fn redact_ui(ui: &mut UiMessage, keys: &[Arc<SecretKey>]) {
+    let Some(args) = ui.args.as_mut() else {
+        return;
+    };
+    for value in args.values_mut() {
+        redact_value(value, keys);
+    }
+}
+
+fn redact_value(value: &mut Value, keys: &[Arc<SecretKey>]) {
+    match value {
+        Value::String(text) => redact_string(text, keys),
+        Value::Array(items) => {
+            for item in items {
+                redact_value(item, keys);
+            }
+        }
+        Value::Object(map) => {
+            for nested in map.values_mut() {
+                redact_value(nested, keys);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Redacts both halves of one outgoing failure against `keys`, the ring the
+/// request selected: the English diagnostic and the descriptor, argument by
+/// argument. A newer ring is never consulted here.
+fn redact_api_error(error: &mut ApiError, keys: &[Arc<SecretKey>]) {
+    redact_string(&mut error.message, keys);
+    redact_ui(&mut error.ui, keys);
+}
+
+/// The response boundary retains the selected request revision even if Save or
+/// dictation retirement changes the runtime while the request is in flight.
+fn request_error_response(
+    mut error: ApiError,
+    selected: Option<&RequestSnapshot>,
+    runtime: &SharedRuntime,
+) -> Response {
+    let current;
+    let keys = match selected {
+        Some(request) => request.keys(),
+        None => {
+            current = runtime.snapshot();
+            current.keys.keys()
+        }
+    };
+    redact_api_error(&mut error, keys);
+    api_error_response(error)
+}
+
 fn missing_key_error() -> ApiError {
-    ApiError::new(
-        503,
-        "MISSING_API_KEY",
-        "No Gemini API key is available. Add at least one key in the Speechek settings window under \"API keys\".",
-    )
+    ApiError::new(503, "MISSING_API_KEY", UiMessage::new(MessageId::MissingApiKey))
 }
 
 fn cross_origin_error() -> ApiError {
-    ApiError::new(
-        403,
-        "CROSS_ORIGIN",
-        "This endpoint only accepts same-origin requests.",
-    )
+    ApiError::new(403, "CROSS_ORIGIN", UiMessage::new(MessageId::CrossOrigin))
 }
 
 /// A `session` tag that is not the exact decimal spelling of one positive
@@ -159,32 +220,20 @@ fn cross_origin_error() -> ApiError {
 /// as an absent one: silently untagging a request would let it run on settings
 /// it does not belong to.
 fn invalid_session_error() -> ApiError {
-    ApiError::new(
-        400,
-        "INVALID_SESSION",
-        "session must be the numeric generation of a running dictation.",
-    )
+    ApiError::new(400, "INVALID_SESSION", UiMessage::new(MessageId::InvalidSession))
 }
 
 /// The dictation's revision is gone: it was retired when the take ended. A late
 /// request of that take must not run on newer settings instead.
 fn stale_session_error() -> ApiError {
-    ApiError::new(
-        409,
-        "STALE_SESSION",
-        "This dictation is no longer active; start a new recording.",
-    )
+    ApiError::new(409, "STALE_SESSION", UiMessage::new(MessageId::StaleSession))
 }
 
 /// The request is not the dictation it claims to be part of: a batch request
 /// asks for a mode the pinned settings do not have, or the Live socket asks to
 /// be served by a dictation that is not Live.
 fn mode_mismatch_error() -> ApiError {
-    ApiError::new(
-        409,
-        "MODE_MISMATCH",
-        "The requested mode does not match the dictation this session belongs to.",
-    )
+    ApiError::new(409, "MODE_MISMATCH", UiMessage::new(MessageId::ModeMismatch))
 }
 
 /* -------------------------------------------------------------------------- */
@@ -229,7 +278,7 @@ impl Backend {
         reservation: ReservedListener,
         runtime: Arc<SharedRuntime>,
         provider: Arc<Provider>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, UiError> {
         let ReservedListener {
             listener,
             actual_port,
@@ -247,9 +296,10 @@ impl Backend {
             .enable_all()
             .thread_name("speechek-backend")
             .build()
-            .map_err(|error| format!("Could not start the speechek backend runtime: {error}"))?;
+            .map_err(|error| UiError::new("BACKEND_RUNTIME", UiMessage::new(MessageId::BackendRuntimeFailed)
+                .with_arg("detail", json!(error.to_string()))))?;
 
-        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), UiError>>(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         let thread = std::thread::Builder::new()
@@ -259,9 +309,10 @@ impl Backend {
                     let listener = match tokio::net::TcpListener::from_std(listener) {
                         Ok(listener) => listener,
                         Err(error) => {
-                            let _ = ready_tx.send(Err(format!(
-                                "Could not serve http://127.0.0.1:{actual_port}: {error}"
-                            )));
+                            let _ = ready_tx.send(Err(UiError::new("BACKEND_SERVE",
+                                UiMessage::new(MessageId::BackendServeFailed)
+                                    .with_arg("port", json!(actual_port))
+                                    .with_arg("detail", json!(error.to_string())))));
                             return;
                         }
                     };
@@ -288,7 +339,8 @@ impl Backend {
                 // than awaited forever: this backend is on its way out either way.
                 runtime.shutdown_timeout(DRAIN_TIMEOUT);
             })
-            .map_err(|error| format!("Could not start the speechek backend thread: {error}"))?;
+            .map_err(|error| UiError::new("BACKEND_THREAD", UiMessage::new(MessageId::BackendThreadFailed)
+                .with_arg("detail", json!(error.to_string()))))?;
 
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
@@ -296,7 +348,7 @@ impl Backend {
                 thread: Some(thread),
             }),
             Ok(Err(error)) => Err(error),
-            Err(_) => Err("The speechek backend stopped before it was ready.".to_string()),
+            Err(_) => Err(UiError::new("BACKEND_NOT_READY", UiMessage::new(MessageId::BackendStoppedBeforeReady))),
         }
     }
 
@@ -363,9 +415,9 @@ impl ReservedListener {
 /// reason, and a configured port of 0, are returned as errors: an unusable
 /// stored value must never turn into a random port, and a missing socket exists
 /// nowhere else to fall back to.
-pub fn reserve(configured_port: u16) -> Result<ReservedListener, String> {
+pub fn reserve(configured_port: u16) -> Result<ReservedListener, UiError> {
     if configured_port == 0 {
-        return Err("Could not start speechek: a port of 0 names no loopback port.".to_string());
+        return Err(UiError::new("BACKEND_INVALID_PORT", UiMessage::new(MessageId::BackendPortZero)));
     }
 
     // Windows lets a second process bind a port that is already being served, so
@@ -385,14 +437,14 @@ pub fn reserve(configured_port: u16) -> Result<ReservedListener, String> {
 }
 
 /// Claim a temporary loopback port for a start whose configured port is taken.
-fn reserve_fallback(configured_port: u16) -> Result<ReservedListener, String> {
+fn reserve_fallback(configured_port: u16) -> Result<ReservedListener, UiError> {
     match bind_exclusive(0) {
         Ok(listener) => finish_reservation(listener, configured_port, true),
         // Port zero is never in use; a second `InUse` is the system saying it
         // has no temporary port to give, which is as fatal as a taken one.
-        Err(BindError::InUse) => Err(format!(
-            "Could not start speechek: {configured_port} is already in use by another program and no temporary loopback port could be claimed; stop that program and try again."
-        )),
+        Err(BindError::InUse) => Err(UiError::new("BACKEND_NO_FALLBACK",
+            UiMessage::new(MessageId::BackendNoFallbackPort)
+                .with_arg("port", json!(configured_port)))),
         Err(BindError::Fatal(message)) => Err(message),
     }
 }
@@ -404,10 +456,11 @@ fn finish_reservation(
     listener: TcpListener,
     configured_port: u16,
     fallback: bool,
-) -> Result<ReservedListener, String> {
+) -> Result<ReservedListener, UiError> {
     let actual_port = listener
         .local_addr()
-        .map_err(|error| format!("Could not read the backend port: {error}"))?
+        .map_err(|error| UiError::new("BACKEND_PORT_READ", UiMessage::new(MessageId::BackendPortReadFailed)
+            .with_arg("detail", json!(error.to_string()))))?
         .port();
     Ok(ReservedListener {
         listener,
@@ -437,14 +490,15 @@ enum BindError {
     /// Another socket holds the address.
     InUse,
     /// A message to show; the failure is not a taken port.
-    Fatal(String),
+    Fatal(UiError),
 }
 
 /// Bind and listen on the loopback port, refusing to share it.
 fn bind_exclusive(port: u16) -> Result<TcpListener, BindError> {
     let address = SocketAddrV4::new(HOST, port);
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).map_err(|error| {
-        BindError::Fatal(format!("Could not create the backend socket: {error}"))
+        BindError::Fatal(UiError::new("BACKEND_SOCKET", UiMessage::new(MessageId::BackendSocketCreateFailed)
+            .with_arg("detail", json!(error.to_string()))))
     })?;
 
     // `SO_REUSEADDR` is deliberately never enabled: on Windows it is exactly the
@@ -454,21 +508,25 @@ fn bind_exclusive(port: u16) -> Result<TcpListener, BindError> {
     set_exclusive_address_use(&socket).map_err(BindError::Fatal)?;
     #[cfg(not(windows))]
     socket.set_reuse_address(false).map_err(|error| {
-        BindError::Fatal(format!("Could not configure the backend socket: {error}"))
+        BindError::Fatal(UiError::new("BACKEND_SOCKET_CONFIG", UiMessage::new(MessageId::BackendSocketConfigureFailed)
+            .with_arg("detail", json!(error.to_string()))))
     })?;
 
     socket.bind(&address.into()).map_err(|error| {
         if is_address_in_use(&error) {
             BindError::InUse
         } else {
-            BindError::Fatal(format!("Could not bind 127.0.0.1:{port}: {error}"))
+            BindError::Fatal(UiError::new("BACKEND_BIND", UiMessage::new(MessageId::BackendBindFailed)
+                .with_arg("port", json!(port)).with_arg("detail", json!(error.to_string()))))
         }
     })?;
     socket.listen(128).map_err(|error| {
-        BindError::Fatal(format!("Could not listen on 127.0.0.1:{port}: {error}"))
+        BindError::Fatal(UiError::new("BACKEND_LISTEN", UiMessage::new(MessageId::BackendListenFailed)
+            .with_arg("port", json!(port)).with_arg("detail", json!(error.to_string()))))
     })?;
     socket.set_nonblocking(true).map_err(|error| {
-        BindError::Fatal(format!("Could not prepare 127.0.0.1:{port}: {error}"))
+        BindError::Fatal(UiError::new("BACKEND_PREPARE", UiMessage::new(MessageId::BackendPrepareFailed)
+            .with_arg("port", json!(port)).with_arg("detail", json!(error.to_string()))))
     })?;
     Ok(socket.into())
 }
@@ -499,7 +557,7 @@ const WSAEADDRINUSE: i32 = 10048;
 /// that asks for `SO_REUSEADDR`. That is the Windows-only half of "one backend
 /// per port"; the connect probe covers the other half.
 #[cfg(windows)]
-fn set_exclusive_address_use(socket: &Socket) -> Result<(), String> {
+fn set_exclusive_address_use(socket: &Socket) -> Result<(), UiError> {
     use std::os::windows::io::AsRawSocket;
     use windows::Win32::Networking::WinSock::{
         setsockopt, SOCKET, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
@@ -516,10 +574,8 @@ fn set_exclusive_address_use(socket: &Socket) -> Result<(), String> {
         )
     };
     if result != 0 {
-        return Err(format!(
-            "Could not make the backend port exclusive: {}",
-            io::Error::last_os_error()
-        ));
+        return Err(UiError::new("BACKEND_EXCLUSIVE", UiMessage::new(MessageId::BackendExclusiveFailed)
+            .with_arg("detail", json!(io::Error::last_os_error().to_string()))));
     }
     Ok(())
 }
@@ -634,21 +690,9 @@ async fn dispatch(State(state): State<Arc<AppState>>, request: Request) -> Respo
     match outcome {
         Ok(response) => response,
         Err(error) => {
-            // Method, path, status and code only: never a key, never a body.
-            eprintln!("{method} {} -> {} {}", uri.path(), error.status, error.code);
-            let current;
-            let keys = match &selected {
-                Some(request) => request.keys(),
-                None => {
-                    current = state.runtime.snapshot();
-                    current.keys.keys()
-                }
-            };
-            api_error_response(
-                status_code(error.status),
-                error.code,
-                redact(&error.message, keys),
-            )
+            // Method, status and code only: untrusted paths can contain secrets.
+            eprintln!("{method} -> {} {}", error.status, error.code);
+            request_error_response(error, selected.as_ref(), &state.runtime)
         }
     }
 }
@@ -668,7 +712,7 @@ async fn handle(
             return Err(ApiError::new(
                 405,
                 "METHOD_NOT_ALLOWED",
-                "/api/health accepts GET only.",
+                UiMessage::new(MessageId::HealthGetOnly),
             ));
         }
         return Ok(json_response(StatusCode::OK, json!({ "status": "ok" })));
@@ -679,7 +723,7 @@ async fn handle(
             return Err(ApiError::new(
                 405,
                 "METHOD_NOT_ALLOWED",
-                "/api/settings accepts GET only.",
+                UiMessage::new(MessageId::SettingsGetOnly),
             ));
         }
         // Read by the launcher before it starts a recording. One revision answers
@@ -693,6 +737,8 @@ async fn handle(
             json!({
                 "hotkey": snapshot.settings.hotkey.as_str(),
                 "mode": snapshot.settings.mode.as_str(),
+                "language": snapshot.settings.language,
+                "revision": snapshot.revision,
             }),
         ));
     }
@@ -702,7 +748,7 @@ async fn handle(
             return Err(ApiError::new(
                 426,
                 "UPGRADE_REQUIRED",
-                "/api/live requires a WebSocket upgrade.",
+                UiMessage::new(MessageId::LiveUpgradeRequired),
             ));
         }
         if !origin_allowed(headers, &state.allowed_origins) {
@@ -724,7 +770,7 @@ async fn handle(
             return Err(ApiError::new(
                 400,
                 "UPGRADE_FAILED",
-                "Could not upgrade the connection to WebSocket.",
+                UiMessage::new(MessageId::LiveUpgradeFailed),
             ));
         };
 
@@ -758,7 +804,7 @@ async fn handle(
             return Err(ApiError::new(
                 405,
                 "METHOD_NOT_ALLOWED",
-                "/api/transcribe accepts POST only.",
+                UiMessage::new(MessageId::TranscribePostOnly),
             ));
         }
         return handle_transcribe(state, selected, uri, headers, body).await;
@@ -768,7 +814,7 @@ async fn handle(
         return Err(ApiError::new(
             404,
             "NOT_FOUND",
-            format!("Unknown API route: {path}"),
+            UiMessage::new(MessageId::UnknownApiRoute).with_arg("path", json!(path)),
         ));
     }
 
@@ -806,7 +852,7 @@ async fn handle_transcribe(
         return Err(ApiError::new(
             400,
             "INVALID_MODE",
-            "mode must be 'smart' or 'verbatim'.",
+            UiMessage::new(MessageId::InvalidBatchMode),
         ));
     }
     // A tagged recording belongs to the dictation that pinned it: asking for a
@@ -830,7 +876,7 @@ async fn handle_transcribe(
         return Err(ApiError::new(
             415,
             "UNSUPPORTED_TYPE",
-            "Send the recording as Content-Type: audio/wav.",
+            UiMessage::new(MessageId::TranscribeUnsupportedType),
         ));
     }
 
@@ -840,11 +886,9 @@ async fn handle_transcribe(
         return Err(ApiError::new(
             413,
             "AUDIO_TOO_LONG",
-            format!(
-                "Recording is {}s; the limit is {} minutes.",
-                (duration + 0.5).floor() as i64,
-                MAX_RECORDING_SECONDS / 60
-            ),
+            UiMessage::new(MessageId::AudioTooLong)
+                .with_arg("seconds", json!((duration + 0.5).floor() as i64))
+                .with_arg("minutes", json!(MAX_RECORDING_SECONDS / 60)),
         ));
     }
 
@@ -856,7 +900,7 @@ async fn handle_transcribe(
             return Err(ApiError::new(
                 429,
                 "SERVER_BUSY",
-                "Too many transcriptions in flight; try again in a moment.",
+                UiMessage::new(MessageId::ServerBusy),
             ))
         }
     };
@@ -878,7 +922,7 @@ async fn handle_transcribe(
             .next_key()
             .ok_or_else(missing_key_error)?,
     };
-    let text = state.provider.transcribe(&key, &mode, bytes).await?;
+    let text = state.provider.transcribe(&key, request.keys(), &mode, bytes).await?;
     Ok(json_response(StatusCode::OK, json!({ "text": text })))
 }
 
@@ -893,10 +937,8 @@ async fn read_body_capped(body: Body, headers: &HeaderMap) -> Result<Vec<u8>, Ap
         ApiError::new(
             413,
             "AUDIO_TOO_LARGE",
-            format!(
-                "Recording is larger than the {} minute limit.",
-                MAX_RECORDING_SECONDS / 60
-            ),
+            UiMessage::new(MessageId::AudioTooLarge)
+                .with_arg("minutes", json!(MAX_RECORDING_SECONDS / 60)),
         )
     }
 
@@ -916,7 +958,7 @@ async fn read_body_capped(body: Body, headers: &HeaderMap) -> Result<Vec<u8>, Ap
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let chunk =
-            chunk.map_err(|_| ApiError::new(500, "INTERNAL", "Unexpected server error."))?;
+            chunk.map_err(|_| ApiError::new(500, "INTERNAL", UiMessage::new(MessageId::InternalError)))?;
         if chunk.is_empty() {
             continue;
         }
@@ -936,7 +978,7 @@ fn parse_wav(bytes: &[u8]) -> Result<f64, ApiError> {
         return Err(ApiError::new(
             400,
             "INVALID_WAV",
-            "Body must be a RIFF/WAVE file (audio/wav).",
+            UiMessage::new(MessageId::WavNotRiff),
         ));
     }
 
@@ -969,23 +1011,27 @@ fn parse_wav(bytes: &[u8]) -> Result<f64, ApiError> {
         return Err(ApiError::new(
             400,
             "INVALID_WAV",
-            "WAV must contain uncompressed PCM audio (format 1).",
+            UiMessage::new(MessageId::WavNotPcm),
         ));
     }
     if channels != CHANNELS || sample_rate != SAMPLE_RATE || bits_per_sample != BITS_PER_SAMPLE {
         return Err(ApiError::new(
             400,
             "INVALID_WAV",
-            format!(
-                "WAV must be {SAMPLE_RATE} Hz, {CHANNELS} channel, {BITS_PER_SAMPLE}-bit PCM (got {sample_rate} Hz, {channels} ch, {bits_per_sample}-bit)."
-            ),
+            UiMessage::new(MessageId::WavFormatMismatch)
+                .with_arg("rate", json!(SAMPLE_RATE))
+                .with_arg("channels", json!(CHANNELS))
+                .with_arg("bits", json!(BITS_PER_SAMPLE))
+                .with_arg("gotRate", json!(sample_rate))
+                .with_arg("gotChannels", json!(channels))
+                .with_arg("gotBits", json!(bits_per_sample)),
         ));
     }
     match pcm_bytes {
         None | Some(0) => Err(ApiError::new(
             400,
             "INVALID_WAV",
-            "WAV contains no audio samples.",
+            UiMessage::new(MessageId::WavNoSamples),
         )),
         Some(pcm_bytes) => {
             Ok(pcm_bytes as f64 / (SAMPLE_RATE * (CHANNELS as u32) * BYTES_PER_SAMPLE) as f64)
@@ -1028,7 +1074,7 @@ struct StaticAsset {
     content_type: &'static str,
 }
 
-const ASSETS: [StaticAsset; 13] = [
+const ASSETS: [StaticAsset; 15] = [
     StaticAsset {
         path: "/index.html",
         body: include_bytes!("../../public/index.html"),
@@ -1086,6 +1132,18 @@ const ASSETS: [StaticAsset; 13] = [
         body: include_bytes!("../../public/settings.css"),
         content_type: MIME_CSS,
     },
+    // The interface message catalog and its WebView loader: the same dictionary
+    // the native shell compiles in, served to every window over the loopback.
+    StaticAsset {
+        path: "/messages.json",
+        body: include_bytes!("../../public/messages.json"),
+        content_type: "application/json;charset=utf-8",
+    },
+    StaticAsset {
+        path: "/i18n.js",
+        body: include_bytes!("../../public/i18n.js"),
+        content_type: MIME_JS,
+    },
     // The paste transaction is adapted from Handy; its license text ships inside
     // the binary so the distributed EXE stands alone.
     StaticAsset {
@@ -1112,17 +1170,17 @@ fn handle_static(method: &Method, raw_path: &str, normalized: &str) -> Result<Re
         return Err(ApiError::new(
             405,
             "METHOD_NOT_ALLOWED",
-            "Static files are served with GET or HEAD only.",
+            UiMessage::new(MessageId::StaticGetHeadOnly),
         ));
     }
 
     // `decodeURIComponent` is strict: a malformed escape or invalid UTF-8 makes the
     // path unusable instead of silently producing a different file name.
     let Some(decoded) = percent_decode(raw_path, true) else {
-        return Err(ApiError::new(400, "BAD_PATH", "Malformed request path."));
+        return Err(ApiError::new(400, "BAD_PATH", UiMessage::new(MessageId::MalformedRequestPath)));
     };
     if decoded.contains('\0') || decoded.contains('\\') {
-        return Err(ApiError::new(400, "BAD_PATH", "Invalid request path."));
+        return Err(ApiError::new(400, "BAD_PATH", UiMessage::new(MessageId::InvalidRequestPath)));
     }
 
     let mut lookup = normalize_path(&decoded);
@@ -1136,7 +1194,7 @@ fn handle_static(method: &Method, raw_path: &str, normalized: &str) -> Result<Re
         return Err(ApiError::new(
             404,
             "NOT_FOUND",
-            format!("No such file: {normalized}"),
+            UiMessage::new(MessageId::NoSuchFile).with_arg("path", json!(normalized)),
         ));
     };
 
@@ -1179,10 +1237,10 @@ fn json_response(status: StatusCode, body: Value) -> Response {
     response
 }
 
-fn api_error_response(status: StatusCode, code: &'static str, message: String) -> Response {
+fn api_error_response(error: ApiError) -> Response {
     json_response(
-        status,
-        json!({ "error": { "code": code, "message": message } }),
+        status_code(error.status),
+        json!({ "error": { "code": error.code, "message": error.message, "ui": error.ui } }),
     )
 }
 
@@ -1363,6 +1421,89 @@ mod tests {
     use super::*;
     use std::net::TcpStream;
 
+    fn test_snapshot(language: Language, revision: u64, keys: crate::secrets::KeyRing) -> Arc<RuntimeSnapshot> {
+        Arc::new(RuntimeSnapshot {
+            settings: crate::settings::Settings {
+                hotkey: "F2".to_owned(),
+                mode: "smart".to_owned(),
+                mute_during_recording: false,
+                port: 4175,
+                input_device: None,
+                language,
+            },
+            keys: Arc::new(keys),
+            revision,
+        })
+    }
+
+    #[test]
+    fn nested_ui_arguments_cannot_leak_synthetic_keys() {
+        let key = Arc::new(SecretKey::new("synthetic-nested-key".to_owned()));
+        let nested = UiMessage::new(MessageId::UpstreamUnreachable)
+            .with_arg("detail", json!("synthetic-nested-key / synthetic-nested-key"));
+        let mut ui = UiMessage::new(MessageId::GoogleRequestFailed)
+            .with_arg("detail", json!(nested))
+            .with_arg("diagnostics", json!([
+                {"values": ["prefix synthetic-nested-key suffix", {"raw": "synthetic-nested-key"}]},
+                429, null, true
+            ]));
+        let unchanged = ui.clone();
+        redact_ui(&mut ui, &[]);
+        assert_eq!(ui, unchanged);
+        redact_ui(&mut ui, std::slice::from_ref(&key));
+        let wire = serde_json::to_value(&ui).expect("descriptor serialization");
+        assert!(!wire.to_string().contains(key.as_str()));
+        assert_eq!(wire["args"]["detail"]["key"], "UpstreamUnreachable");
+        assert_eq!(wire["args"]["detail"]["args"]["detail"], "[redacted] / [redacted]");
+        assert_eq!(wire["args"]["diagnostics"][1], 429);
+        assert_eq!(wire["args"]["diagnostics"][2], Value::Null);
+        assert_eq!(wire["args"]["diagnostics"][3], true);
+    }
+
+    #[test]
+    fn response_redaction_retains_the_selected_request_ring_after_publish_and_retire() {
+        let pinned_key = Arc::new(SecretKey::new("synthetic-pinned-key".to_owned()));
+        let newer_key = Arc::new(SecretKey::new("synthetic-current-key".to_owned()));
+        let initial = test_snapshot(Language::En, 1,
+            crate::secrets::KeyRing::new(vec![Arc::clone(&pinned_key)]));
+        let runtime = Arc::new(SharedRuntime::new(Arc::clone(&initial)));
+        runtime.pin(77, initial);
+        let state = AppState {
+            runtime: Arc::clone(&runtime),
+            provider: Arc::new(Provider::new()),
+            batches: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH)),
+            allowed_origins: loopback_origins(4175),
+        };
+        let selected = select_request_snapshot(&state, AudioRoute::Batch,
+            &"/api/transcribe?mode=smart&session=77".parse().expect("request URI"))
+            .expect("pinned request revision");
+        runtime.publish(test_snapshot(Language::Ru, 2,
+            crate::secrets::KeyRing::new(vec![Arc::clone(&newer_key)])));
+        runtime.retire(77);
+        assert!(runtime.resolve(Some(77)).is_none());
+        let cause = UiMessage::new(MessageId::UpstreamUnreachable)
+            .with_arg("detail", json!("synthetic-pinned-key / synthetic-current-key"));
+        let error = ApiError::new(502, "UPSTREAM_ERROR",
+            UiMessage::new(MessageId::GoogleRequestFailed).with_arg("detail", json!(cause)));
+        let response = request_error_response(error, Some(&selected), &runtime);
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let bytes = tokio::runtime::Runtime::new().expect("test runtime").block_on(
+            axum::body::to_bytes(response.into_body(), 16 * 1024))
+            .expect("error response body");
+        let body: Value = serde_json::from_slice(&bytes).expect("error JSON");
+        assert_eq!(body["error"]["code"], "UPSTREAM_ERROR");
+        let diagnostic = body["error"]["message"].as_str().expect("diagnostic");
+        let ui = &body["error"]["ui"];
+        assert!(!diagnostic.contains(pinned_key.as_str()));
+        assert!(!ui.to_string().contains(pinned_key.as_str()));
+        // A current-ring-only sentinel is deliberately retained: consulting the
+        // newer ring instead would redact it while leaking the pinned key.
+        assert!(diagnostic.contains(newer_key.as_str()));
+        assert!(ui.to_string().contains(newer_key.as_str()));
+        assert_eq!(ui["args"]["detail"]["args"]["detail"],
+            "[redacted] / synthetic-current-key");
+    }
+
     /// A listener holding an ephemeral loopback port, and the port it holds:
     /// the "already in use" side of every reservation test.
     fn held_port() -> (TcpListener, u16) {
@@ -1424,7 +1565,8 @@ mod tests {
             Err(error) => error,
             Ok(_) => panic!("port zero names no loopback port"),
         };
-        assert!(error.contains('0'), "the refusal names the port: {error}");
+        assert_eq!(error.code, "BACKEND_INVALID_PORT");
+        assert_eq!(error.ui.key, MessageId::BackendPortZero);
     }
 
     /// A bind on a port somebody serves reads as `InUse` - the only failure that

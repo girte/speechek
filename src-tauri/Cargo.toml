@@ -12,6 +12,9 @@ name = "speechek_lib"
 [build-dependencies]
 # Pinned with tauri: 2.6.3 is the build/codegen generation that ships with tauri 2.11.5.
 tauri-build = { version = "=2.6.3", features = [] }
+# The build script validates public/messages.json and renders the MessageId
+# enum; the runtime already links serde_json for the loopback API.
+serde_json = "1"
 
 [dependencies]
 tauri = { version = "=2.11.5", features = ["tray-icon", "image-png"] }
@@ -33,6 +36,9 @@ windows = { version = "0.61.3", features = [
   "Win32_System_Threading",
   "Win32_Storage_FileSystem",
   "Win32_System_Registry",
+  # The Windows UI language a profile without a saved or installer-recorded
+  # choice falls back to (src/i18n.rs).
+  "Win32_Globalization",
   # The receipt-sequenced clipboard paste (src/paste.rs): the clipboard API and
   # its delayed-render promise, the process-module handle the message-only owner
   # window is created from, and the global-memory blocks the text is written into.

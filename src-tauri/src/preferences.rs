@@ -45,6 +45,7 @@ use zeroize::Zeroizing;
 use crate::provider::{KeyCheckOutcome, Provider};
 use crate::secrets::{self, KeyRing, SecretKey, SecretStoreError};
 use crate::settings::{self, RuntimeSnapshot, Settings, SharedRuntime};
+use crate::i18n::{self, Language, MessageId, UiMessage};
 
 /* -------------------------------------------------------------------------- */
 /* Names, codes and fixed wording                                             */
@@ -66,46 +67,23 @@ const EVENT_SETTINGS_CHANGED: &str = "speechek:settings-changed";
 /// Modes the launcher understands, in the order the page shows them.
 const MODES: &[&str] = &["live", "smart", "verbatim"];
 
-/// Wording for the one failure the user has to fix on disk.
-const SAVE_PARTIAL_MESSAGE: &str = "Файлы могли измениться частично; приложение продолжает использовать прежние настройки. Устраните ошибку доступа и повторите применение.";
-/// Wording for an apply that would change the launcher chord mid-dictation.
-const DICTATION_ACTIVE_MESSAGE: &str =
-    "Чтобы изменить горячую клавишу, завершите или отмените диктовку.";
-/// Wording for a key store that exists but cannot be opened.
-const SECRETS_UNAVAILABLE_MESSAGE: &str =
-    "Хранилище ключей недоступно: сохранённый список невозможно прочитать.";
-/// Wording for a launcher chord the grammar cannot express.
-const HOTKEY_INVALID_MESSAGE: &str =
-    "Сочетание клавиш не поддерживается. Примеры: F2, Ctrl+Shift+Space.";
-/// Wording for a general-form port outside `1..=65535`.
-const PORT_INVALID_MESSAGE: &str = "Укажите целое число от 1 до 65535.";
-/// Wording for a chosen input device id the document's own reader would refuse.
-const INPUT_DEVICE_INVALID_MESSAGE: &str =
-    "Идентификатор выбранного микрофона не поддерживается. Выберите устройство заново.";
-/// Wording for an input-device enumeration the host refused to perform. The
-/// page keeps the running choice and its own options; the operating system's
-/// text, which may name endpoints, never reaches it.
-const INPUT_DEVICES_UNAVAILABLE_MESSAGE: &str =
-    "Не удалось получить список микрофонов. Проверьте доступ к устройствам записи.";
-/// Wording for a launch-at-logon registration the name already holds, or the
-/// registry cannot be read: nothing was changed.
-const AUTOSTART_UNAVAILABLE_MESSAGE: &str =
-    "Автозагрузка занята другой программой или недоступна; изменение не выполнено.";
-/// Wording for a launch-at-logon write that did not stick.
-const AUTOSTART_FAILED_MESSAGE: &str =
-    "Не удалось изменить автозагрузку. Проверьте права текущего пользователя и повторите.";
 
 /* -------------------------------------------------------------------------- */
 /* Command failure                                                            */
 /* -------------------------------------------------------------------------- */
 
-/// A settings-command failure: a stable machine-readable code, fixed text that
-/// never quotes a key, a Google response or a file's contents, and - where the
-/// page can point at something - the field or the physical line it belongs to.
+/// A settings-command failure: a stable machine-readable code, the English
+/// diagnostic derived from its descriptor, that descriptor itself - what the
+/// page renders in the current language - and, where the page can point at
+/// something, the field or the physical line it belongs to.
 #[derive(Clone, Debug, Serialize)]
 pub struct SettingsUiError {
     code: String,
     message: String,
+    /// The reason as a catalog descriptor: the page renders it in the current
+    /// language and never matches the diagnostic text. Reasons keep distinct
+    /// keys even where an older caller would have read the same `code`.
+    pub ui: UiMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
     field: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -113,58 +91,48 @@ pub struct SettingsUiError {
 }
 
 impl SettingsUiError {
-    /// A failure with fixed text. Every call site passes compile-time constants
-    /// or text this module composed from a path, never a value read from a
-    /// configuration file.
-    pub fn new(code: &str, message: &str) -> Self {
+    /// A failure from its semantic descriptor. The English diagnostic is
+    /// rendered from that descriptor, not kept as a second source of copy.
+    pub fn new(code: &str, ui: UiMessage) -> Self {
         Self {
             code: code.to_owned(),
-            message: message.to_owned(),
+            message: i18n::render(Language::En, &ui).into_owned(),
+            ui,
             field: None,
             line: None,
         }
     }
 
     /// The same failure, naming the form field it belongs to.
-    fn field(code: &str, message: &str, field: &str) -> Self {
+    fn field(code: &str, ui: UiMessage, field: &str) -> Self {
         Self {
-            code: code.to_owned(),
-            message: message.to_owned(),
             field: Some(field.to_owned()),
-            line: None,
+            ..Self::new(code, ui)
         }
     }
 
     /// The same failure, naming the physical line of the list it belongs to.
-    fn line(code: &str, message: &str, line: u64) -> Self {
+    fn line(code: &str, ui: UiMessage, line: u64) -> Self {
         Self {
-            code: code.to_owned(),
-            message: message.to_owned(),
-            field: None,
             line: Some(line),
+            ..Self::new(code, ui)
         }
     }
 
     /// Only the settings page may call the settings commands.
     fn forbidden() -> Self {
-        Self::new(
-            "FORBIDDEN",
-            "Команда доступна только окну настроек Speechek.",
-        )
+        Self::new("FORBIDDEN", UiMessage::new(MessageId::SettingsForbidden))
     }
 
     /// The draft is gone, or the caller names a revision that is not the one
     /// the draft is on.
     fn stale_draft() -> Self {
-        Self::new(
-            "STALE_DRAFT",
-            "Черновик настроек изменился; перечитайте окно и повторите действие.",
-        )
+        Self::new("STALE_DRAFT", UiMessage::new(MessageId::SettingsStaleDraft))
     }
 
     /// A destructive step needs its own confirmation.
-    fn confirm_required(message: &str) -> Self {
-        Self::new("CONFIRM_REQUIRED", message)
+    fn confirm_required(ui: UiMessage) -> Self {
+        Self::new("CONFIRM_REQUIRED", ui)
     }
 }
 
@@ -195,6 +163,12 @@ pub struct SettingsView {
     /// carries the revision it expects, so a late answer cannot overwrite a
     /// newer one.
     pub revision: u64,
+
+    /// The runtime revision this view was drawn from. The draft's own
+    /// `revision` moves on every edit; this one names the published
+    /// configuration the language and the chord really come from, so a late
+    /// answer can never make a stale language look newer.
+    pub runtime_revision: u64,
     /// The values the page shows for the two form sections.
     pub settings: Settings,
     /// The port this run claimed from the settings document before the shell
@@ -227,6 +201,12 @@ pub struct SettingsView {
     /// Why the launcher chord is not registered, when it is not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hotkey_error: Option<String>,
+
+    /// The same reason as a semantic descriptor: what the banner really says,
+    /// rendered by the page in the current language. The string above stays as
+    /// its English diagnostic for logs and older callers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hotkey_error_ui: Option<UiMessage>,
     /// A dictation is in progress, so the chord cannot be changed right now.
     pub dictation_active: bool,
     /// A previous apply could not be rolled back completely.
@@ -255,11 +235,15 @@ pub struct InputDeviceView {
     pub is_default: bool,
 }
 
-/// An unusable key list, by physical line; the message never holds a key.
+/// An unusable key list, by physical line; neither the diagnostic nor the
+/// descriptor ever holds a key.
 #[derive(Clone, Debug, Serialize)]
 pub struct KeyError {
     pub line: u64,
     pub message: String,
+    /// The reason as a catalog descriptor, rendered by the page in the current
+    /// language; `message` stays as its English diagnostic for logs.
+    pub ui: UiMessage,
 }
 
 /// The outcome of an apply: the new view, whether the new configuration is in
@@ -272,6 +256,11 @@ pub struct SaveResult {
     pub applied: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+
+    /// The same warning as a semantic descriptor, so the page renders it in
+    /// the current language; `warning` stays as its English diagnostic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning_ui: Option<UiMessage>,
 }
 
 /// What one key check found. A report is either about the draft revision it
@@ -294,13 +283,53 @@ pub struct KeyCheckEntry {
     pub line: u64,
     pub status: String,
     pub message: String,
+    /// The same result as a catalog descriptor, rendered by the page in the
+    /// current language; `message` stays as its English diagnostic.
+    pub ui: UiMessage,
 }
 
-/// The payload of the one event an apply sends: the launcher chord the running
-/// revision now uses. It never carries a key.
+/// The payload of the one event an apply sends: the launcher chord and the
+/// interface language the running revision now uses, tagged with that
+/// revision so a late delivery cannot move a window back. It never carries a
+/// key.
 #[derive(Clone, Debug, Serialize)]
 struct SettingsChanged {
     hotkey: String,
+    language: Language,
+    revision: u64,
+}
+
+/// The English diagnostic text of a semantic warning, for logs and for
+/// callers that predate the descriptor field. The page renders the descriptor
+/// itself.
+pub(crate) fn diagnostic_text(warning: &Option<UiMessage>) -> Option<String> {
+    warning
+        .as_ref()
+        .map(|ui| i18n::render(Language::En, ui).into_owned())
+}
+
+/// One warning out of two: both became true during the same apply and the
+/// window shows one line. Each side stays a nested descriptor, so the page
+/// renders either cause in the current language.
+pub(crate) fn combined_warning(
+    first: Option<UiMessage>,
+    second: Option<UiMessage>,
+) -> Option<UiMessage> {
+    match (first, second) {
+        (None, None) => None,
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (Some(first), Some(second)) => Some(
+            UiMessage::new(MessageId::CombinedWarnings)
+                .with_arg(
+                    "first",
+                    serde_json::json!({ "key": first.key, "args": first.args }),
+                )
+                .with_arg(
+                    "second",
+                    serde_json::json!({ "key": second.key, "args": second.args }),
+                ),
+        ),
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -483,6 +512,7 @@ fn read_key_draft(
             error: Some(KeyError {
                 line: error.line() as u64,
                 message: error.message().to_owned(),
+                ui: error.ui(),
             }),
         },
     }
@@ -521,7 +551,8 @@ pub struct PreferencesState {
     /// The container beside it.
     pub(crate) secrets_path: PathBuf,
     /// Why the launcher chord is not registered, for the banner in the window.
-    pub(crate) hotkey_error: Mutex<Option<String>>,
+    /// The descriptor is the statement; the view derives its diagnostic text.
+    pub(crate) hotkey_error: Mutex<Option<UiMessage>>,
     /// The section a pending open (tray activation, startup) asked for.
     pub(crate) pending_section: Mutex<String>,
     /// Set while the shell is leaving. The quit path latches it before its
@@ -658,9 +689,11 @@ impl PreferencesState {
         // use: the same answer decides what the page shows and whether a close
         // still has to ask about it.
         let reading = self.key_reading(draft, &snapshot);
+        let hotkey_error = self.hotkey_error.lock().clone();
         SettingsView {
             draft_id: draft.id,
             revision: draft.revision,
+            runtime_revision: snapshot.revision,
             settings: snapshot.settings.clone(),
             startup_port: self.ports.configured,
             running_port: self.ports.actual,
@@ -670,7 +703,8 @@ impl PreferencesState {
             keys_changed: reading.changed,
             key_error: reading.error,
             secrets_status: self.secrets_status().to_owned(),
-            hotkey_error: self.hotkey_error.lock().clone(),
+            hotkey_error: diagnostic_text(&hotkey_error),
+            hotkey_error_ui: hotkey_error,
             dictation_active: crate::phase_of(&crate::inner(app)).is_active(),
             partial_persistence: self.partial_persistence(),
             autostart_enabled: crate::autostart::state(),
@@ -706,7 +740,7 @@ where
         Ok(result) => result,
         Err(_) => Err(SettingsUiError::new(
             "INTERNAL",
-            "Не удалось выполнить действие: рабочий поток недоступен.",
+            UiMessage::new(MessageId::SettingsWorkerUnavailable),
         )),
     }
 }
@@ -720,7 +754,7 @@ fn ensure_running(state: &PreferencesState) -> Result<(), SettingsUiError> {
     if state.closing.load(Ordering::SeqCst) || state.installer_closing.load(Ordering::SeqCst) {
         return Err(SettingsUiError::new(
             "CLOSING",
-            "Приложение завершает работу, изменение настроек недоступно.",
+            UiMessage::new(MessageId::SettingsClosing),
         ));
     }
     Ok(())
@@ -786,6 +820,10 @@ pub struct GeneralSettings {
     /// `null` is a value of the contract; an omitted field is refused.
     #[serde(deserialize_with = "input_device_choice")]
     pub input_device: Option<String>,
+    /// The interface language this change asks for, in its lowercase wire
+    /// spelling. Required: a payload that omits it is refused, so an old page
+    /// can never write a language it never showed.
+    pub language: Language,
 }
 
 /// Reads the general form's `input_device`: `null` is the system default
@@ -838,7 +876,7 @@ fn usable_port(port: u16) -> Result<u16, SettingsUiError> {
     if port == 0 {
         return Err(SettingsUiError::field(
             "PORT_INVALID",
-            PORT_INVALID_MESSAGE,
+            UiMessage::new(MessageId::PortInvalid),
             "port",
         ));
     }
@@ -855,7 +893,7 @@ fn usable_input_device(device: Option<String>) -> Result<Option<String>, Setting
         Some(id) => settings::usable_device_id(&id).map(Some).ok_or_else(|| {
             SettingsUiError::field(
                 "INPUT_DEVICE_INVALID",
-                INPUT_DEVICE_INVALID_MESSAGE,
+                UiMessage::new(MessageId::InputDeviceInvalid),
                 "input_device",
             )
         }),
@@ -874,7 +912,10 @@ pub async fn settings_update_general(
     settings: GeneralSettings,
 ) -> Result<SaveResult, SettingsUiError> {
     check_window(&window)?;
-    run_blocking(move || update_general_blocking(&app, draft_id, revision, settings)).await
+    let handle = app.clone();
+    let result =
+        run_blocking(move || update_general_blocking(&app, draft_id, revision, settings)).await?;
+    Ok(crate::finish_ui_apply(&handle, result).await)
 }
 
 fn update_general_blocking(
@@ -901,6 +942,7 @@ fn update_general_blocking(
         mute_during_recording: request.mute_during_recording,
         port,
         input_device,
+        language: request.language,
     };
     let mut slot = state.draft.lock();
     let draft = slot.as_mut().ok_or_else(SettingsUiError::stale_draft)?;
@@ -956,7 +998,10 @@ fn list_input_devices(app: &AppHandle) -> Result<Vec<InputDeviceView>, SettingsU
 /// A fixed failure for an enumeration the host refused. The operating system's
 /// own text may name endpoints, so it never reaches the page.
 fn list_failure() -> SettingsUiError {
-    SettingsUiError::new("INPUT_DEVICES_UNAVAILABLE", INPUT_DEVICES_UNAVAILABLE_MESSAGE)
+    SettingsUiError::new(
+        "INPUT_DEVICES_UNAVAILABLE",
+        UiMessage::new(MessageId::InputDevicesUnavailable),
+    )
 }
 
 /// Turns enumerated `(id, name)` pairs into the window's list: the default
@@ -1018,6 +1063,7 @@ fn update_hotkey_blocking(
         mute_during_recording: snapshot.settings.mute_during_recording,
         port: snapshot.settings.port,
         input_device: snapshot.settings.input_device.clone(),
+        language: snapshot.settings.language,
     };
     let mut slot = state.draft.lock();
     let draft = slot.as_mut().ok_or_else(SettingsUiError::stale_draft)?;
@@ -1076,10 +1122,10 @@ fn set_autostart_blocking(
 fn autostart_error(error: crate::autostart::AutostartError) -> SettingsUiError {
     match error {
         crate::autostart::AutostartError::Unavailable => {
-            SettingsUiError::new("AUTOSTART_UNAVAILABLE", AUTOSTART_UNAVAILABLE_MESSAGE)
+            SettingsUiError::new("AUTOSTART_UNAVAILABLE", UiMessage::new(MessageId::AutostartUnavailable))
         }
         crate::autostart::AutostartError::Failed => {
-            SettingsUiError::new("AUTOSTART_FAILED", AUTOSTART_FAILED_MESSAGE)
+            SettingsUiError::new("AUTOSTART_FAILED", UiMessage::new(MessageId::AutostartFailed))
         }
     }
 }
@@ -1196,7 +1242,7 @@ fn reveal_keys_blocking(app: &AppHandle, draft_id: u64) -> Result<String, Settin
     if state.secrets_status() == "unavailable" {
         return Err(SettingsUiError::new(
             "SECRETS_UNAVAILABLE",
-            SECRETS_UNAVAILABLE_MESSAGE,
+            UiMessage::new(MessageId::SecretsUnavailable),
         ));
     }
     // An apply that could not be rolled back may have left the container
@@ -1212,7 +1258,7 @@ fn reveal_keys_blocking(app: &AppHandle, draft_id: u64) -> Result<String, Settin
             Err(_) => {
                 return Err(SettingsUiError::new(
                     "SECRETS_UNAVAILABLE",
-                    SECRETS_UNAVAILABLE_MESSAGE,
+                    UiMessage::new(MessageId::SecretsUnavailable),
                 ));
             }
         }
@@ -1249,9 +1295,9 @@ fn clear_keys_blocking(
     confirmed: bool,
 ) -> Result<SettingsView, SettingsUiError> {
     if !confirmed {
-        return Err(SettingsUiError::confirm_required(
-            "Очистка списка отключит диктовку до сохранения новых ключей. Подтвердите очистку.",
-        ));
+        return Err(SettingsUiError::confirm_required(UiMessage::new(
+            MessageId::ConfirmClearKeys,
+        )));
     }
     let state = app.state::<PreferencesState>();
     let mut slot = state.draft.lock();
@@ -1302,7 +1348,7 @@ fn close_blocking(
         if state.keys_need_decision(draft) && !discard {
             return Err(SettingsUiError::new(
                 "UNSAVED_CHANGES",
-                "Есть неприменённые ключи API.",
+                UiMessage::new(MessageId::UnsavedKeys),
             ));
         }
         slot.take();
@@ -1345,7 +1391,7 @@ fn action_blocking(
         "quit" => quit_guarded(app, acknowledged),
         _ => Err(SettingsUiError::field(
             "INVALID_ACTION",
-            "Неизвестное действие.",
+            UiMessage::new(MessageId::UnknownAction),
             "action",
         )),
     }
@@ -1372,7 +1418,7 @@ fn quit_guarded(app: &AppHandle, acknowledged: bool) -> Result<(), SettingsUiErr
     {
         return Err(SettingsUiError::new(
             "CLOSING",
-            "Завершение уже выполняется.",
+            UiMessage::new(MessageId::QuitInProgress),
         ));
     }
     {
@@ -1391,13 +1437,16 @@ fn quit_guarded(app: &AppHandle, acknowledged: bool) -> Result<(), SettingsUiErr
             crate::request_settings(app, "last");
             return Err(SettingsUiError::new(
                 "UNSAVED_CHANGES",
-                "Есть неприменённые ключи API: примените их или откажитесь от них.",
+                UiMessage::new(MessageId::UnsavedKeysApplyOrDiscard),
             ));
         }
         if state.partial_persistence() && !acknowledged {
             state.closing.store(false, Ordering::SeqCst);
             crate::request_settings(app, "last");
-            return Err(SettingsUiError::new("SAVE_PARTIAL", SAVE_PARTIAL_MESSAGE));
+            return Err(SettingsUiError::new(
+                "SAVE_PARTIAL",
+                UiMessage::new(MessageId::SavePartial),
+            ));
         }
     }
     // The latch stays up across the gap, and the session lock is released before
@@ -1515,7 +1564,7 @@ pub async fn settings_check_keys(
     if state.check_busy.swap(true, Ordering::SeqCst) {
         return Err(SettingsUiError::new(
             "CHECK_IN_PROGRESS",
-            "Проверка ключей уже выполняется.",
+            UiMessage::new(MessageId::KeyCheckInProgress),
         ));
     }
     let _ticket = CheckTicket(&state.check_busy);
@@ -1528,15 +1577,17 @@ pub async fn settings_check_keys(
         if !draft_matches(&state, draft_id, revision) {
             return Ok(stale_report(draft_id, revision));
         }
-        let (status, message) = match state.provider.check_key(key.as_ref()).await {
-            KeyCheckOutcome::Ok => ("ok", "Доступ к API подтверждён".to_owned()),
-            KeyCheckOutcome::Denied => ("denied", "Доступ запрещён".to_owned()),
-            KeyCheckOutcome::Indeterminate(reason) => ("indeterminate", reason.message()),
+        let (status, ui) = match state.provider.check_key(key.as_ref()).await {
+            KeyCheckOutcome::Ok => ("ok", UiMessage::new(MessageId::KeyCheckOk)),
+            KeyCheckOutcome::Denied => ("denied", UiMessage::new(MessageId::KeyCheckDenied)),
+            KeyCheckOutcome::Indeterminate(reason) => ("indeterminate", reason.ui()),
         };
+        let message = i18n::render(Language::En, &ui).into_owned();
         results.push(KeyCheckEntry {
             line: line as u64,
             status: status.to_owned(),
             message,
+            ui,
         });
     }
     if !draft_matches(&state, draft_id, revision) {
@@ -1587,7 +1638,7 @@ fn check_keys(
     match draft.raw_keys.as_deref() {
         Some(raw) => {
             let normalized = secrets::normalize_key_text(raw).map_err(|error| {
-                SettingsUiError::line("KEY_LIST_INVALID", error.message(), error.line() as u64)
+                SettingsUiError::line("KEY_LIST_INVALID", error.ui(), error.line() as u64)
             })?;
             Ok(normalized
                 .keys()
@@ -1600,7 +1651,7 @@ fn check_keys(
             if state.secrets_status() == "unavailable" {
                 return Err(SettingsUiError::new(
                     "SECRETS_UNAVAILABLE",
-                    SECRETS_UNAVAILABLE_MESSAGE,
+                    UiMessage::new(MessageId::SecretsUnavailable),
                 ));
             }
             // The saved list is compact by construction, so its lines are the
@@ -1700,16 +1751,22 @@ fn planned_for_scope(
             mute_during_recording: planned.mute_during_recording,
             port: planned.port,
             input_device: planned.input_device,
+            language: planned.language,
         },
         ApplyScope::Keys => snapshot.clone(),
         ApplyScope::Hotkey => Settings {
             hotkey: settings::validate_hotkey(&planned.hotkey, config_path).map_err(|_| {
-                SettingsUiError::field("HOTKEY_INVALID", HOTKEY_INVALID_MESSAGE, "hotkey")
+                SettingsUiError::field(
+                    "HOTKEY_INVALID",
+                    UiMessage::new(MessageId::HotkeyInvalid),
+                    "hotkey",
+                )
             })?,
             mode: snapshot.mode.clone(),
             mute_during_recording: snapshot.mute_during_recording,
             port: snapshot.port,
             input_device: snapshot.input_device.clone(),
+            language: snapshot.language,
         },
     })
 }
@@ -1743,7 +1800,7 @@ fn apply_locked(
     if !MODES.contains(&planned.mode.as_str()) {
         return Err(SettingsUiError::field(
             "INVALID_MODE",
-            "Выберите режим распознавания: live, smart или verbatim.",
+            UiMessage::new(MessageId::InvalidMode),
             "mode",
         ));
     }
@@ -1761,7 +1818,7 @@ fn apply_locked(
     if registration_needed && crate::phase_of(&inner).is_active() {
         return Err(SettingsUiError::new(
             "DICTATION_ACTIVE",
-            DICTATION_ACTIVE_MESSAGE,
+            UiMessage::new(MessageId::DictationActive),
         ));
     }
 
@@ -1786,7 +1843,7 @@ fn apply_locked(
                     .map_err(|error| {
                         SettingsUiError::line(
                             "KEY_LIST_INVALID",
-                            error.message(),
+                            error.ui(),
                             error.line() as u64,
                         )
                     })?
@@ -1810,9 +1867,9 @@ fn apply_locked(
                     // one - is an explicit replacement here, and it needs its
                     // own confirmation.
                     if !confirmed_replace {
-                        return Err(SettingsUiError::confirm_required(
-                            "Прежний список ключей прочитать не удалось, он будет заменён новым. Подтвердите замену.",
-                        ));
+                        return Err(SettingsUiError::confirm_required(UiMessage::new(
+                            MessageId::ConfirmReplaceKeys,
+                        )));
                     }
                     KeyPlan::Replace(typed)
                 } else if secrets::list_equal(&typed, snapshot.keys.keys()) {
@@ -1822,9 +1879,9 @@ fn apply_locked(
                         KeyPlan::Keep
                     }
                 } else if typed.is_empty() && !(draft.clear_confirmed || confirmed_replace) {
-                    return Err(SettingsUiError::confirm_required(
-                        "Очистка списка отключит диктовку до сохранения новых ключей. Подтвердите очистку.",
-                    ));
+                    return Err(SettingsUiError::confirm_required(UiMessage::new(
+                        MessageId::ConfirmClearKeys,
+                    )));
                 } else {
                     KeyPlan::Replace(typed)
                 }
@@ -1882,6 +1939,7 @@ fn apply_locked(
             view,
             applied: true,
             warning: None,
+            warning_ui: None,
         });
     }
 
@@ -1889,25 +1947,25 @@ fn apply_locked(
     // anything is written. Each failure is one of this module's fixed lines:
     // the library's own text names paths and property names, and the window
     // shows neither.
-    let before_settings = settings::read_settings_text(&state.config_path, "файл настроек")
+    let before_settings = settings::read_settings_text(&state.config_path, MessageId::SettingsFileRole)
         .map_err(|_| {
             SettingsUiError::new(
                 "SAVE_FAILED",
-                "Не удалось прочитать файл настроек; изменения не сохранены.",
+                UiMessage::new(MessageId::SaveReadFailed),
             )
         })?;
     let patched = settings::patch_settings_document(&before_settings, &planned)
         .map_err(|_| {
             SettingsUiError::new(
                 "SAVE_FAILED",
-                "Файл настроек нельзя изменить: в нём нет одного из полей Speechek или есть лишнее. Исправьте файл вручную и повторите.",
+                UiMessage::new(MessageId::SaveDocumentUnmanaged),
             )
         })?;
     let new_container = match &plan {
         KeyPlan::Replace(keys) => Some(Some(secrets::encode_secret_keys(keys).map_err(|_| {
             SettingsUiError::new(
                 "SAVE_FAILED",
-                "Не удалось зашифровать список ключей для текущего пользователя Windows.",
+                UiMessage::new(MessageId::SaveEncryptFailed),
             )
         })?)),
         KeyPlan::RestoreOpaque(bytes) => Some(Some(bytes.clone())),
@@ -1923,7 +1981,7 @@ fn apply_locked(
             Err(_) => {
                 return Err(SettingsUiError::new(
                     "SAVE_FAILED",
-                    "Не удалось прочитать файл ключей; прежний список не изменён.",
+                    UiMessage::new(MessageId::SaveKeysReadFailed),
                 ));
             }
         }
@@ -1982,7 +2040,7 @@ fn apply_locked(
     }));
 
     // The runtime is on the new revision; only now may the old chord go.
-    let warning = crate::commit_settings_hotkey(app, candidate.take());
+    let mut warning = crate::commit_settings_hotkey(app, candidate.take());
 
     // The store's state is now a fact about the file that was just verified.
     match &plan {
@@ -2004,17 +2062,35 @@ fn apply_locked(
     let view = state.view(app, draft, SECTION_LAST.to_owned());
     let event = SettingsChanged {
         hotkey: view.settings.hotkey.clone(),
+        language: view.settings.language,
+        revision: view.runtime_revision,
     };
-    // The caller's draft lock is still held here, and the event is queued to the
-    // overlay's webview rather than dispatched from this thread: a listener
-    // cannot re-enter a settings command under this lock.
-    if let Err(error) = app.emit_to(crate::OVERLAY_LABEL, EVENT_SETTINGS_CHANGED, event) {
-        eprintln!("speechek: cannot reach the overlay about new settings: {error}.");
+    // The caller's draft lock is still held here, and the events are queued to
+    // the windows' webviews rather than dispatched from this thread: a listener
+    // cannot re-enter a settings command under this lock. A window that is not
+    // there has nothing to miss - its creation reads the current snapshot - so
+    // only a window that exists and cannot be reached is a warning.
+    let mut propagation_failed = false;
+    for label in [SETTINGS_LABEL, crate::LAB_LABEL, crate::OVERLAY_LABEL] {
+        if app.get_webview_window(label).is_none() {
+            continue;
+        }
+        if let Err(error) = app.emit_to(label, EVENT_SETTINGS_CHANGED, &event) {
+            eprintln!("speechek: cannot reach the {label} window about new settings: {error}.");
+            propagation_failed = true;
+        }
+    }
+    if propagation_failed {
+        warning = combined_warning(
+            warning,
+            Some(UiMessage::new(MessageId::UiPropagationFailed)),
+        );
     }
     Ok(SaveResult {
         view,
         applied: true,
-        warning,
+        warning: diagnostic_text(&warning),
+        warning_ui: warning,
     })
 }
 
@@ -2042,23 +2118,24 @@ fn abandon_save(
     candidate: Option<crate::RegisteredHotkey>,
 ) -> SettingsUiError {
     let chord = crate::rollback_settings_hotkey(app, candidate);
-    let mut message = match failure.obligation {
-        Some(_) => SAVE_PARTIAL_MESSAGE.to_owned(),
-        None => failure.kind.message().to_owned(),
+    let base = match failure.obligation {
+        Some(_) => UiMessage::new(MessageId::SavePartial),
+        None => failure.kind.ui(),
     };
-    if let Some(chord) = chord {
-        message.push(' ');
-        message.push_str(&chord);
-    }
+    let ui = match chord {
+        Some(chord) => combined_warning(Some(base), Some(chord))
+            .expect("two causes always combine into one warning"),
+        None => base,
+    };
     let Some(obligation) = failure.obligation else {
-        return SettingsUiError::new("SAVE_FAILED", &message);
+        return SettingsUiError::new("SAVE_FAILED", ui);
     };
     // What an earlier failed apply owed is still owed: this transaction did not
     // read those roles back, whatever it managed to put back itself.
     let mut slot = state.partial.lock();
     let merged = fold_obligation(slot.as_ref(), obligation);
     *slot = Some(merged);
-    SettingsUiError::new("SAVE_PARTIAL", &message)
+    SettingsUiError::new("SAVE_PARTIAL", ui)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2109,27 +2186,17 @@ enum FileFailureKind {
 }
 
 impl FileFailureKind {
-    /// The fixed Russian line for this category. No path, no key and no system
+    /// The reason as a catalog descriptor. No path, no key and no system
     /// message: the window only needs to know which half of the apply failed
     /// and that the previous configuration is still in effect.
-    fn message(self) -> &'static str {
-        match self {
-            FileFailureKind::ContainerWrite => {
-                "Не удалось записать файл ключей; приложение продолжает использовать прежнюю конфигурацию."
-            }
-            FileFailureKind::ContainerRemove => {
-                "Не удалось удалить файл ключей; приложение продолжает использовать прежнюю конфигурацию."
-            }
-            FileFailureKind::DocumentWrite => {
-                "Не удалось записать файл настроек; приложение продолжает использовать прежние настройки."
-            }
-            FileFailureKind::ContainerVerify => {
-                "Записанный файл ключей не совпал с ожидаемым; прежняя конфигурация восстановлена."
-            }
-            FileFailureKind::DocumentVerify => {
-                "Записанный файл настроек не совпал с ожидаемым; прежние настройки восстановлены."
-            }
-        }
+    fn ui(self) -> UiMessage {
+        UiMessage::new(match self {
+            FileFailureKind::ContainerWrite => MessageId::FileContainerWrite,
+            FileFailureKind::ContainerRemove => MessageId::FileContainerRemove,
+            FileFailureKind::DocumentWrite => MessageId::FileDocumentWrite,
+            FileFailureKind::ContainerVerify => MessageId::FileContainerVerify,
+            FileFailureKind::DocumentVerify => MessageId::FileDocumentVerify,
+        })
     }
 }
 
@@ -2233,7 +2300,7 @@ fn transact_files(
         },
     };
     if undo.settings_replaced {
-        match settings::read_settings_document(context.config_path, "файл настроек") {
+        match settings::read_settings_document(context.config_path, MessageId::SettingsFileRole) {
             Ok(saved) if saved == *planned => {}
             _ => {
                 return Err(failed_files(
@@ -2380,6 +2447,8 @@ mod tests {
     use std::fs::{self, File};
     use std::os::windows::fs::OpenOptionsExt as _;
 
+    use crate::i18n::Language;
+
     /// A directory of its own for one test, removed with everything in it. The
     /// user's `%APPDATA%` is never touched.
     struct Scratch(PathBuf);
@@ -2428,6 +2497,7 @@ mod tests {
             mute_during_recording: false,
             port: settings::DEFAULT_PORT,
             input_device: None,
+            language: Language::En,
         }
     }
 
@@ -2522,58 +2592,6 @@ mod tests {
         assert!(replacement.error.is_none());
     }
 
-    /// The general command's payload is the page's contract with the shell.
-    /// Every managed value the general section owns travels under its own name
-    /// - mode, the mute switch, the port and the chosen device - and the retired
-    /// `compare_all` is not part of the contract any more, so a stale page that
-    /// still sends it changes nothing. A payload that leaves any managed value
-    /// out is refused rather than read as a default the page never chose: a
-    /// missing mute switch would mean "off", a missing port and a missing
-    /// device would silently undo values the user set.
-    #[test]
-    fn the_general_payload_carries_every_managed_value() {
-        let sent: GeneralSettings = serde_json::from_str(
-            r#"{"mode":"smart","mute_during_recording":true,"port":43118,"input_device":"wasapi:card-one"}"#,
-        )
-        .expect("the payload the settings page sends");
-        assert_eq!(sent.mode, "smart");
-        assert!(sent.mute_during_recording);
-        assert_eq!(sent.port, 43118);
-        assert_eq!(sent.input_device.as_deref(), Some("wasapi:card-one"));
-
-        // `null` is the stored form of the system default device and a value
-        // the page really sends, unlike an omitted field.
-        let system: GeneralSettings = serde_json::from_str(
-            r#"{"mode":"live","mute_during_recording":false,"port":4173,"input_device":null}"#,
-        )
-        .expect("the system default device");
-        assert_eq!(system.port, 4173);
-        assert_eq!(system.input_device, None);
-
-        // A page from the comparison era still spells the retired field out; it
-        // is not a value of this command and changes nothing.
-        let stale: GeneralSettings = serde_json::from_str(
-            r#"{"mode":"verbatim","compare_all":true,"mute_during_recording":false,"port":4173,"input_device":null}"#,
-        )
-        .expect("a stale payload");
-        assert_eq!(stale.mode, "verbatim");
-        assert!(!stale.mute_during_recording);
-
-        // Each managed value is part of the contract: an omitted one is refused
-        // instead of read as a default.
-        for payload in [
-            r#"{"mode":"smart"}"#,
-            r#"{"mode":"smart","mute_during_recording":true}"#,
-            r#"{"mode":"smart","mute_during_recording":true,"port":4173}"#,
-            r#"{"mode":"smart","mute_during_recording":true,"input_device":null}"#,
-        ] {
-            assert!(
-                serde_json::from_str::<GeneralSettings>(payload).is_err(),
-                "the payload {payload} leaves a managed value out"
-            );
-        }
-    }
-
     /// The general form's own values are checked against the rule the settings
     /// document is read with, before anything is planned or written: zero is not
     /// a port, a negative, a fraction, a string or a number above the range never
@@ -2589,7 +2607,7 @@ mod tests {
         // Zero is the only port a `u16` accepts that is not a port, so it is the
         // value this check is for.
         let zero: GeneralSettings = serde_json::from_str(
-            r#"{"mode":"smart","mute_during_recording":true,"port":0,"input_device":null}"#,
+            r#"{"mode":"smart","mute_during_recording":true,"port":0,"input_device":null,"language":"en"}"#,
         )
         .expect("zero is a u16");
         let error = usable_port(zero.port).expect_err("zero is not a port");
@@ -2599,15 +2617,25 @@ mod tests {
         // A value that is not a whole number in range never becomes a parsed
         // payload: the command is refused before its body runs.
         for payload in [
-            r#"{"mode":"smart","mute_during_recording":true,"port":65536,"input_device":null}"#,
-            r#"{"mode":"smart","mute_during_recording":true,"port":-1,"input_device":null}"#,
-            r#"{"mode":"smart","mute_during_recording":true,"port":"4173","input_device":null}"#,
-            r#"{"mode":"smart","mute_during_recording":true,"port":4173.5,"input_device":null}"#,
+            r#"{"mode":"smart","mute_during_recording":true,"port":65536,"input_device":null,"language":"en"}"#,
+            r#"{"mode":"smart","mute_during_recording":true,"port":-1,"input_device":null,"language":"en"}"#,
+            r#"{"mode":"smart","mute_during_recording":true,"port":"4173","input_device":null,"language":"en"}"#,
+            r#"{"mode":"smart","mute_during_recording":true,"port":4173.5,"input_device":null,"language":"en"}"#,
         ] {
             assert!(
                 serde_json::from_str::<GeneralSettings>(payload).is_err(),
                 "the port in {payload} is not a whole number in range"
             );
+        }
+
+        // Required fields are not silently replaced by defaults.
+        for payload in [
+            r#"{"mode":"smart","language":"en"}"#,
+            r#"{"mode":"smart","mute_during_recording":true,"language":"en"}"#,
+            r#"{"mode":"smart","mute_during_recording":true,"port":4173,"language":"en"}"#,
+            r#"{"mode":"smart","mute_during_recording":true,"input_device":null,"language":"en"}"#,
+        ] {
+            assert!(serde_json::from_str::<GeneralSettings>(payload).is_err());
         }
 
         assert_eq!(usable_input_device(None).expect("the system device"), None);
@@ -2645,6 +2673,7 @@ mod tests {
             mute_during_recording: false,
             port: 43118,
             input_device: Some("wasapi:card-one".to_owned()),
+            language: Language::En,
         };
         let path = Path::new("settings.json");
 
@@ -2656,6 +2685,7 @@ mod tests {
                 mute_during_recording: true,
                 port: 43119,
                 input_device: None,
+                language: Language::Ru,
             },
             &running,
             path,
@@ -2667,6 +2697,11 @@ mod tests {
         );
         assert_eq!(general.port, 43119);
         assert_eq!(general.input_device, None);
+        assert_eq!(
+            general.language,
+            Language::Ru,
+            "the general scope owns the planned language"
+        );
 
         // A key change takes the whole running revision: a port or a device a
         // page might still be holding is not part of its business.
@@ -2676,6 +2711,7 @@ mod tests {
             mute_during_recording: true,
             port: 43119,
             input_device: None,
+            language: Language::En,
         };
         let keys = planned_for_scope(ApplyScope::Keys, page_copy.clone(), &running, path)
             .expect("a keys plan");
@@ -2697,6 +2733,46 @@ mod tests {
         assert_eq!(hotkey.mode, "smart");
         assert_eq!(hotkey.port, 43118);
         assert_eq!(hotkey.input_device.as_deref(), Some("wasapi:card-one"));
+        assert_eq!(
+            hotkey.language,
+            Language::En,
+            "a chord change keeps the running language"
+        );
+    }
+
+    /// The general form's payload is a contract: the language is required, and
+    /// a payload that omits it, spells one the interface does not ship or
+    /// repeats it is refused before anything is planned.
+    #[test]
+    fn general_requests_require_a_supported_language() {
+        let complete: GeneralSettings = serde_json::from_value(serde_json::json!({
+            "mode": "smart",
+            "mute_during_recording": false,
+            "port": 43118,
+            "input_device": null,
+            "language": "ru",
+        }))
+        .expect("a complete general payload");
+        assert_eq!(complete.language, Language::Ru);
+
+        let missing =
+            r#"{"mode":"smart","mute_during_recording":false,"port":43118,"input_device":null}"#;
+        assert!(
+            serde_json::from_str::<GeneralSettings>(missing).is_err(),
+            "an omitted language is refused, not defaulted"
+        );
+
+        let unsupported = r#"{"mode":"smart","mute_during_recording":false,"port":43118,"input_device":null,"language":"de"}"#;
+        assert!(
+            serde_json::from_str::<GeneralSettings>(unsupported).is_err(),
+            "a language the interface does not ship is refused"
+        );
+
+        let duplicate = r#"{"mode":"smart","mute_during_recording":false,"port":43118,"input_device":null,"language":"ru","language":"en"}"#;
+        assert!(
+            serde_json::from_str::<GeneralSettings>(duplicate).is_err(),
+            "a duplicated language is refused, not coerced"
+        );
     }
 
     /// The picker's list is a pure function of what the host enumerated: the
@@ -2763,6 +2839,7 @@ mod tests {
             mute_during_recording: true,
             port: 43118,
             input_device: None,
+            language: Language::En,
         };
         let context = FileContext {
             config_path: &config,
@@ -2790,7 +2867,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&config).expect("the written document"),
-            "\u{feff}{\r\n  // режим\r\n  \"mute_during_recording\": true,\r\n  \"port\": 43118,\r\n  \"input_device\": null,\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"verbatim\"\r\n  \r\n}\r\n",
+            "\u{feff}{\r\n  // режим\r\n  \"mute_during_recording\": true,\r\n  \"port\": 43118,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"verbatim\"\r\n  \r\n}\r\n",
             "the retired property is gone and every other byte survived"
         );
     }

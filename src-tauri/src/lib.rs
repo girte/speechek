@@ -71,6 +71,7 @@ mod audio;
 mod autostart;
 mod backend;
 mod capture;
+mod i18n;
 mod installer;
 mod live;
 mod overlay;
@@ -92,10 +93,11 @@ use settings::{RuntimeSnapshot, SharedRuntime};
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem},
-    tray::TrayIconBuilder,
+    tray::{TrayIconBuilder, TrayIconEvent},
     webview::{NewWindowResponse, PageLoadEvent, WebviewWindowBuilder},
     AppHandle, Emitter, Manager, RunEvent, Url, WebviewUrl, WebviewWindow, WindowEvent,
 };
+use crate::i18n::{Language, MessageId, UiError, UiMessage};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_single_instance::init as single_instance;
 use windows::core::HSTRING;
@@ -130,9 +132,6 @@ pub(crate) const SETTINGS_PAGE_PATH: &str = "settings.html";
 const OVERLAY_PAGE_PATH: &str = "overlay.html";
 const LAB_PAGE_PATH: &str = "/index.html";
 
-/// The settings window: one window, opened on demand from the tray icon, and
-/// only ever on the page its own navigation gate accepts.
-const SETTINGS_TITLE: &str = "Speechek — Настройки";
 /// The window a right click on the tray icon gets, and the smallest size that
 /// still shows both sections without covering the fields with the footer.
 const SETTINGS_SIZE: (f64, f64) = (920.0, 720.0);
@@ -165,29 +164,24 @@ const SECTION_KEYS: u8 = 2;
 /// The launcher chord the settings document names could not be registered while
 /// the shell started. The shell then runs with the launcher disabled and opens
 /// the window, so the chord can be repaired instead of refusing to start.
-const HOTKEY_NOT_REGISTERED: &str =
-    "Горячую клавишу не удалось зарегистрировать: её удерживает другая программа или система. Выберите другое сочетание в разделе «Общие настройки».";
+fn hotkey_not_registered() -> UiMessage {
+    UiMessage::new(MessageId::HotkeyNotRegistered)
+}
 
-/// The chord the settings window asked for is taken by another program. The
-/// registration the shell is already running is left exactly as it is.
-const HOTKEY_CONFLICT_MESSAGE: &str =
-    "Это сочетание клавиш уже занято другой программой или системой. Выберите другое.";
 
-/// The chord the settings window asked for is not one the grammar can express.
-const HOTKEY_INVALID_MESSAGE: &str =
-    "Сочетание клавиш не поддерживается. Примеры: F2, Ctrl+Shift+Space.";
+/// The chord apply succeeded, but the chord it replaced could not be released.
+/// The new chord works; only leaving the process gives the old one back, so the
+/// user is told before the next start finds it taken.
+fn hotkey_unreleased() -> UiMessage {
+    UiMessage::new(MessageId::HotkeyUnreleased)
+}
 
-/// The chord apply succeeded, but the chord it replaced could not be
-/// released. The new chord works; only leaving the process gives the old one
-/// back, so the user is told before the next start finds it taken.
-const HOTKEY_UNRELEASED_MESSAGE: &str =
-    "Новые настройки применены, но прежнюю клавишу не удалось освободить. Завершите Speechek через «Выход» перед повторным запуском.";
-
-/// The chord apply failed before anything was published, and its candidate
-/// just taken could not be given back either. The running chord is untouched;
-/// the candidate is silenced and named so the user knows what still holds it.
-const HOTKEY_CANDIDATE_UNRELEASED_MESSAGE: &str =
-    "Прежняя настройка осталась в силе, но выбранное сочетание клавиш не удалось освободить: его удерживает сам Speechek до выхода. Выберите другое сочетание или завершите приложение.";
+/// The chord apply failed before anything was published, and its candidate just
+/// taken could not be given back either. The running chord is untouched; the
+/// candidate is silenced and named so the user knows what still holds it.
+fn hotkey_candidate_unreleased() -> UiMessage {
+    UiMessage::new(MessageId::HotkeyCandidateUnreleased)
+}
 
 /// Emitted to the overlay to start recording and to stop it again. Both use the
 /// same event and the same generation, so the renderer can tell which dictation
@@ -722,13 +716,13 @@ fn admits_capture(inner: &Inner, generation: u64) -> bool {
 /// Why the laboratory cannot take the microphone right now, if it cannot.
 /// Called with the session lock held: the phase it reads is decided under that
 /// same lock by every dictation transition.
-fn lab_refusal(inner: &Inner) -> Option<String> {
+fn lab_refusal(inner: &Inner) -> Option<UiMessage> {
     if inner.shutdown.load(Ordering::SeqCst) {
-        return Some("Speechek завершается — запись невозможна.".to_string());
+        return Some(UiMessage::new(MessageId::LabShuttingDown));
     }
     match phase_of(inner) {
         Phase::Idle => None,
-        _ => Some("Идёт диктовка — дождитесь её окончания.".to_string()),
+        _ => Some(UiMessage::new(MessageId::LabDictationRunning)),
     }
 }
 
@@ -740,16 +734,22 @@ fn lab_refusal(inner: &Inner) -> Option<String> {
 /// never shares the microphone with a dictation, one take of its own is prepared
 /// at a time, and a closed window can never leave a take nobody is there to
 /// stop.
-fn reserve_lab_capture(inner: &Inner) -> Result<u64, String> {
+fn reserve_lab_capture(inner: &Inner) -> Result<u64, UiError> {
     if let Some(message) = lab_refusal(inner) {
-        return Err(message);
+        return Err(UiError::new("LAB_UNAVAILABLE", message));
     }
     if inner.lab_closed.load(Ordering::SeqCst) {
-        return Err("Окно лаборатории закрыто — откройте его заново.".to_string());
+        return Err(UiError::new(
+            "LAB_WINDOW_CLOSED",
+            UiMessage::new(MessageId::LabWindowClosed),
+        ));
     }
     let mut lab = inner.lab.lock();
     if lab.is_some() {
-        return Err("Лаборатория уже готовит запись.".to_string());
+        return Err(UiError::new(
+            "LAB_BUSY",
+            UiMessage::new(MessageId::LabBusyPreparing),
+        ));
     }
     let generation = inner.lab_next.fetch_add(1, Ordering::SeqCst) + 1;
     *lab = Some(LabCapture {
@@ -767,17 +767,23 @@ fn reserve_lab_capture(inner: &Inner) -> Result<u64, String> {
 /// A generation that is not the reserved one — a repeated command, a late start
 /// of a take that is already over — opens nothing, and the right is spent by the
 /// first start that takes it.
-fn request_lab_start(inner: &Inner, generation: u64) -> Result<Arc<RuntimeSnapshot>, String> {
+fn request_lab_start(inner: &Inner, generation: u64) -> Result<Arc<RuntimeSnapshot>, UiError> {
     let mut lab = inner.lab.lock();
     match lab.as_mut() {
         Some(reserved) if reserved.generation == generation => {
             if reserved.start_requested {
-                return Err("Микрофон этой записи уже открывается.".to_string());
+                return Err(UiError::new(
+                    "LAB_ALREADY_STARTING",
+                    UiMessage::new(MessageId::LabStartInProgress),
+                ));
             }
             reserved.start_requested = true;
             Ok(Arc::clone(&reserved.snapshot))
         }
-        _ => Err("Эта запись уже завершена — микрофон не открывался.".to_string()),
+        _ => Err(UiError::new(
+            "LAB_ENDED",
+            UiMessage::new(MessageId::LabTakeEnded),
+        )),
     }
 }
 
@@ -866,11 +872,73 @@ fn show_message(message: &str, icon: MESSAGEBOX_STYLE) {
     }
 }
 
+/// Shows a catalog message in a native dialog, in `language`.
+fn show_ui(language: Language, message: &UiMessage, icon: MESSAGEBOX_STYLE) {
+    show_message(&i18n::render(language, message), icon);
+}
+
+/// The language a native dialog uses before the runtime answers: the saved
+/// choice when a settings document is there, the detected default otherwise.
+fn startup_ui_language() -> Language {
+    let path = settings::settings_path().ok();
+    settings::startup_language(path.as_deref())
+}
+
 /// Fatal startup failure: the user has to see why speechek did not start, so the
 /// reason is a modal dialog and the process stops once it is dismissed.
-fn fatal(message: String) -> ! {
-    show_message(&message, MB_ICONERROR);
+fn fatal(language: Language, message: &UiMessage) -> ! {
+    show_ui(language, message, MB_ICONERROR);
     std::process::exit(1)
+}
+
+/// A fatal failure once the shell exists: the descriptor is redacted against
+/// the ring the running revision holds - never a copy of a key - before it is
+/// rendered in the current language.
+fn fatal_native(app: &AppHandle, mut message: UiMessage) -> ! {
+    let snapshot = inner(app).runtime.snapshot();
+    backend::redact_ui(&mut message, snapshot.keys.keys());
+    fatal(current_language(app), &message)
+}
+
+/// Redacts a capture-produced descriptor against the ring the take belongs to:
+/// the dictation's own pinned revision, or - for the laboratory, which has no
+/// pin - the running revision. It borrows the ring the snapshot already holds,
+/// copying no key material, and never takes the session lock: a stop may be
+/// awaiting a worker that reports through here. A dictation whose pin is
+/// already retired has no relevant ring left, so nothing is redacted - the
+/// current ring is never substituted for a stale generation.
+pub(crate) fn redact_capture_ui(
+    app: &AppHandle,
+    owner: capture::CaptureOwner,
+    ui: &mut UiMessage,
+) {
+    let inner = inner(app);
+    let snapshot = match owner {
+        capture::CaptureOwner::Dictation(generation) => inner.runtime.resolve(Some(generation)),
+        capture::CaptureOwner::Lab(_) => inner.runtime.resolve(None),
+    };
+    if let Some(snapshot) = snapshot {
+        backend::redact_ui(ui, snapshot.keys.keys());
+    }
+}
+
+/// The same redaction for a command failure: the descriptor is mutated and the
+/// English diagnostic is re-rendered from the redacted descriptor, so no
+/// unredacted copy of the reason is kept.
+fn redact_capture_error(
+    app: &AppHandle,
+    owner: capture::CaptureOwner,
+    mut error: UiError,
+) -> UiError {
+    redact_capture_ui(app, owner, &mut error.ui);
+    error.message = i18n::render(Language::En, &error.ui).into_owned();
+    error
+}
+
+/// An authored nested cause as the `{key,args}` value a descriptor argument
+/// takes, so a child reason renders in the same language as its parent.
+fn nested_cause(cause: &UiMessage) -> serde_json::Value {
+    serde_json::json!({ "key": cause.key, "args": cause.args })
 }
 
 /// Reads the configuration, serves the loopback socket this run reserved and
@@ -902,7 +970,7 @@ fn fatal(message: String) -> ! {
 fn startup(app: &AppHandle, reservation: ReservedListener) {
     let config_path = match settings::settings_path() {
         Ok(path) => path,
-        Err(err) => fatal(err.to_string()),
+        Err(err) => fatal(startup_ui_language(), &err.ui),
     };
 
     // A first run gets the annotated settings document on the path this launch
@@ -910,12 +978,12 @@ fn startup(app: &AppHandle, reservation: ReservedListener) {
     // with it: the key list that is still missing is reported to the user, not
     // turned into a dialog that keeps the shell from starting.
     if let Err(err) = settings::create_default_if_missing(&config_path) {
-        fatal(err.to_string());
+        fatal(startup_ui_language(), &err.ui);
     }
 
     let settings = match settings::load_settings(&config_path) {
         Ok(settings) => settings,
-        Err(err) => fatal(err.to_string()),
+        Err(err) => fatal(startup_ui_language(), &err.ui),
     };
 
     // The socket is already listening on the port the preflight read, so the
@@ -924,11 +992,12 @@ fn startup(app: &AppHandle, reservation: ReservedListener) {
     // and windows exist instead of running elsewhere than the file says;
     // a restart applies the value currently in the file.
     if settings.port != reservation.configured_port() {
-        fatal(format!(
-            "Speechek cannot start: the settings file names port {}, but this start claimed port {}. Start Speechek again to serve the saved port.",
-            settings.port,
-            reservation.configured_port()
-        ));
+        fatal(
+            startup_ui_language(),
+            &UiMessage::new(MessageId::StartupPortMismatch)
+                .with_arg("port", serde_json::json!(settings.port))
+                .with_arg("claimed", serde_json::json!(reservation.configured_port())),
+        );
     }
 
     // The key list travels beside the settings document, sealed for this
@@ -1003,15 +1072,30 @@ fn startup(app: &AppHandle, reservation: ReservedListener) {
         Arc::clone(&provider),
     ) {
         Ok(running) => running,
-        Err(err) => fatal(err),
+        Err(err) => {
+            let ui = UiMessage::new(MessageId::StartupBackendFailed)
+                .with_arg("detail", nested_cause(&err.ui));
+            fatal_native(app, ui)
+        }
     };
     app.manage(BackendState(Mutex::new(Some(running))));
 
     if let Err(err) = overlay::create(app) {
-        fatal(format!("cannot create the hidden overlay: {err}"));
+        // The underlying window error stays in the diagnostic log; the dialog
+        // nests its semantic descriptor, redacted against the running ring.
+        eprintln!("{APP_TITLE}: {err}.");
+        fatal_native(
+            app,
+            UiMessage::new(MessageId::StartupOverlayCreateFailed)
+                .with_arg("detail", nested_cause(&err.ui)),
+        );
     }
     if let Err(err) = tray(app) {
-        fatal(format!("cannot create the tray icon: {err}"));
+        fatal_native(
+            app,
+            UiMessage::new(MessageId::StartupTrayCreateFailed)
+                .with_arg("detail", serde_json::Value::from(err.to_string())),
+        );
     }
 
     // Last, once the overlay exists: the first press has to find a page that can
@@ -1079,17 +1163,17 @@ fn register_gated(
 /// dialog that keeps the shell from starting. Nothing is retried at runtime
 /// either — not here, and not on a press — so the only way a chord the user
 /// wants starts working is an explicit chord apply that registers it.
-fn register_launcher(app: &AppHandle, hotkey: &str) -> Option<String> {
+fn register_launcher(app: &AppHandle, hotkey: &str) -> Option<UiMessage> {
     // The document's chord is checked against the same grammar the settings
     // window enforces: `"Escape"` and `"F12"` must not be registered as the
     // launcher, because one belongs to cancelling a dictation and the other is
     // reserved. A chord the grammar refuses is a repair, not a registration.
     let path = app.state::<PreferencesState>().config_path.clone();
     let Ok(hotkey) = settings::validate_hotkey(hotkey, &path) else {
-        return Some(HOTKEY_NOT_REGISTERED.to_owned());
+        return Some(hotkey_not_registered());
     };
     let Ok(shortcut) = hotkey.parse::<Shortcut>() else {
-        return Some(HOTKEY_NOT_REGISTERED.to_owned());
+        return Some(hotkey_not_registered());
     };
     let registration = RegisteredHotkey::launcher(shortcut);
     match registration.install(app) {
@@ -1099,7 +1183,7 @@ fn register_launcher(app: &AppHandle, hotkey: &str) -> Option<String> {
             *shell.hotkey.lock() = Some(registration);
             None
         }
-        Err(_) => Some(HOTKEY_NOT_REGISTERED.to_owned()),
+        Err(_) => Some(hotkey_not_registered()),
     }
 }
 
@@ -1156,7 +1240,7 @@ pub(crate) fn prepare_settings_hotkey(
 ) -> Result<Option<RegisteredHotkey>, SettingsUiError> {
     let inner = inner(app);
     let path = app.state::<PreferencesState>().config_path.clone();
-    let invalid = || SettingsUiError::new("HOTKEY_INVALID", HOTKEY_INVALID_MESSAGE);
+    let invalid = || SettingsUiError::new("HOTKEY_INVALID", UiMessage::new(MessageId::HotkeyInvalid));
     let hotkey = settings::validate_hotkey(hotkey, &path).map_err(|_| invalid())?;
     let shortcut = hotkey.parse::<Shortcut>().map_err(|_| invalid())?;
     if holds_chord(&inner, shortcut) {
@@ -1165,7 +1249,7 @@ pub(crate) fn prepare_settings_hotkey(
     let candidate = RegisteredHotkey::candidate(shortcut);
     candidate
         .install(app)
-        .map_err(|_| SettingsUiError::new("HOTKEY_CONFLICT", HOTKEY_CONFLICT_MESSAGE))?;
+        .map_err(|_| SettingsUiError::new("HOTKEY_CONFLICT", UiMessage::new(MessageId::HotkeyConflict)))?;
     Ok(Some(candidate))
 }
 
@@ -1179,7 +1263,7 @@ pub(crate) fn prepare_settings_hotkey(
 pub(crate) fn commit_settings_hotkey(
     app: &AppHandle,
     candidate: Option<RegisteredHotkey>,
-) -> Option<String> {
+) -> Option<UiMessage> {
     let candidate = candidate?;
     let inner = inner(app);
     let previous = {
@@ -1202,7 +1286,7 @@ pub(crate) fn commit_settings_hotkey(
     let previous = previous?;
     match app.global_shortcut().unregister(previous.shortcut) {
         Ok(()) => None,
-        Err(_) => Some(HOTKEY_UNRELEASED_MESSAGE.to_owned()),
+        Err(_) => Some(hotkey_unreleased()),
     }
 }
 
@@ -1216,12 +1300,12 @@ pub(crate) fn commit_settings_hotkey(
 pub(crate) fn rollback_settings_hotkey(
     app: &AppHandle,
     candidate: Option<RegisteredHotkey>,
-) -> Option<String> {
+) -> Option<UiMessage> {
     let candidate = candidate?;
     candidate.enabled.store(false, Ordering::SeqCst);
     match app.global_shortcut().unregister(candidate.shortcut) {
         Ok(()) => None,
-        Err(_) => Some(HOTKEY_CANDIDATE_UNRELEASED_MESSAGE.to_owned()),
+        Err(_) => Some(hotkey_candidate_unreleased()),
     }
 }
 
@@ -1346,8 +1430,9 @@ fn toggle(app: &AppHandle, gate: &Arc<AtomicBool>) {
             // before the pill is placed, so the arming itself can be cancelled.
             let session_id = inner.session_id.fetch_add(1, Ordering::SeqCst) + 1;
             if let Err(err) = guard_cancel_key(app, session_id) {
-                cancel_arming_locked(app, err.clone());
-                show_message(&err, MB_ICONERROR);
+                let reason = i18n::render(Language::En, &err).into_owned();
+                cancel_arming_locked(app, reason);
+                show_ui(current_language(app), &err, MB_ICONERROR);
                 return;
             }
             // The dictation exists now, so the settings window stops offering a
@@ -1592,13 +1677,11 @@ fn cancel_key() -> Shortcut {
 
 /// A session without its cancel key must not start. Each handler captures the
 /// session ticket, so a queued Escape cannot cancel the next dictation.
-fn guard_cancel_key(app: &AppHandle, session_id: u64) -> Result<(), String> {
+fn guard_cancel_key(app: &AppHandle, session_id: u64) -> Result<(), UiMessage> {
     let shortcuts = app.global_shortcut();
     let key = cancel_key();
     if shortcuts.is_registered(key) {
-        return Err(
-            "Escape ещё занят предыдущей записью; повторите после её завершения.".to_string(),
-        );
+        return Err(UiMessage::new(MessageId::EscapeBusy));
     }
     let handle = app.clone();
     shortcuts.on_shortcut(key, move |_app, _shortcut, event| {
@@ -1613,7 +1696,10 @@ fn guard_cancel_key(app: &AppHandle, session_id: u64) -> Result<(), String> {
             std::thread::spawn(move || cancel_dictation(&handle, session_id));
         }
     })
-    .map_err(|err| format!("Не удалось зарегистрировать Escape для отмены записи: {err}. Освободите клавишу в другой программе и повторите."))
+    .map_err(|err| {
+        UiMessage::new(MessageId::EscapeUnavailable)
+            .with_arg("detail", serde_json::Value::from(err.to_string()))
+    })
 }
 
 /// Gives Escape back to Windows once no dictation can be cancelled any more.
@@ -1764,14 +1850,35 @@ fn watch(app: AppHandle) {
 /// A right click opens the native menu only. The two actions preserve the
 /// deferred settings activation and the page's unflushed key editor.
 fn tray(app: &AppHandle) -> tauri::Result<()> {
-    let settings = MenuItem::with_id(app, "settings", "Настройка", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
+    let language = current_language(app);
+    let settings = MenuItem::with_id(
+        app,
+        "settings",
+        localized(language, MessageId::TraySettings),
+        true,
+        None::<&str>,
+    )?;
+    let quit = MenuItem::with_id(
+        app,
+        "quit",
+        localized(language, MessageId::TrayExit),
+        true,
+        None::<&str>,
+    )?;
     let menu = Menu::with_items(app, &[&settings, &quit])?;
     TrayIconBuilder::with_id("speechek")
         .icon(Image::from_bytes(include_bytes!("../icons/icon.png"))?)
         .tooltip(APP_TITLE)
         .menu(&menu)
         .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            // A click or a pointer entering the icon is a moment the shell may
+            // have a caption a missed refresh left behind; the menu action
+            // itself is untouched.
+            if matches!(event, TrayIconEvent::Click { .. } | TrayIconEvent::Enter { .. }) {
+                let _ = apply_native_language_now(tray.app_handle());
+            }
+        })
         .on_menu_event(|app, event| match event.id.as_ref() {
             "settings" => request_settings(app, "last"),
             "quit" => {
@@ -1781,7 +1888,115 @@ fn tray(app: &AppHandle) -> tauri::Result<()> {
             _ => {}
         })
         .build(app)?;
+    app.manage(TrayItems { settings, quit });
     Ok(())
+}
+
+/// The tray's own menu entries, kept so the shell can retitle them when the
+/// interface language changes without rebuilding the menu, showing the icon or
+/// touching a window.
+struct TrayItems {
+    settings: MenuItem<tauri::Wry>,
+    quit: MenuItem<tauri::Wry>,
+}
+
+/// One catalog string in `language`.
+pub(crate) fn localized(language: Language, key: MessageId) -> &'static str {
+    key.template(language)
+}
+
+/// The language the running revision uses.
+pub(crate) fn current_language(app: &AppHandle) -> Language {
+    inner(app).runtime.snapshot().settings.language
+}
+
+/// Puts the current language on every existing window title and tray entry: the
+/// settings, laboratory and overlay titles and the two tray menu entries. It
+/// reads the latest snapshot, never a captured one, so a delayed call cannot put
+/// an older language back. Nothing is created, shown, focused, resized or
+/// reloaded - a window that is not there is skipped - and the first failure is
+/// reported as one aggregate error once every item was attempted.
+pub(crate) fn apply_native_language_now(app: &AppHandle) -> Result<(), UiMessage> {
+    let language = current_language(app);
+    let mut failed = false;
+    for (label, key) in [
+        (preferences::SETTINGS_LABEL, MessageId::SettingsTitle),
+        (LAB_LABEL, MessageId::LabTitle),
+        (OVERLAY_LABEL, MessageId::OverlayTitle),
+    ] {
+        let Some(window) = app.get_webview_window(label) else {
+            continue;
+        };
+        if let Err(error) = window.set_title(localized(language, key)) {
+            eprintln!("{APP_TITLE}: cannot retitle the {label} window: {error}.");
+            failed = true;
+        }
+    }
+    if let Some(items) = app.try_state::<TrayItems>() {
+        if let Err(error) = items
+            .settings
+            .set_text(localized(language, MessageId::TraySettings))
+        {
+            eprintln!("{APP_TITLE}: cannot retitle the settings tray entry: {error}.");
+            failed = true;
+        }
+        if let Err(error) = items.quit.set_text(localized(language, MessageId::TrayExit)) {
+            eprintln!("{APP_TITLE}: cannot retitle the exit tray entry: {error}.");
+            failed = true;
+        }
+    }
+    if failed {
+        Err(UiMessage::new(MessageId::NativeUiRefreshFailed))
+    } else {
+        Ok(())
+    }
+}
+
+/// The aggregate failure of a native refresh: a dispatch, a channel and a
+/// timeout all mean the same thing to the page.
+fn native_refresh_failed() -> UiMessage {
+    UiMessage::new(MessageId::NativeUiRefreshFailed)
+}
+
+/// Retitles the windows and tray entries on the main thread and waits, bounded,
+/// for the completion `run_on_main_thread` itself does not report. A callback
+/// that arrives late still reads the latest snapshot.
+pub(crate) async fn refresh_native_language(app: &AppHandle) -> Result<(), UiMessage> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    let handle = app.clone();
+    app.run_on_main_thread(move || {
+        let _ = sender.send(apply_native_language_now(&handle));
+    })
+    .map_err(|error| {
+        eprintln!("{APP_TITLE}: cannot dispatch the interface refresh: {error}.");
+        native_refresh_failed()
+    })?;
+    match tokio::time::timeout(Duration::from_secs(2), receiver).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => {
+            eprintln!("{APP_TITLE}: the interface refresh did not report back.");
+            Err(native_refresh_failed())
+        }
+        Err(_) => {
+            eprintln!("{APP_TITLE}: the interface refresh did not finish in time.");
+            Err(native_refresh_failed())
+        }
+    }
+}
+
+/// Adds the native-refresh outcome to a committed save as a warning. A save that
+/// succeeded is never turned into a failure, and a no-op save may still restore
+/// a window that missed an earlier refresh.
+pub(crate) async fn finish_ui_apply(
+    app: &AppHandle,
+    result: preferences::SaveResult,
+) -> preferences::SaveResult {
+    let mut result = result;
+    if let Err(ui) = refresh_native_language(app).await {
+        result.warning_ui = preferences::combined_warning(result.warning_ui.take(), Some(ui));
+        result.warning = preferences::diagnostic_text(&result.warning_ui);
+    }
+    result
 }
 
 /// The section a request named, as the page spells it.
@@ -1911,6 +2126,7 @@ fn activate_settings(app: &AppHandle) {
         inner.settings_activating.store(false, Ordering::SeqCst);
         inner.pending_settings.store(false, Ordering::SeqCst);
         flush_settings_close(&handle);
+        let _ = apply_native_language_now(&handle);
     });
     if dispatched.is_err() {
         // The token says whether this activation is still the one the flags
@@ -1919,8 +2135,9 @@ fn activate_settings(app: &AppHandle) {
         if shell.activation_token.load(Ordering::SeqCst) == token {
             shell.settings_activating.store(false, Ordering::SeqCst);
             shell.pending_settings.store(false, Ordering::SeqCst);
-            show_message(
-                "Не удалось открыть окно настроек: приложение не смогло обратиться к главному потоку.",
+            show_ui(
+                current_language(app),
+                &UiMessage::new(MessageId::SettingsWindowDispatchFailed),
                 MB_ICONERROR,
             );
         }
@@ -1948,7 +2165,7 @@ fn create_settings_window(app: &AppHandle) {
         preferences::SETTINGS_LABEL,
         WebviewUrl::App(SETTINGS_PAGE_PATH.into()),
     )
-    .title(SETTINGS_TITLE)
+    .title(localized(current_language(app), MessageId::SettingsTitle))
     .inner_size(SETTINGS_SIZE.0, SETTINGS_SIZE.1)
     .min_inner_size(SETTINGS_MIN_SIZE.0, SETTINGS_MIN_SIZE.1)
     .resizable(true)
@@ -1980,8 +2197,10 @@ fn create_settings_window(app: &AppHandle) {
     let window = match window {
         Ok(window) => window,
         Err(err) => {
-            show_message(
-                &format!("Не удалось открыть окно настроек: {err}."),
+            show_ui(
+                current_language(app),
+                &UiMessage::new(MessageId::SettingsWindowCreateFailed)
+                    .with_arg("detail", serde_json::Value::from(err.to_string())),
                 MB_ICONERROR,
             );
             return;
@@ -2029,6 +2248,7 @@ fn create_settings_window(app: &AppHandle) {
 
     let _ = window.show();
     let _ = window.set_focus();
+    let _ = apply_native_language_now(app);
 }
 
 /// Drops the settings draft, off the UI thread.
@@ -2056,6 +2276,7 @@ pub(crate) fn open_lab(app: &AppHandle) {
 }
 
 fn open_lab_now(app: &AppHandle) {
+    let _ = apply_native_language_now(app);
     if let Some(window) = app.get_webview_window(LAB_LABEL) {
         let _ = window.show();
         let _ = window.set_focus();
@@ -2067,7 +2288,7 @@ fn open_lab_now(app: &AppHandle) {
     }
 
     let window = match WebviewWindowBuilder::new(app, LAB_LABEL, WebviewUrl::App(LAB_PAGE_PATH.into()))
-        .title("Speechek — сравнение")
+        .title(localized(current_language(app), MessageId::LabTitle))
         .inner_size(LAB_SIZE.0, LAB_SIZE.1)
         .visible(false)
         .build()
@@ -2324,7 +2545,7 @@ async fn dictation_context(
     if !is_overlay(&window) {
         return Err(preferences::SettingsUiError::new(
             "FORBIDDEN",
-            "Команда доступна только плашке диктовки Speechek.",
+            UiMessage::new(MessageId::OverlayForbidden),
         ));
     }
     tauri::async_runtime::spawn_blocking(move || {
@@ -2333,7 +2554,7 @@ async fn dictation_context(
         let snapshot = inner.runtime.resolve(Some(generation)).ok_or_else(|| {
             preferences::SettingsUiError::new(
                 "STALE_SESSION",
-                "Эта диктовка уже завершена или отменена.",
+                UiMessage::new(MessageId::StaleSession),
             )
         })?;
         {
@@ -2348,7 +2569,7 @@ async fn dictation_context(
             {
                 return Err(preferences::SettingsUiError::new(
                     "STALE_SESSION",
-                    "Эта диктовка уже завершена или отменена.",
+                    UiMessage::new(MessageId::StaleSession),
                 ));
             }
         }
@@ -2359,7 +2580,10 @@ async fn dictation_context(
     })
     .await
     .map_err(|_| {
-        preferences::SettingsUiError::new("INTERNAL", "Не удалось получить параметры диктовки.")
+        preferences::SettingsUiError::new(
+            "INTERNAL",
+            UiMessage::new(MessageId::DictationContextUnavailable),
+        )
     })?
 }
 
@@ -2441,12 +2665,18 @@ async fn finish_session(
     app: AppHandle,
     generation: u64,
     outcome: String,
-) -> Result<(), String> {
+) -> Result<(), UiError> {
     if outcome != "success" && outcome != "error" {
-        return Err("invalid dictation outcome".to_string());
+        return Err(UiError::new(
+            "INVALID_OUTCOME",
+            UiMessage::new(MessageId::InvalidDictationOutcome),
+        ));
     }
     if !is_overlay(&window) {
-        return Err("finish_session is only available to the overlay window.".to_string());
+        return Err(UiError::new(
+            "FORBIDDEN",
+            UiMessage::new(MessageId::OverlayForbidden),
+        ));
     }
     tauri::async_runtime::spawn_blocking(move || {
         let inner = inner(&app);
@@ -2480,7 +2710,13 @@ async fn finish_session(
         Ok(())
     })
     .await
-    .map_err(|err| format!("the dictation outcome could not be applied ({err})"))?
+    .map_err(|err| {
+        UiError::new(
+            "INTERNAL",
+            UiMessage::new(MessageId::FinishSessionWorkerFailed)
+                .with_arg("detail", serde_json::Value::from(err.to_string())),
+        )
+    })?
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2520,14 +2756,22 @@ async fn start_native_capture(
     window: WebviewWindow,
     app: AppHandle,
     generation: u64,
-) -> Result<capture::CaptureStart, String> {
+) -> Result<capture::CaptureStart, UiError> {
     if !is_overlay(&window) {
-        return Err("start_native_capture is only available to the overlay window.".to_string());
+        return Err(UiError::new(
+            "FORBIDDEN",
+            UiMessage::new(MessageId::OverlayForbidden),
+        ));
     }
     let state = inner(&app);
     let (mute_audio, input_device, admission) = {
         let _session = state.session.lock();
-        let ended = || "this dictation is no longer arming its microphone.".to_string();
+        let ended = || {
+            UiError::new(
+                "STALE_SESSION",
+                UiMessage::new(MessageId::CaptureNoLongerArming),
+            )
+        };
         if !admits_capture(&state, generation) {
             return Err(ended());
         }
@@ -2549,7 +2793,10 @@ async fn start_native_capture(
         input_device.as_deref(),
         mute_audio,
         admission,
-    );
+    )
+    .map_err(|err| {
+        redact_capture_error(&app, capture::CaptureOwner::Dictation(generation), err)
+    });
     let admitted = {
         let _session = state.session.lock();
         admits_capture(&state, generation)
@@ -2559,7 +2806,10 @@ async fn start_native_capture(
         // capture is closed through its own generation, so a newer take that
         // owns the microphone in the meantime is not touched.
         let _ = capture::stop(&app, capture::CaptureOwner::Dictation(generation));
-        return Err("this dictation ended while its microphone was opening.".to_string());
+        return Err(UiError::new(
+            "CAPTURE_ENDED",
+            UiMessage::new(MessageId::CaptureEndedWhileOpening),
+        ));
     }
     if opened.is_err() {
         // A start that failed leaves nothing behind: a device attempt that was
@@ -2581,17 +2831,25 @@ async fn stop_native_capture(
     window: WebviewWindow,
     app: AppHandle,
     generation: u64,
-) -> Result<u64, String> {
+) -> Result<u64, UiError> {
     if !is_overlay(&window) {
-        return Err("stop_native_capture is only available to the overlay window.".to_string());
+        return Err(UiError::new(
+            "FORBIDDEN",
+            UiMessage::new(MessageId::OverlayForbidden),
+        ));
     }
     let state = inner(&app);
     if generation != state.generation.load(Ordering::SeqCst)
         || !matches!(phase_of(&state), Phase::Recording | Phase::Finalizing)
     {
-        return Err("this dictation is no longer capturing.".to_string());
+        return Err(UiError::new(
+            "STALE_SESSION",
+            UiMessage::new(MessageId::CaptureNoLongerCapturing),
+        ));
     }
-    capture::stop(&app, capture::CaptureOwner::Dictation(generation))
+    capture::stop(&app, capture::CaptureOwner::Dictation(generation)).map_err(|err| {
+        redact_capture_error(&app, capture::CaptureOwner::Dictation(generation), err)
+    })
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2607,8 +2865,8 @@ fn is_lab(window: &WebviewWindow) -> bool {
 
 /// The refusal every laboratory command answers when it is not called by the
 /// laboratory's own page.
-fn lab_forbidden() -> String {
-    "Команда доступна только встроенной лаборатории Speechek.".to_string()
+fn lab_forbidden() -> UiError {
+    UiError::new("FORBIDDEN", UiMessage::new(MessageId::LabForbidden))
 }
 
 /// The laboratory reserves the microphone for one take.
@@ -2623,7 +2881,7 @@ fn lab_forbidden() -> String {
 /// The reservation pins the configuration the take records with, so a setting
 /// saved while it runs takes effect with the next take.
 #[tauri::command]
-async fn lab_prepare_capture(window: WebviewWindow, app: AppHandle) -> Result<u64, String> {
+async fn lab_prepare_capture(window: WebviewWindow, app: AppHandle) -> Result<u64, UiError> {
     if !is_lab(&window) {
         return Err(lab_forbidden());
     }
@@ -2633,7 +2891,12 @@ async fn lab_prepare_capture(window: WebviewWindow, app: AppHandle) -> Result<u6
         reserve_lab_capture(&inner)
     })
     .await
-    .unwrap_or_else(|_| Err("Не удалось подготовить запись: рабочий поток недоступен.".to_string()))
+    .unwrap_or_else(|_| {
+        Err(UiError::new(
+            "INTERNAL",
+            UiMessage::new(MessageId::LabPrepareWorkerUnavailable),
+        ))
+    })
 }
 
 /// Opens the microphone of a prepared laboratory take.
@@ -2652,16 +2915,21 @@ async fn lab_start_capture(
     window: WebviewWindow,
     app: AppHandle,
     generation: u64,
-) -> Result<capture::CaptureStart, String> {
+) -> Result<capture::CaptureStart, UiError> {
     if !is_lab(&window) {
         return Err(lab_forbidden());
     }
     tauri::async_runtime::spawn_blocking(move || start_lab_capture(&app, generation))
         .await
-        .unwrap_or_else(|_| Err("Не удалось открыть микрофон: рабочий поток недоступен.".to_string()))
+        .unwrap_or_else(|_| {
+            Err(UiError::new(
+                "INTERNAL",
+                UiMessage::new(MessageId::LabMicWorkerUnavailable),
+            ))
+        })
 }
 
-fn start_lab_capture(app: &AppHandle, generation: u64) -> Result<capture::CaptureStart, String> {
+fn start_lab_capture(app: &AppHandle, generation: u64) -> Result<capture::CaptureStart, UiError> {
     let inner = inner(app);
     let owner = capture::CaptureOwner::Lab(generation);
     let (snapshot, admission) = {
@@ -2683,6 +2951,7 @@ fn start_lab_capture(app: &AppHandle, generation: u64) -> Result<capture::Captur
     ) {
         Ok(opened) => opened,
         Err(cause) => {
+            let cause = redact_capture_error(app, owner, cause);
             eprintln!("{APP_TITLE}: the comparison take could not open a microphone: {cause}.");
             // The reservation is given back so the page may prepare another
             // take, and whatever the attempt left behind — a recording that was
@@ -2690,7 +2959,11 @@ fn start_lab_capture(app: &AppHandle, generation: u64) -> Result<capture::Captur
             // its own owner: a take of either window is never touched by it.
             release_failed_lab_capture(app, generation);
             let _ = capture::stop(app, owner);
-            return Err(format!("Не удалось открыть микрофон: {cause}"));
+            return Err(UiError::new(
+                "CAPTURE_FAILED",
+                UiMessage::new(MessageId::LabMicOpenFailed)
+                    .with_arg("cause", nested_cause(&cause.ui)),
+            ));
         }
     };
     // The take was stopped, or the shell closed its capture, while the device
@@ -2702,7 +2975,10 @@ fn start_lab_capture(app: &AppHandle, generation: u64) -> Result<capture::Captur
     };
     if !current {
         let _ = capture::stop(app, owner);
-        return Err("Запись была остановлена, пока открывался микрофон.".to_string());
+        return Err(UiError::new(
+            "CAPTURE_ENDED",
+            UiMessage::new(MessageId::LabMicStoppedWhileOpening),
+        ));
     }
     Ok(opened)
 }
@@ -2721,16 +2997,21 @@ async fn lab_stop_capture(
     window: WebviewWindow,
     app: AppHandle,
     generation: u64,
-) -> Result<u64, String> {
+) -> Result<u64, UiError> {
     if !is_lab(&window) {
         return Err(lab_forbidden());
     }
     tauri::async_runtime::spawn_blocking(move || stop_lab_capture(&app, generation))
         .await
-        .unwrap_or_else(|_| Err("Не удалось остановить запись: рабочий поток недоступен.".to_string()))
+        .unwrap_or_else(|_| {
+            Err(UiError::new(
+                "INTERNAL",
+                UiMessage::new(MessageId::LabStopWorkerUnavailable),
+            ))
+        })
 }
 
-fn stop_lab_capture(app: &AppHandle, generation: u64) -> Result<u64, String> {
+fn stop_lab_capture(app: &AppHandle, generation: u64) -> Result<u64, UiError> {
     let inner = inner(app);
     let current = {
         let _session = inner.session.lock();
@@ -2746,9 +3027,13 @@ fn stop_lab_capture(app: &AppHandle, generation: u64) -> Result<u64, String> {
     match capture::stop(app, capture::CaptureOwner::Lab(generation)) {
         Ok(sequence) => Ok(sequence),
         Err(cause) => {
+            let cause =
+                redact_capture_error(app, capture::CaptureOwner::Lab(generation), cause);
             eprintln!("{APP_TITLE}: the comparison capture did not stop cleanly: {cause}.");
-            Err(format!(
-                "Не удалось дождаться последних кадров записи: {cause}"
+            Err(UiError::new(
+                "CAPTURE_FAILED",
+                UiMessage::new(MessageId::LabFramesFailed)
+                    .with_arg("cause", nested_cause(&cause.ui)),
             ))
         }
     }
@@ -2814,17 +3099,24 @@ async fn insert_text(
     app: AppHandle,
     generation: u64,
     text: String,
-) -> Result<&'static str, String> {
+) -> Result<&'static str, UiError> {
     if !is_overlay(&window) {
-        return Err("insert_text is only available to the overlay window.".to_string());
+        return Err(UiError::new(
+            "FORBIDDEN",
+            UiMessage::new(MessageId::OverlayForbidden),
+        ));
     }
     if text.trim().is_empty() {
-        return Err("the dictation was empty, so there was nothing to insert.".to_string());
+        return Err(UiError::new(
+            "EMPTY",
+            UiMessage::new(MessageId::InsertTextEmpty),
+        ));
     }
     if text.len() > MAX_TEXT_BYTES {
-        return Err(format!(
-            "the dictation is longer than {} KiB.",
-            MAX_TEXT_BYTES / 1024
+        return Err(UiError::new(
+            "TOO_LONG",
+            UiMessage::new(MessageId::InsertTextTooLong)
+                .with_arg("kib", serde_json::json!(MAX_TEXT_BYTES / 1024)),
         ));
     }
     let inner = inner(&app);
@@ -2834,7 +3126,10 @@ async fn insert_text(
             || state.phase != Phase::Finalizing
             || state.inserted
         {
-            return Err("this dictation is no longer waiting for text.".to_string());
+            return Err(UiError::new(
+                "STALE_SESSION",
+                UiMessage::new(MessageId::InsertTextNotWaiting),
+            ));
         }
         state.inserted = true;
     }
@@ -2853,7 +3148,10 @@ async fn insert_text(
         {
             let _session = gate.session.lock();
             if !paste_may_begin(&gate, generation) {
-                return Err("this dictation was cancelled.".to_string());
+                return Err(UiError::new(
+                    "CANCELLED",
+                    UiMessage::new(MessageId::InsertTextCancelled),
+                ));
             }
             gate.state.lock().phase = Phase::Pasting;
             // The dictation is going through, so the pill comes down in the same
@@ -2865,7 +3163,16 @@ async fn insert_text(
         paste::transact_foreground(text, own_process)
     })
     .await
-    .map_err(|err| format!("the text could not be handed over ({err})"))??;
+    .map_err(|err| {
+        UiError::new(
+            "INTERNAL",
+            UiMessage::new(MessageId::InsertTextHandoverFailed)
+                .with_arg("detail", serde_json::Value::from(err.to_string())),
+        )
+    })?
+    .map_err(|err| {
+        redact_capture_error(&app, capture::CaptureOwner::Dictation(generation), err)
+    })?;
     inner.state.lock().text = Some(kept);
     Ok(pasted.as_str())
 }
@@ -2896,10 +3203,30 @@ async fn insert_text(
 /// The command list below is the same inventory the build script declares to
 /// Tauri: a label capability only closes the commands the manifest names, so both
 /// lists have to agree with each other and with `src-tauri/build.rs`.
+/// Why the run could not claim its loopback socket, before any window exists:
+/// a settings document the preflight refused, or a port the reservation could
+/// not bind. Both become one native dialog in `setup`.
+enum StartupFailure {
+    Config(settings::ConfigError),
+    Reserve(UiError),
+}
+
+impl StartupFailure {
+    /// The reason as a descriptor for the native dialog.
+    fn ui(&self) -> UiMessage {
+        match self {
+            StartupFailure::Config(error) => error.ui.clone(),
+            StartupFailure::Reserve(error) => {
+                UiMessage::new(MessageId::StartupReserveFailed)
+                    .with_arg("detail", nested_cause(&error.ui))
+            }
+        }
+    }
+}
 pub fn run() {
-    let reservation = settings::preflight_port()
-        .map_err(|error| error.to_string())
-        .and_then(backend::reserve);
+    let reservation: Result<ReservedListener, StartupFailure> = settings::preflight_port()
+        .map_err(StartupFailure::Config)
+        .and_then(|port| backend::reserve(port).map_err(StartupFailure::Reserve));
 
     let mut context = tauri::generate_context!();
     // The flavor owns the identity the shell runs under: a debug build must not
@@ -2970,7 +3297,7 @@ pub fn run() {
             // no window exists yet, so the deferred failure is reported here.
             let reservation = match reservation {
                 Ok(reservation) => reservation,
-                Err(message) => fatal(message),
+                Err(failure) => fatal(startup_ui_language(), &failure.ui()),
             };
             startup(app.handle(), reservation);
             Ok(())
@@ -2978,7 +3305,11 @@ pub fn run() {
 
     let app = match builder.build(context) {
         Ok(app) => app,
-        Err(err) => fatal(format!("cannot start the Tauri runtime: {err}")),
+        Err(err) => fatal(
+            startup_ui_language(),
+            &UiMessage::new(MessageId::StartupRuntimeFailed)
+                .with_arg("detail", serde_json::Value::from(err.to_string())),
+        ),
     };
 
     app.run(|app, event| match event {
@@ -3060,6 +3391,7 @@ mod tests {
                 mute_during_recording: false,
                 port: crate::settings::DEFAULT_PORT,
                 input_device: None,
+                language: crate::i18n::Language::En,
             },
             keys: Arc::new(KeyRing::empty()),
             revision: 1,
@@ -3215,6 +3547,7 @@ mod tests {
                 mute_during_recording: false,
                 port: crate::settings::DEFAULT_PORT,
                 input_device: None,
+                language: crate::i18n::Language::En,
             },
             keys: Arc::new(KeyRing::empty()),
             revision: 1,
@@ -3234,8 +3567,8 @@ mod tests {
         let generation = reserve_lab_capture(&inner).expect("an idle shell reserves a take");
         assert_eq!(generation, 1, "the laboratory numbers its own takes");
         assert_eq!(
-            reserve_lab_capture(&inner).unwrap_err(),
-            "Лаборатория уже готовит запись.",
+            reserve_lab_capture(&inner).unwrap_err().code,
+            "LAB_BUSY",
             "one take is prepared at a time"
         );
         assert!(lab_holds_microphone(&inner));
@@ -3267,8 +3600,8 @@ mod tests {
         // in flight when it went away must not leave a take nobody can stop.
         inner.lab_closed.store(true, Ordering::SeqCst);
         assert_eq!(
-            reserve_lab_capture(&inner).unwrap_err(),
-            "Окно лаборатории закрыто — откройте его заново."
+            reserve_lab_capture(&inner).unwrap_err().code,
+            "LAB_WINDOW_CLOSED"
         );
         inner.lab_closed.store(false, Ordering::SeqCst);
 
@@ -3454,6 +3787,7 @@ mod tests {
                 mute_during_recording: false,
                 port: crate::settings::DEFAULT_PORT,
                 input_device: None,
+                language: crate::i18n::Language::En,
             },
             keys: Arc::new(KeyRing::empty()),
             revision: 1,

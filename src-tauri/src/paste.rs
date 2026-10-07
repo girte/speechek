@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 
 use enigo::{Direction, Enigo, Key, Keyboard, Settings};
 use parking_lot::Mutex;
+use serde_json::Value;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{
     GlobalFree, SetLastError, ERROR_SUCCESS, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM,
@@ -61,6 +62,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassW, SetTimer, SetWindowLongPtrW, GWLP_USERDATA, HWND_MESSAGE, MSG, WINDOW_EX_STYLE,
     WINDOW_STYLE, WM_DESTROYCLIPBOARD, WM_RENDERALLFORMATS, WM_RENDERFORMAT, WM_TIMER, WNDCLASSW,
 };
+
+use crate::i18n::{MessageId, UiError, UiMessage};
 
 /// The transcript is not left as a promise forever: after this long without a
 /// decision the promise becomes ordinary text whether or not anyone read it.
@@ -99,6 +102,27 @@ const OPEN_RETRY: Duration = Duration::from_millis(20);
 /// The hidden window that owns the clipboard promise. One class serves every
 /// transaction; each transaction has its own window on its own thread.
 const CLASS_NAME: PCWSTR = w!("SpeechekPasteWindow");
+
+/// The stable codes clipboard failures cross the command boundary with. The
+/// reason itself is the descriptor's key; these only keep the categories apart.
+const CLIPBOARD_ERROR: &str = "CLIPBOARD_ERROR";
+const CLIPBOARD_TAKEN: &str = "CLIPBOARD_TAKEN";
+const PASTE_REPLACED: &str = "PASTE_REPLACED";
+const PASTE_FAILED: &str = "PASTE_FAILED";
+
+/// A failure whose reason is one catalog key.
+fn failure(code: &'static str, key: MessageId) -> UiError {
+    UiError::new(code, UiMessage::new(key))
+}
+
+/// A failure that carries one operating system string as data: it is copied
+/// into the rendered text as-is and is never translated or read again.
+fn detail_failure(code: &'static str, key: MessageId, detail: impl Into<String>) -> UiError {
+    UiError::new(
+        code,
+        UiMessage::new(key).with_arg("detail", Value::String(detail.into())),
+    )
+}
 
 /// What the caller has reported about the paste chord.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -177,7 +201,7 @@ struct Tx {
     own_sequence: u32,
     /// The outcome the caller is waiting for, stored before the worker's message
     /// loop ends so it can be reported from there.
-    result: Option<Result<Settlement, String>>,
+    result: Option<Result<Settlement, UiError>>,
 }
 
 impl Tx {
@@ -223,7 +247,7 @@ enum Startup {
     /// There is nothing to wait for: the text is already ordinary clipboard text.
     Settled(Settlement),
     /// Neither happened, and the clipboard holds no dictation text at all.
-    Unavailable(String),
+    Unavailable(UiError),
 }
 
 /* -------------------------------------------------------------------------- */
@@ -262,7 +286,7 @@ fn window_process(hwnd: HWND) -> Option<u32> {
 ///
 /// Blocking: waits for the read receipt, the quiet period, and at most
 /// [`SETTLE_TIMEOUT`]. Never run it on a thread that has to answer messages.
-pub fn transact(text: Arc<String>, target: Option<HWND>) -> Result<Settlement, String> {
+pub fn transact(text: Arc<String>, target: Option<HWND>) -> Result<Settlement, UiError> {
     let job = Arc::new(Job {
         tx: Mutex::new(Tx::new()),
         text,
@@ -273,16 +297,14 @@ pub fn transact(text: Arc<String>, target: Option<HWND>) -> Result<Settlement, S
     thread::Builder::new()
         .name("speechek-paste".to_string())
         .spawn(move || pump(worker, ready_tx, settled_tx))
-        .map_err(|err| format!("cannot start the clipboard worker ({err})"))?;
+        .map_err(|err| detail_failure(PASTE_FAILED, MessageId::PasteWorkerSpawn, err.to_string()))?;
 
     match ready_rx.recv() {
         Ok(Ok(Startup::Published)) => {}
         Ok(Ok(Startup::Settled(settlement))) => return Ok(settlement),
-        Ok(Ok(Startup::Unavailable(err))) => return Err(err),
-        Ok(Err(err)) => return Err(err),
-        Err(_) => {
-            return Err("the clipboard worker stopped before the text was published".to_string())
-        }
+        Ok(Ok(Startup::Unavailable(error))) => return Err(error),
+        Ok(Err(error)) => return Err(error),
+        Err(_) => return Err(failure(PASTE_FAILED, MessageId::PasteWorkerStoppedEarly)),
     }
 
     // The chord: only a target that owns the foreground may get one, and only if
@@ -317,7 +339,7 @@ pub fn transact(text: Arc<String>, target: Option<HWND>) -> Result<Settlement, S
 
     match settled_rx.recv() {
         Ok(result) => result,
-        Err(_) => Err("the clipboard worker stopped without settling the text".to_string()),
+        Err(_) => Err(failure(PASTE_FAILED, MessageId::PasteWorkerStoppedUnsettled)),
     }
 }
 
@@ -328,7 +350,7 @@ pub fn transact(text: Arc<String>, target: Option<HWND>) -> Result<Settlement, S
 /// A window whose process cannot be established is not trusted with a chord
 /// either; like `own_process` itself and a missing foreground, it leaves the
 /// transcript in the clipboard alone.
-pub fn transact_foreground(text: Arc<String>, own_process: u32) -> Result<Settlement, String> {
+pub fn transact_foreground(text: Arc<String>, own_process: u32) -> Result<Settlement, UiError> {
     let target = foreground_window()
         .filter(|hwnd| window_process(*hwnd).is_some_and(|process| process != own_process));
     transact(text, target)
@@ -342,8 +364,8 @@ pub fn transact_foreground(text: Arc<String>, own_process: u32) -> Result<Settle
 /// a read receipt. The calling thread only decides whether a chord may be sent.
 fn pump(
     job: Arc<Job>,
-    ready: mpsc::Sender<Result<Startup, String>>,
-    settled: mpsc::Sender<Result<Settlement, String>>,
+    ready: mpsc::Sender<Result<Startup, UiError>>,
+    settled: mpsc::Sender<Result<Settlement, UiError>>,
 ) {
     let hwnd = match create_window() {
         Ok(hwnd) => hwnd,
@@ -365,7 +387,7 @@ fn pump(
         let _ = ready.send(Ok(Startup::Published));
         run_message_loop(hwnd);
         let result = job.tx.lock().result.take().unwrap_or_else(|| {
-            Err("the clipboard window closed before the text settled".to_string())
+            Err(failure(PASTE_FAILED, MessageId::PasteWindowClosed))
         });
         let _ = settled.send(result);
     } else {
@@ -398,11 +420,7 @@ fn start(hwnd: HWND, job: &Arc<Job>) -> Startup {
     // without one is not started at all.
     if unsafe { SetTimer(Some(hwnd), TIMER_ID, TICK_MS, None) } == 0 {
         release_pending(job);
-        return recover(
-            hwnd,
-            job,
-            "cannot watch the clipboard promise (SetTimer)".to_string(),
-        );
+        return recover(hwnd, job, failure(CLIPBOARD_ERROR, MessageId::PasteCannotWatch));
     }
 
     note("published the transcript as a clipboard promise");
@@ -412,7 +430,7 @@ fn start(hwnd: HWND, job: &Arc<Job>) -> Startup {
 /// The promise could not be set up. `publish` may already have emptied the
 /// clipboard, so it can be ours and empty: write the transcript as ordinary text
 /// when that is possible — the user is left with a clipboard, not with nothing.
-fn recover(hwnd: HWND, job: &Job, err: String) -> Startup {
+fn recover(hwnd: HWND, job: &Job, err: UiError) -> Startup {
     match unsafe { materialize(hwnd, job) } {
         Ok(()) => Startup::Settled(Settlement::CopiedFallback),
         Err(_) => Startup::Unavailable(err),
@@ -501,9 +519,9 @@ fn on_timer(hwnd: HWND, job: &Job) {
     }
 
     let result = match decision {
-        Decision::Cancelled => Err("a newer dictation replaced this text".to_string()),
+        Decision::Cancelled => Err(failure(PASTE_REPLACED, MessageId::PasteReplacedByNewer)),
         Decision::TakenOver => {
-            Err("another window took the clipboard; that copy was left as it is".to_string())
+            Err(failure(CLIPBOARD_TAKEN, MessageId::PasteClipboardTakenOver))
         }
         Decision::Inserted => unsafe { materialize(hwnd, job) }.map(|()| Settlement::Inserted),
         Decision::CopiedFallback => {
@@ -515,7 +533,7 @@ fn on_timer(hwnd: HWND, job: &Job) {
         Ok(Settlement::CopiedFallback) => {
             note("no confirmed paste; the transcript stays in the clipboard")
         }
-        Err(err) => note(err),
+        Err(err) => note(&err.message),
     }
 
     release_pending(job);
@@ -558,19 +576,23 @@ fn release_pending(job: &Job) {
 /// The delayed handle is NULL, and `SetClipboardData` returns NULL for it: success
 /// is only distinguishable from failure through the thread error, which therefore
 /// has to be cleared first.
-unsafe fn publish(hwnd: HWND) -> Result<u32, String> {
+unsafe fn publish(hwnd: HWND) -> Result<u32, UiError> {
     open_clipboard(hwnd)?;
     let published = publish_formats();
     let closed = CloseClipboard();
     published?;
-    closed.map_err(|err| format!("cannot close the clipboard ({err})"))?;
+    closed.map_err(|err| {
+        detail_failure(CLIPBOARD_ERROR, MessageId::PasteCannotClose, err.to_string())
+    })?;
     Ok(GetClipboardSequenceNumber())
 }
 
 /// Everything `publish` does while the clipboard is open, split out so the
 /// clipboard is closed on every path.
-unsafe fn publish_formats() -> Result<(), String> {
-    EmptyClipboard().map_err(|err| format!("cannot empty the clipboard ({err})"))?;
+unsafe fn publish_formats() -> Result<(), UiError> {
+    EmptyClipboard().map_err(|err| {
+        detail_failure(CLIPBOARD_ERROR, MessageId::PasteCannotEmpty, err.to_string())
+    })?;
 
     for (name, value) in [
         ("ExcludeClipboardContentFromMonitorProcessing", 1u32),
@@ -600,7 +622,11 @@ unsafe fn publish_formats() -> Result<(), String> {
     SetLastError(ERROR_SUCCESS);
     if let Err(err) = SetClipboardData(CF_UNICODETEXT.0 as u32, None) {
         if err.code().is_err() {
-            return Err(format!("cannot promise the text to the clipboard ({err})"));
+            return Err(detail_failure(
+                CLIPBOARD_ERROR,
+                MessageId::PasteCannotPromise,
+                err.to_string(),
+            ));
         }
     }
     Ok(())
@@ -613,7 +639,7 @@ unsafe fn publish_formats() -> Result<(), String> {
 /// The write only happens while the clipboard is still ours. A copy the user made
 /// during the transaction — or another transaction's promise — is never
 /// clobbered; the caller reports the error instead.
-unsafe fn materialize(hwnd: HWND, job: &Job) -> Result<(), String> {
+unsafe fn materialize(hwnd: HWND, job: &Job) -> Result<(), UiError> {
     open_clipboard(hwnd)?;
     let outcome = write_text(hwnd, job);
     let _ = CloseClipboard();
@@ -621,36 +647,39 @@ unsafe fn materialize(hwnd: HWND, job: &Job) -> Result<(), String> {
 }
 
 /// The guarded write, with the clipboard already open and designated as ours.
-unsafe fn write_text(hwnd: HWND, job: &Job) -> Result<(), String> {
+unsafe fn write_text(hwnd: HWND, job: &Job) -> Result<(), UiError> {
     let ours = GetClipboardOwner()
         .map(|owner| owner == hwnd)
         .unwrap_or(false);
     let sequence = GetClipboardSequenceNumber();
     let expected = job.tx.lock().own_sequence;
     if !ours || (expected != 0 && sequence != expected) {
-        return Err("another window took the clipboard before the text could be kept".to_string());
+        return Err(failure(CLIPBOARD_TAKEN, MessageId::PasteClipboardTakenBeforeWrite));
     }
-    EmptyClipboard().map_err(|err| format!("cannot empty the clipboard ({err})"))?;
+    EmptyClipboard().map_err(|err| {
+        detail_failure(CLIPBOARD_ERROR, MessageId::PasteCannotEmpty, err.to_string())
+    })?;
     render_text(job)
 }
 
 /// Writes the transcript as plain `CF_UNICODETEXT`. The clipboard must be open and
 /// ours; the same bytes are written whenever a reader asks for the promise and
 /// when the transaction settles, so a reader never sees anything else.
-unsafe fn render_text(job: &Job) -> Result<(), String> {
+unsafe fn render_text(job: &Job) -> Result<(), UiError> {
     let wide: Vec<u16> = job.text.encode_utf16().chain(std::iter::once(0)).collect();
-    let handle = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2)
-        .map_err(|err| format!("cannot allocate the clipboard text ({err})"))?;
+    let handle = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2).map_err(|err| {
+        detail_failure(CLIPBOARD_ERROR, MessageId::PasteCannotAllocate, err.to_string())
+    })?;
     let pointer = GlobalLock(handle) as *mut u16;
     if pointer.is_null() {
         let _ = GlobalFree(Some(handle));
-        return Err("cannot lock the clipboard text".to_string());
+        return Err(failure(CLIPBOARD_ERROR, MessageId::PasteCannotLock));
     }
     std::ptr::copy_nonoverlapping(wide.as_ptr(), pointer, wide.len());
     let _ = GlobalUnlock(handle);
     if SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(handle.0))).is_err() {
         let _ = GlobalFree(Some(handle));
-        return Err("cannot put the text on the clipboard".to_string());
+        return Err(failure(CLIPBOARD_ERROR, MessageId::PasteCannotPut));
     }
     // Our own write moved the sequence number; the guard compares against the
     // last one we wrote, not against the promise's.
@@ -662,7 +691,7 @@ unsafe fn render_text(job: &Job) -> Result<(), String> {
 /// process holds it. Opening it with the owner is what lets the following
 /// `EmptyClipboard` and `SetClipboardData` succeed: opening with `NULL` would
 /// clear the owner and make the write fail.
-unsafe fn open_clipboard(hwnd: HWND) -> Result<(), String> {
+unsafe fn open_clipboard(hwnd: HWND) -> Result<(), UiError> {
     let mut last = String::new();
     for attempt in 0..OPEN_ATTEMPTS {
         if attempt > 0 {
@@ -673,7 +702,7 @@ unsafe fn open_clipboard(hwnd: HWND) -> Result<(), String> {
             Err(err) => last = err.to_string(),
         }
     }
-    Err(format!("cannot open the clipboard ({last})"))
+    Err(detail_failure(CLIPBOARD_ERROR, MessageId::PasteCannotOpen, last))
 }
 
 /* -------------------------------------------------------------------------- */
@@ -769,11 +798,17 @@ unsafe fn job_of(hwnd: HWND) -> Option<&'static Job> {
 }
 
 /// Creates the hidden message-only window that owns the clipboard promise.
-fn create_window() -> Result<HWND, String> {
+fn create_window() -> Result<HWND, UiError> {
     let hinstance = unsafe {
         GetModuleHandleW(PCWSTR::null())
             .map(|module| HINSTANCE(module.0))
-            .map_err(|err| format!("cannot reach the process module ({err})"))?
+            .map_err(|err| {
+                detail_failure(
+                    CLIPBOARD_ERROR,
+                    MessageId::PasteCannotReachModule,
+                    err.to_string(),
+                )
+            })?
     };
     ensure_window_class(hinstance);
     unsafe {
@@ -791,7 +826,13 @@ fn create_window() -> Result<HWND, String> {
             Some(hinstance),
             None,
         )
-        .map_err(|err| format!("cannot create the clipboard window ({err})"))
+        .map_err(|err| {
+            detail_failure(
+                CLIPBOARD_ERROR,
+                MessageId::PasteCannotCreateWindow,
+                err.to_string(),
+            )
+        })
     }
 }
 

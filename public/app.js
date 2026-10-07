@@ -1,4 +1,5 @@
 import { createRecorder } from './recorder.js';
+import { t, formatError, initI18n, onLanguageChange, applyTranslations, refreshLanguageSnapshot } from './i18n.js';
 
 /** The laboratory always runs all three modes on one take; nothing selects a subset. */
 const MODES = ['live', 'smart', 'verbatim'];
@@ -21,9 +22,10 @@ const LAB_CAP_MS = 600000;
 /** Grace for the frames the shell had queued when it answered the stop. */
 const LAB_TAIL_MS = 1500;
 
-const MIC_FAILED = 'Запись не началась';
-const TAIL_LOST = 'Потеряны кадры записи — текст не расшифрован';
-const LAB_CLOSED = 'Окно лаборатории закрыто';
+const ui = (key, args) => args ? { key, args } : { key };
+const MIC_FAILED = ui('LabRecordingNotStarted');
+const TAIL_LOST = ui('LabRecordingFramesLost');
+const LAB_CLOSED = ui('LabCaptureWindowClosed');
 
 const $ = (id) => document.getElementById(id);
 const button = $('record-button');
@@ -61,39 +63,79 @@ const unlisten = [];
  * Resolves once the lab events are subscribed. A native take awaits this before
  * it asks the shell to reserve a generation, so no frame of it can be missed.
  */
-const listening = shell
-  ? Promise.all([
+let listening = Promise.resolve();
+
+function subscribeCaptureEvents() {
+  if (!shell) return Promise.resolve();
+  return Promise.all([
     [EVENT_PCM_FRAME, onPcmFrame],
     [EVENT_MIC_ERROR, onMicError],
     [EVENT_LAB_CLOSED, onLabClosed],
   ].map(([name, handler]) => tauri.event.listen(name, handler)
     .then((off) => { if (typeof off === 'function') unlisten.push(off); })
-    .catch(() => { /* the page still works, without the shell's frames */ })))
-  : Promise.resolve();
+    .catch(() => { /* the page still works, without the shell's frames */ })));
+}
 
 // The device chosen in Speechek's settings belongs to the shell's capture. A page
 // in a plain browser has no shell and always records through the browser's own
 // microphone, so it says that instead of pretending the choice applies.
 if (browserNote && !embedded) browserNote.hidden = false;
 
+/** Presentation state is separate from capture state and user transcript text. */
+const resultDisplay = new Map(MODES.map((name) => [name, {
+  body: ui({ live: 'LabLiveEmpty', smart: 'LabSmartEmpty', verbatim: 'LabVerbatimEmpty' }[name]),
+  meta: ui('LabWaitingRecording'),
+}]));
+let labelDisplay = ui('LabStartRecording');
+let statusDisplay = ui('LabReadyToRecord');
+let errorDisplay = null;
+let warningDisplay = null;
+const titleSuffix = document.title.match(/\s(?:\[(?:Dev|Test)\]|\((?:Dev|Test)\)|— (?:Dev|Test)|(?:Dev|Test))$/)?.[0] ?? '';
+document.querySelector('title')?.removeAttribute('data-i18n');
+
+function displayText(value) { return typeof value === 'string' ? value : formatError(value); }
 function setResult(name, text, meta, empty = false) {
   const [body, footer] = panels[name];
-  body.textContent = text;
+  // Strings here are dictated text; only descriptors are rewritten on translation.
+  resultDisplay.set(name, { body: typeof text === 'string' ? null : text, meta });
+  body.textContent = displayText(text);
   body.classList.toggle('empty', empty);
-  footer.textContent = meta;
+  footer.textContent = displayText(meta);
 }
-function showError(message) { error.textContent = message; error.hidden = false; }
-function clearError() { error.hidden = true; error.textContent = ''; }
-function setStatus(message) { status.textContent = message; }
+function showError(message) {
+  errorDisplay = message;
+  error.textContent = displayText(message);
+  error.hidden = false;
+}
+function clearError() { errorDisplay = null; error.hidden = true; error.textContent = ''; }
+function setLabel(message) { labelDisplay = message; label.textContent = displayText(message); }
+function setStatus(message) { statusDisplay = message; status.textContent = displayText(message); }
 function showWarning(message) {
+  warningDisplay = message;
   if (!warning) return;
-  warning.textContent = message;
+  warning.textContent = displayText(message);
   warning.hidden = false;
 }
 function clearWarning() {
+  warningDisplay = null;
   if (!warning) return;
   warning.textContent = '';
   warning.hidden = true;
+}
+
+/** Never enters onState: translating must not restart a timer or clear a take. */
+function renderLanguage() {
+  applyTranslations();
+  document.title = t('LabTitle') + titleSuffix;
+  label.textContent = displayText(labelDisplay);
+  status.textContent = displayText(statusDisplay);
+  if (errorDisplay !== null) error.textContent = displayText(errorDisplay);
+  if (warning && warningDisplay !== null) warning.textContent = displayText(warningDisplay);
+  for (const [name, display] of resultDisplay) {
+    const [body, footer] = panels[name];
+    if (display.body !== null) body.textContent = displayText(display.body);
+    footer.textContent = displayText(display.meta);
+  }
 }
 function timeText(seconds) {
   return `${String(Math.floor(seconds / 60)).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`;
@@ -102,16 +144,16 @@ function stopTick() { clearInterval(tick); tick = null; }
 
 /** Status line after a take, from the recorder's report or from the live callbacks. */
 function summarize(report) {
-  if (!sessionStarted) { setStatus('Запись отменена'); return; }
+  if (!sessionStarted) { setStatus(ui('LabRecordingCancelled')); return; }
   const text = (name) => (report ? report.results[name] : confirmed.get(name));
   const failure = (name) => (report ? report.errors[name] : failures.get(name));
   const live = text('live');
-  if (live) setResult('live', live, 'Готово');
+  if (live) setResult('live', live, ui('LabDone'));
   const succeeded = MODES.filter((name) => text(name));
-  if (succeeded.length === MODES.length) { setStatus('Расшифровка готова'); return; }
-  if (failure('')) { setStatus('Не удалось получить расшифровку'); return; }
-  if (succeeded.length) { setStatus('Часть результатов недоступна — проверьте ошибки ниже'); return; }
-  setStatus('Не удалось получить расшифровку');
+  if (succeeded.length === MODES.length) { setStatus(ui('LabTranscriptionReady')); return; }
+  if (failure('')) { setStatus(ui('LabTranscriptionFailed')); return; }
+  if (succeeded.length) { setStatus(ui('LabPartialResults')); return; }
+  setStatus(ui('LabTranscriptionFailed'));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -133,11 +175,11 @@ function ensureRecorder() {
           batchBegan.clear();
           clearWarning();
           button.disabled = true;
-          label.textContent = 'Начать запись';
+          setLabel(ui('LabStartRecording'));
           clearError();
           timer.textContent = '00:00';
-          setStatus(shell ? 'Открываем микрофон' : 'Запрашиваем доступ к микрофону');
-          for (const name of MODES) setResult(name, 'Ожидание записи…', 'Ожидание', true);
+          setStatus(ui(shell ? 'LabOpeningMicrophone' : 'LabRequestingMicrophone'));
+          for (const name of MODES) setResult(name, ui('LabWaitingRecordingEllipsis'), ui('LabWaiting'), true);
           return;
         }
         if (next === 'recording') {
@@ -145,22 +187,22 @@ function ensureRecorder() {
           sessionStarted = true;
           button.disabled = false;
           button.classList.add('recording');
-          label.textContent = 'Остановить';
+          setLabel(ui('LabStopRecording'));
           tickFrom = Date.now();
           stopTick();
           tick = setInterval(() => { timer.textContent = timeText(Math.floor((Date.now() - tickFrom) / 1000)); }, 250);
-          setStatus('Идёт запись и потоковая расшифровка');
+          setStatus(ui('LabRecordingAndTranscribing'));
           return;
         }
         if (next === 'stopping') {
           recording = false;
           stopTick();
           button.disabled = true;
-          label.textContent = 'Обработка…';
-          setStatus('Завершаем потоковую расшифровку');
+          setLabel(ui('LabProcessing'));
+          setStatus(ui('LabFinishingLive'));
           for (const name of BATCH_MODES) {
             batchBegan.set(name, performance.now());
-            setResult(name, 'Обработка записи…', 'Запрос к gemini-3.5-transcribe', true);
+            setResult(name, ui('LabProcessingRecording'), ui('LabBatchRequest'), true);
           }
           return;
         }
@@ -169,25 +211,28 @@ function ensureRecorder() {
           stopTick();
           button.disabled = false;
           button.classList.remove('recording');
-          label.textContent = sessionStarted ? 'Новая запись' : 'Начать запись';
+          setLabel(ui(sessionStarted ? 'LabNewRecording' : 'LabStartRecording'));
           // A stop the page did not ask for (the ten-minute cap) still needs a status.
           if (!halting) summarize();
         }
       },
       onLevel() { /* level meter is not part of this layout */ },
       onInterim(name, text) {
-        setResult(name, text, 'Предварительный текст');
+        setResult(name, text, ui('LabInterimText'));
       },
       onFinal(name, text) {
         confirmed.set(name, text);
         failures.delete(name);
         const began = batchBegan.get(name);
-        setResult(name, text, name === 'live' ? 'Подтверждённый текст' : began === undefined ? 'Готово' : `Готово · ${((performance.now() - began) / 1000).toFixed(1)} с`);
+        const meta = name === 'live' ? ui('LabConfirmedText') : began === undefined ? ui('LabDone')
+          : ui('LabDoneDuration', { seconds: ((performance.now() - began) / 1000).toFixed(1) });
+        setResult(name, text, meta);
       },
-      onError(name, message) {
+      onError(name, message, descriptor) {
         if (!confirmed.has(name)) failures.set(name, message);
-        if (panels[name]) setResult(name, message, 'Ошибка — результат не сравнивается');
-        showError(message);
+        const detail = descriptor ?? message;
+        if (panels[name]) setResult(name, typeof detail === 'string' ? { message: detail } : detail, ui('LabErrorNotComparable'));
+        showError(detail);
       },
     });
   }
@@ -215,8 +260,11 @@ async function callShell(command, args) {
   }
 }
 
-function messageOf(cause) {
-  return cause instanceof Error ? cause.message : String(cause ?? '');
+function messageOf(cause, fallback = ui('InternalError')) {
+  if (cause?.ui && typeof cause.ui.key === 'string') return cause.ui;
+  if (cause && typeof cause.key === 'string') return cause;
+  const detail = typeof cause === 'string' ? cause : cause?.message;
+  return typeof detail === 'string' && detail.trim() ? detail : fallback;
 }
 
 /** Best-effort release of the shell's reservation; the answer decides nothing. */
@@ -271,8 +319,7 @@ function onMicError(event) {
   const take = native;
   const payload = event?.payload;
   if (!take || !payload || payload.generation !== take.generation) return;
-  const reason = typeof payload.message === 'string' ? payload.message.trim() : '';
-  dropNativeTake(take, reason || MIC_FAILED);
+  dropNativeTake(take, messageOf(payload, MIC_FAILED));
 }
 
 /**
@@ -336,9 +383,9 @@ function dropNativeTake(take, message) {
   failures.clear();
   batchBegan.clear();
   clearWarning();
-  for (const name of MODES) setResult(name, 'Текст не расшифрован', 'Ошибка — результат не сравнивается', true);
+  for (const name of MODES) setResult(name, ui('LabTextNotTranscribed'), ui('LabErrorNotComparable'), true);
   showError(message);
-  setStatus('Расшифровка не начата');
+  setStatus(ui('LabTranscriptionNotStarted'));
 }
 
 /**
@@ -358,7 +405,7 @@ async function beginNative() {
     try {
       prepared = await tauri.core.invoke('lab_prepare_capture');
     } catch (cause) {
-      if (!take.dropped) dropNativeTake(take, messageOf(cause).trim() || 'Лаборатория сейчас занята другой записью.');
+      if (!take.dropped) dropNativeTake(take, messageOf(cause, ui('LabBusyRecording')));
       return;
     }
     if (take.dropped || native !== take || take.stopping) {
@@ -368,7 +415,7 @@ async function beginNative() {
       return;
     }
     if (!Number.isSafeInteger(prepared) || prepared <= 0) {
-      dropNativeTake(take, 'Лаборатория сейчас занята другой записью.');
+      dropNativeTake(take, ui('LabBusyRecording'));
       return;
     }
     take.generation = prepared;
@@ -376,12 +423,12 @@ async function beginNative() {
     // recorder accepted the frames of it would drop the beginning of the take.
     await ensureRecorder().start({ modes: MODES, external: true });
     if (take.dropped || take.stopping || native !== take) return;
-    setStatus('Открываем микрофон устройства');
+    setStatus(ui('LabOpeningDeviceMicrophone'));
     let answer;
     try {
       answer = await tauri.core.invoke('lab_start_capture', { generation: take.generation });
     } catch (cause) {
-      if (!take.dropped && !take.stopping && native === take) dropNativeTake(take, messageOf(cause).trim() || MIC_FAILED);
+      if (!take.dropped && !take.stopping && native === take) dropNativeTake(take, messageOf(cause, MIC_FAILED));
       return;
     }
     if (take.dropped || take.stopping || native !== take) return;
@@ -390,11 +437,11 @@ async function beginNative() {
     }
     // The recorder announced the recording before the device was open; the take
     // is only really running once the shell answers.
-    setStatus('Идёт запись и потоковая расшифровка');
+    setStatus(ui('LabRecordingAndTranscribing'));
     // An external take has no recorder timer; the laboratory keeps its ten minutes.
     take.capTimer = setTimeout(() => { void haltNative(); }, LAB_CAP_MS);
   } catch (cause) {
-    if (!take.dropped && !take.stopping && native === take) dropNativeTake(take, messageOf(cause).trim() || MIC_FAILED);
+    if (!take.dropped && !take.stopping && native === take) dropNativeTake(take, messageOf(cause, MIC_FAILED));
   }
 }
 
@@ -411,14 +458,14 @@ async function haltNative() {
   take.capTimer = null;
   halting = true;
   button.disabled = true;
-  label.textContent = 'Обработка…';
-  setStatus('Завершаем запись и дожидаемся последних кадров');
+  setLabel(ui('LabProcessing'));
+  setStatus(ui('LabWaitingLastFrames'));
   try {
     let last;
     try {
       last = await tauri.core.invoke('lab_stop_capture', { generation: take.generation });
     } catch (cause) {
-      if (!take.dropped) dropNativeTake(take, messageOf(cause).trim() || TAIL_LOST);
+      if (!take.dropped) dropNativeTake(take, messageOf(cause, TAIL_LOST));
       return;
     }
     if (take.dropped) return;
@@ -436,7 +483,7 @@ async function haltNative() {
     clearWarning();
     summarize(result);
   } catch (cause) {
-    if (!take.dropped && native === take) dropNativeTake(take, `Не удалось обработать запись: ${messageOf(cause)}`);
+    if (!take.dropped && native === take) dropNativeTake(take, ui('LabProcessingFailed', { cause: messageOf(cause) }));
   } finally {
     halting = false;
   }
@@ -448,7 +495,7 @@ async function haltNative() {
  * this take only: the settings keep the device the user chose.
  */
 function fallbackLine(device) {
-  return `Выбранный микрофон недоступен; запись с системного: ${device}`;
+  return ui('LabFallbackMicrophone', { device });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -465,8 +512,8 @@ async function begin() {
   try {
     await ensureRecorder().start({ modes: MODES });
   } catch (cause) {
-    showError(cause.message);
-    setStatus('Запись не началась');
+    showError(cause?.ui ? cause : messageOf(cause, MIC_FAILED));
+    setStatus(MIC_FAILED);
   }
 }
 
@@ -480,14 +527,23 @@ async function halt() {
   try {
     summarize(await ensureRecorder().stop());
   } catch (cause) {
-    showError(`Не удалось обработать запись: ${cause.message}`);
-    setStatus('Ошибка обработки');
+    showError(ui('LabProcessingFailed', { cause: messageOf(cause) }));
+    setStatus(ui('LabProcessingError'));
   } finally {
     halting = false;
   }
 }
 
-button.addEventListener('click', () => { if (recording) void halt(); else void begin(); });
+/** Catalog failure must never arm either capture path or install its actions. */
+void initI18n().then((ready) => {
+  if (!ready.catalogReady) return;
+  renderLanguage();
+  onLanguageChange(renderLanguage);
+  listening = subscribeCaptureEvents();
+  button.disabled = false;
+  button.addEventListener('click', () => { if (recording) void halt(); else void begin(); });
+  window.addEventListener('focus', () => { void refreshLanguageSnapshot(); });
+});
 
 // Leaving the page takes the shell's capture with it, best effort: the frames of
 // the take have nowhere to go after this page does, so it is never transcribed.

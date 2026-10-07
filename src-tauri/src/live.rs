@@ -27,7 +27,8 @@ use serde_json::{json, Value};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::protocol::Message as UpstreamMessage;
 
-use crate::backend::redact;
+use crate::backend::{redact, redact_ui};
+use crate::i18n::{render, Language, MessageId, UiMessage};
 use crate::provider::Provider;
 use crate::secrets::{KeyRing, SecretKey};
 
@@ -310,7 +311,7 @@ async fn handle_client(
         return;
     }
     let Some(message) = parse_json_object(raw) else {
-        fail(socket, upstream, state, "Malformed JSON message.").await;
+        fail(socket, upstream, state, UiMessage::new(MessageId::LiveMalformedJson)).await;
         return;
     };
     let message_type = message.get("type");
@@ -330,7 +331,7 @@ async fn handle_client(
                 socket,
                 upstream,
                 state,
-                &format!("Unknown message type: {described}"),
+                UiMessage::new(MessageId::LiveUnknownMessageType).with_arg("type", json!(described)),
             )
             .await;
         }
@@ -353,7 +354,7 @@ async fn start(
             socket,
             upstream,
             state,
-            "Live start must include mode 'smart' or 'verbatim'.",
+            UiMessage::new(MessageId::LiveModeRequired),
         )
         .await;
         return;
@@ -394,8 +395,9 @@ async fn open_upstream(
     {
         Ok(Ok((live, _response))) => live,
         Ok(Err(error)) => {
-            let message = format!("Could not open the Live API connection: {error}");
-            fail(socket, upstream, state, &message).await;
+            let ui = UiMessage::new(MessageId::LiveConnectFailed)
+                .with_arg("detail", json!(error.to_string()));
+            fail(socket, upstream, state, ui).await;
             return;
         }
         Err(_) => {
@@ -403,7 +405,7 @@ async fn open_upstream(
                 socket,
                 upstream,
                 state,
-                "Gemini did not confirm the Live session setup in time.",
+                UiMessage::new(MessageId::LiveSetupTimeout),
             )
             .await;
             return;
@@ -429,7 +431,7 @@ async fn open_upstream(
                 socket,
                 upstream,
                 state,
-                "Gemini did not confirm the Live session setup in time.",
+                UiMessage::new(MessageId::LiveSetupTimeout),
             )
             .await;
             return;
@@ -451,7 +453,7 @@ async fn push_audio(
             socket,
             upstream,
             state,
-            "Audio arrived before the start message.",
+            UiMessage::new(MessageId::LiveAudioBeforeStart),
         )
         .await;
         return;
@@ -470,7 +472,7 @@ async fn push_audio(
             socket,
             upstream,
             state,
-            "Audio frames must carry base64 PCM16 in a 'data' string.",
+            UiMessage::new(MessageId::LiveAudioDataRequired),
         )
         .await;
         return;
@@ -481,7 +483,7 @@ async fn push_audio(
             socket,
             upstream,
             state,
-            "Audio frames must be base64-encoded 16-bit PCM.",
+            UiMessage::new(MessageId::LiveAudioPcmRequired),
         )
         .await;
         return;
@@ -491,10 +493,8 @@ async fn push_audio(
             socket,
             upstream,
             state,
-            &format!(
-                "Recording exceeded the {} minute limit.",
-                MAX_RECORDING_SECONDS / 60
-            ),
+            UiMessage::new(MessageId::LiveAudioTooLong)
+                .with_arg("minutes", json!(MAX_RECORDING_SECONDS / 60)),
         )
         .await;
         return;
@@ -515,7 +515,7 @@ async fn end(socket: &mut WebSocket, upstream: &mut Option<Upstream>, state: &mu
         return;
     }
     if !state.started {
-        fail(socket, upstream, state, "Received end before start.").await;
+        fail(socket, upstream, state, UiMessage::new(MessageId::LiveEndBeforeStart)).await;
         return;
     }
     if state.end_requested {
@@ -633,7 +633,7 @@ async fn handle_upstream_message(
             socket,
             upstream,
             state,
-            &format!("Live API error: {failure}"),
+            UiMessage::new(MessageId::LiveApiError).with_arg("detail", json!(failure)),
         )
         .await;
         return;
@@ -686,16 +686,16 @@ async fn upstream_closed(
     }
     let detail = describe_close(code, reason);
     if !state.upstream_ready {
-        let suffix = if detail.is_empty() {
-            " (closed before setup completed)".to_owned()
-        } else {
-            format!(": {detail}")
+        let ui = match detail {
+            None => UiMessage::new(MessageId::LiveSetupClosedBeforeReady),
+            Some(detail) => UiMessage::new(MessageId::LiveSetupClosedWithDetail)
+                .with_arg("detail", detail),
         };
         fail(
             socket,
             upstream,
             state,
-            &format!("Live session setup failed{suffix}."),
+            ui,
         )
         .await;
         return;
@@ -704,37 +704,33 @@ async fn upstream_closed(
         finish(socket, upstream, state).await;
         return;
     }
-    let suffix = if detail.is_empty() {
-        " unexpectedly".to_owned()
-    } else {
-        format!(": {detail}")
+    let ui = match detail {
+        None => UiMessage::new(MessageId::LiveConnectionClosed),
+        Some(detail) => UiMessage::new(MessageId::LiveConnectionClosedWithDetail)
+            .with_arg("detail", detail),
     };
     fail(
         socket,
         upstream,
         state,
-        &format!("Live connection closed{suffix}."),
+        ui,
     )
     .await;
 }
 
 /// Human-readable close reason: Google carries an `{"error":{"message":...}}`
 /// payload in the close reason, anything else is text.
-fn describe_close(code: u16, reason: &str) -> String {
+fn describe_close(code: u16, reason: &str) -> Option<Value> {
     let reason = reason.trim();
     if !reason.is_empty() {
-        if let Some(message) = parse_json_object(reason)
+        let message = parse_json_object(reason)
             .as_ref()
             .and_then(upstream_error_message)
-        {
-            return message;
-        }
-        return reason.to_owned();
+            .unwrap_or_else(|| reason.to_owned());
+        return Some(json!(message));
     }
-    if code != 1000 {
-        return format!("close code {code}");
-    }
-    String::new()
+    (code != 1000).then(|| json!(UiMessage::new(MessageId::CloseCode)
+        .with_arg("code", json!(code))))
 }
 
 /* -------------------------------------------------------------------------- */
@@ -774,7 +770,7 @@ async fn handle_deadline(
                     socket,
                     upstream,
                     state,
-                    "Gemini did not confirm the Live session setup in time.",
+                    UiMessage::new(MessageId::LiveSetupTimeout),
                 )
                 .await;
             }
@@ -788,7 +784,7 @@ async fn handle_deadline(
                     socket,
                     upstream,
                     state,
-                    "Timed out waiting for the final transcript from the Live API.",
+                    UiMessage::new(MessageId::LiveFinalTimeout),
                 )
                 .await;
             }
@@ -803,10 +799,8 @@ async fn handle_deadline(
                 socket,
                 upstream,
                 state,
-                &format!(
-                    "Live session exceeded the {} minute limit.",
-                    MAX_RECORDING_SECONDS / 60
-                ),
+                UiMessage::new(MessageId::LiveSessionTooLong)
+                    .with_arg("minutes", json!(MAX_RECORDING_SECONDS / 60)),
             )
             .await;
         }
@@ -841,16 +835,17 @@ async fn fail(
     socket: &mut WebSocket,
     upstream: &mut Option<Upstream>,
     state: &mut Relay,
-    message: &str,
+    mut ui: UiMessage,
 ) {
     if state.done {
         return;
     }
-    let safe = redact(message, state.ring.keys());
+    redact_ui(&mut ui, state.ring.keys());
+    let safe = redact(&render(Language::En, &ui), state.ring.keys());
     write_client(
         socket,
         state.ring.keys(),
-        &json!({ "type": "error", "message": safe }),
+        &json!({ "type": "error", "message": safe, "ui": ui }),
     )
     .await;
     finish(socket, upstream, state).await;

@@ -10,6 +10,7 @@
       2. an exact Rust 1.97.1 / x86_64-pc-windows-msvc toolchain resolution;
       3. the Visual Studio x64 developer environment (vswhere + VsDevCmd);
       4. `cargo check --locked --no-default-features`;
+         then localization source checks and the Git changed-message report;
       5. `cargo test --locked --no-default-features --features test-provider`
          (GUI-free unit tests only; that feature is never used by the final
          build);
@@ -169,6 +170,9 @@ if (Test-Path -LiteralPath $exePath -PathType Leaf) {
 
 Invoke-SpeechekCargoStep -Label 'check' -Environment $childEnvironment `
     -Arguments @('check', '--manifest-path', $cargoManifestArgument, '--locked', '--no-default-features')
+# Catalog validation already ran in build.rs above; reuse it, not a second schema.
+. (Join-Path $PSScriptRoot 'check-localization.ps1')
+Invoke-SpeechekLocalizationSources -RepoRoot $repoRoot
 Invoke-SpeechekCargoStep -Label 'test' -Environment $childEnvironment `
     -Arguments @('test', '--manifest-path', $cargoManifestArgument, '--locked', '--no-default-features', '--features', 'test-provider')
 Invoke-SpeechekCargoStep -Label 'build' -Environment $childEnvironment `

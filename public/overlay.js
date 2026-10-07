@@ -38,6 +38,7 @@
  */
 
 import { createRecorder } from './recorder.js';
+import { t, formatError, initI18n, onLanguageChange, applyTranslations, refreshLanguageSnapshot } from './i18n.js';
 
 /** The only event the shell sends to the overlay, and the only recording trigger. */
 const EVENT_TOGGLE = 'speechek:toggle';
@@ -58,12 +59,6 @@ const EVENT_MUTE_WARNING = 'speechek:mute-warning';
  * insertion, and no late answer of it either.
  */
 const EVENT_CANCEL = 'speechek:cancel';
-/**
- * The launcher settings were saved. The idle line follows the new binding; the
- * mode of a take never does, because the shell pins that per dictation.
- */
-const EVENT_SETTINGS_CHANGED = 'speechek:settings-changed';
-const SETTINGS_URL = '/api/settings';
 
 const MODES = new Set(['live', 'smart', 'verbatim']);
 /** The binding shown while idle, until the launcher settings name another one. */
@@ -83,18 +78,12 @@ const CAP_MS = 600000;
 /** Grace for the frames the shell had queued when it answered the stop. */
 const NATIVE_TAIL_MS = 1500;
 
-/** The second line of the pill: which mode records, in the lab's own words. */
-const MODE_LABELS = { live: 'Live Smart', smart: 'Smart', verbatim: 'Дословно' };
-
-/** Shown verbatim when the shell had to leave the text on the clipboard. */
-const COPIED_FALLBACK = 'Скопировано — вставьте вручную';
-/** Windows blocks the microphone in its own privacy settings, not in a page prompt. */
-const MIC_DENIED = 'Разрешите микрофон: Параметры Windows → Конфиденциальность → Микрофон';
-/** The shell could not start capturing, and its reason is the whole story. */
-const MIC_FAILED = 'Запись не началась';
-/** The shell had already queued these frames, so the take is not trustworthy. */
-const TAIL_LOST = 'Потеряны последние кадры записи — текст не вставлен';
-const NO_TEXT = 'Не удалось распознать речь';
+/** Modes remain pinned to a take; only their display labels follow the language. */
+const MODE_KEYS = { live: 'ModeLiveLabel', smart: 'ModeSmartLabel', verbatim: 'ModeVerbatimLabel' };
+const MIC_DENIED = { key: 'OverlayMicDenied' };
+const MIC_FAILED = { key: 'OverlayMicFailed' };
+const TAIL_LOST = { key: 'OverlayTailLost' };
+const NO_TEXT = { key: 'OverlayNoText' };
 
 const overlay = document.getElementById('overlay');
 const statusLine = document.getElementById('status');
@@ -109,8 +98,9 @@ let shell = Boolean(tauri?.event?.listen && tauri?.core?.invoke);
 
 /** The binding to name while idle. */
 let hotkey = DEFAULT_HOTKEY;
-/** Set once the shell pushed a settings change: the boot fetch is older then. */
-let settingsPushed = false;
+let snapshotReady = false;
+/** Last paint survives a finished or hidden take, including its descriptors. */
+let display = { state: 'idle', options: {}, mode: 'live', warning: null };
 
 /** Every shell event this page listens to; registered once, released with the page. */
 const unlisteners = [];
@@ -136,41 +126,28 @@ let draining = false;
 /* Boot                                                                        */
 /* -------------------------------------------------------------------------- */
 
-/**
- * The launcher settings name one thing on this page: the binding written into
- * the idle line. The mode of a take comes from the shell with the dictation, so
- * a settings change can never reach a recording that has already started.
- */
-void (async () => {
-  if (!shell) return;
-  try {
-    const response = await fetch(SETTINGS_URL, { cache: 'no-store', signal: AbortSignal.timeout(2000) });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const settings = await response.json();
-    if (!settingsPushed && typeof settings?.hotkey === 'string') hotkey = settings.hotkey;
-  } catch {
-    // The idle line keeps the default binding; nothing else reads the response.
-    return;
-  }
-  // The binding is known only now, and only the idle line names it: every other
-  // state belongs to a dictation, and that state is left alone.
-  if (overlay.dataset.state === 'idle') render('idle');
-})();
-
-/**
- * The launcher settings were saved: the idle line names the binding they chose.
- * Only that line follows them, and only while no dictation is on screen — the
- * mode and session of a take are the shell's answer to `dictation_context`,
- * pinned to the generation, and this event never touches them.
- */
-function onSettingsChanged(event) {
-  settingsPushed = true;
-  const named = event?.payload?.hotkey;
-  if (typeof named === 'string' && named.trim()) hotkey = named.trim();
-  if (overlay.dataset.state === 'idle') render('idle');
-}
 
 async function boot() {
+  unlisteners.push(onLanguageChange((_language, revision) => {
+    snapshotReady = revision >= 0;
+    applyTranslations();
+    renderText();
+  }));
+  const initialized = await initI18n({ onSettings(settings) {
+    const named = settings?.hotkey;
+    if (typeof named === 'string' && named.trim()) hotkey = named.trim();
+    if (display.state === 'idle') renderText();
+  } });
+  if (!initialized.catalogReady) return;
+  snapshotReady = initialized.snapshotReady;
+  // In this tiny window a separate banner would cover the recording. Keep a
+  // missing-snapshot notice on the existing second line instead; catalog failure
+  // still uses the shared bilingual, inert-page notice above.
+  if (!snapshotReady) {
+    const notice = document.getElementById('ui-language-notice');
+    if (notice) notice.hidden = true;
+  }
+  applyTranslations();
   if (!shell) {
     render('preview');
     return;
@@ -186,7 +163,6 @@ async function boot() {
     unlisteners.push(await tauri.event.listen(EVENT_PCM_FRAME, onPcmFrame));
     unlisteners.push(await tauri.event.listen(EVENT_MIC_ERROR, onMicError));
     unlisteners.push(await tauri.event.listen(EVENT_MUTE_WARNING, onMuteWarning));
-    unlisteners.push(await tauri.event.listen(EVENT_SETTINGS_CHANGED, onSettingsChanged));
   } catch (error) {
     shell = false;
     console.error('speechek overlay: the shell did not accept an event listener', error);
@@ -197,10 +173,12 @@ async function boot() {
     await tauri.core.invoke('overlay_ready');
   } catch (error) {
     console.error('speechek overlay: overlay_ready failed', error);
+    render('error', { message: error });
+    return;
   }
   // `overlay_ready` is where the shell hands over a dictation that was waiting
   // for this listener, so its arming state must not be painted over here.
-  if (!isLive(session)) render('idle');
+  if (!session) render('idle');
 }
 
 /* -------------------------------------------------------------------------- */
@@ -218,6 +196,7 @@ function generationOf(event) {
  * older than the newest generation is a late event from a finished dictation.
  */
 function onToggle(event) {
+  void refreshLanguageSnapshot();
   const generation = generationOf(event);
   if (generation === null || generation < handledGeneration) return;
   queuedGeneration = generation;
@@ -289,9 +268,9 @@ async function beginSession(generation) {
     sampled: false,
     settled: false,
     finished: false,
-    error: '',
+    error: null,
     // A non-fatal line of this take, e.g. the system mute that did not work.
-    warning: '',
+    warning: null,
   };
   session = active;
 
@@ -310,14 +289,15 @@ async function beginSession(generation) {
   // The shell names this take: the mode it records in, and the session whose
   // settings it pinned. Both arrive before the microphone is opened, and a
   // dictation cancelled while the answer was in flight never starts one.
-  const context = await callShell('dictation_context', { generation });
+  let contextError = null;
+  const context = await callShell('dictation_context', { generation }, (error) => { contextError = error; });
   if (!isLive(active)) return;
   if (context === undefined) {
-    finishError(active, 'Не удалось получить настройки диктовки', 'Запись не началась');
+    finishError(active, contextError || { key: 'OverlayContextFailed' }, MIC_FAILED);
     return;
   }
   if (!MODES.has(context?.mode) || !Number.isSafeInteger(context.sessionId) || context.sessionId <= 0) {
-    finishError(active, 'Оболочка назвала неизвестный режим диктовки', 'Запись не началась');
+    finishError(active, { key: 'OverlayUnknownMode' }, MIC_FAILED);
     return;
   }
   active.mode = context.mode;
@@ -340,14 +320,14 @@ async function beginSession(generation) {
   } catch (cause) {
     if (!isLive(active)) return;
     // The capture never opened: nothing was recorded, so nothing is inserted.
-    finishError(active, looksDenied(cause) ? MIC_DENIED : `Запись не началась: ${messageOf(cause)}`, 'Запись не началась');
+    finishError(active, looksDenied(cause) ? MIC_DENIED : cause, MIC_FAILED);
     return;
   }
   if (!isLive(active)) return;
   if (recorderState === before) {
     // `start` does nothing while the recorder still holds a previous take, so
     // this dictation never began and must not pretend it did.
-    finishError(active, 'Предыдущая диктовка ещё завершается', 'Запись не началась');
+    finishError(active, { key: 'OverlayPreviousDictationFinishing' }, MIC_FAILED);
     return;
   }
 
@@ -386,7 +366,7 @@ async function beginSession(generation) {
 
   // The shell moves to Recording here, and this is what delivers a stop the
   // user pressed while the recorder was still starting.
-  await invoke('capture_started', { generation });
+  await invoke('capture_started', { generation }, (error) => retainSessionError(active, error));
   if (!isLive(active)) return;
   active.phase = 'live';
   capTimer = setTimeout(() => { void endSession(active); }, CAP_MS);
@@ -402,23 +382,23 @@ async function endSession(active) {
   stopTimer();
   renderProgress(active, 'transcribing');
 
-  await invoke('capture_finalizing', { generation: active.generation });
+  await invoke('capture_finalizing', { generation: active.generation }, (error) => retainSessionError(active, error));
   // The shell answers with the last frame it emitted, so the recorder waits for
   // every frame it had queued before the take is closed behind it.
   const whole = await closeNative();
   if (!isLive(active)) return;
   let report = null;
-  let failure = '';
+  let failure = null;
   try {
     report = await ensureRecorder().stop();
   } catch (cause) {
-    failure = messageOf(cause);
+    failure = cause;
   }
   if (!isLive(active)) return;
   if (!whole) {
     // Frames the shell had already queued never arrived: the take is missing the
     // words that ended it, so nothing is inserted.
-    finishError(active, TAIL_LOST);
+    finishError(active, active.error || TAIL_LOST);
     return;
   }
   settle(active, report, failure);
@@ -493,15 +473,16 @@ function settle(active, report, failure) {
     void insertText(active, text);
     return;
   }
-  finishError(active, reportedError(errors, active) || failure || active.error || NO_TEXT);
+  finishError(active, reportedError(errors, report?.errorDetails, active) || failure || active.error || NO_TEXT);
 }
 
-function reportedError(errors, active) {
+function reportedError(errors, errorDetails, active) {
   for (const name of [active.mode, '']) {
+    if (errorDetails?.[name]) return { ui: errorDetails[name], message: errors?.[name] };
     const message = errors?.[name];
     if (typeof message === 'string' && message.trim()) return message.trim();
   }
-  return active.error.trim();
+  return active.error;
 }
 
 async function insertText(active, text) {
@@ -509,14 +490,14 @@ async function insertText(active, text) {
   try {
     outcome = await tauri.core.invoke('insert_text', { generation: active.generation, text });
   } catch (cause) {
-    if (isLive(active)) finishError(active, messageOf(cause) || 'Текст не удалось передать в активное окно', 'Текст не вставлен');
+    if (isLive(active)) finishError(active, cause, { key: 'OverlayNotPasted' });
     return;
   }
   if (!isLive(active)) return;
   // The shell types the text, or leaves it on the clipboard for one manual paste.
   if (outcome === 'copied_fallback') finishCopied(active);
   else if (outcome === 'inserted') finishSuccess(active);
-  else finishError(active, 'Неизвестный результат вставки', 'Текст не вставлен');
+  else finishError(active, { key: 'OverlayUnknownInsertionResult' }, { key: 'OverlayNotPasted' });
 }
 
 /** Common end of a dictation: no more timer, no more bars, one last state. */
@@ -536,7 +517,7 @@ function finish(active) {
  */
 function finishSuccess(active) {
   if (!finish(active)) return;
-  void invoke('finish_session', { generation: active.generation, outcome: 'success' });
+  void finishShell(active, 'success');
 }
 
 /**
@@ -546,17 +527,24 @@ function finishSuccess(active) {
 function finishCopied(active) {
   if (!finish(active)) return;
   render('copied');
-  void invoke('finish_session', { generation: active.generation, outcome: 'error' });
+  void finishShell(active, 'error');
 }
 
 /**
  * The dictation failed: the reason replaces the processing status, and the
  * shell keeps it visible briefly (or re-shows it after an insertion failure).
  */
-function finishError(active, message, detail = 'Текст не вставлен') {
+function finishError(active, message, detail = { key: 'OverlayNotPasted' }) {
   if (!finish(active)) return;
   render('error', { message, detail });
-  void invoke('finish_session', { generation: active.generation, outcome: 'error' });
+  void finishShell(active, 'error');
+}
+
+async function finishShell(active, outcome) {
+  await invoke('finish_session', { generation: active.generation, outcome }, (error) => {
+    // A late failure cannot overwrite a newer take or bring a hidden pill back.
+    if (session === active) render('error', { message: error });
+  });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -569,6 +557,7 @@ function trackRelease(next) {
   if (next === 'idle') {
     releaseDone?.();
     releaseDone = null;
+    void refreshLanguageSnapshot();
     return;
   }
   if (!releaseDone) released = new Promise((resolve) => { releaseDone = resolve; });
@@ -600,14 +589,14 @@ function ensureRecorder() {
       // recorder's own report at the end, so neither line has anything to show.
       onInterim() {},
       onFinal() {},
-      onError(name, message) {
+      onError(name, message, ui) {
         const active = session;
         if (!isLive(active) || typeof message !== 'string' || !message) return;
         // An error never becomes an insertion, and a take that failed has no
         // text left to wait for: the capture behind it is closed here.
-        active.error = message;
-        render('error', { message });
-        void abortSession(active, message);
+        active.error = ui ? { ui, message } : message;
+        render('error', { message: active.error });
+        void abortSession(active, active.error);
       },
     });
   }
@@ -684,7 +673,7 @@ function onMicError(event) {
   const running = capture;
   const payload = event?.payload;
   if (!running || !payload || payload.generation !== running.generation) return;
-  const reason = typeof payload.message === 'string' ? payload.message.trim() : '';
+  const reason = payload.ui ? payload : (typeof payload.message === 'string' ? payload.message.trim() : '');
   void abortSession(session, reason || MIC_FAILED, captureFix(reason));
 }
 
@@ -700,7 +689,7 @@ function onMicError(event) {
 function onMuteWarning(event) {
   const payload = event?.payload;
   if (!payload) return;
-  const message = typeof payload.message === 'string' ? payload.message.trim() : '';
+  const message = payload.ui ? payload : (typeof payload.message === 'string' ? payload.message.trim() : '');
   if (!message) return;
   const active = session;
   if (!active || payload.generation !== active.generation) return;
@@ -727,7 +716,10 @@ function onMuteWarning(event) {
 async function closeNative() {
   const running = capture;
   if (!running) return true;
-  const total = await callShell('stop_native_capture', { generation: running.generation });
+  const active = session;
+  const total = await callShell('stop_native_capture', { generation: running.generation }, (error) => {
+    if (active === session && active?.generation === running.generation && !active.error) active.error = error;
+  });
   // The slot stays reachable while the tail is in flight: the frames the shell
   // had already queued still belong to this capture, and only generation and
   // sequence decide what reaches the recorder.
@@ -835,26 +827,42 @@ function showElapsed() {
 /* Copy and rendering                                                          */
 /* -------------------------------------------------------------------------- */
 
-const COPY = {
-  preview: 'Предпросмотр без оболочки',
-  arming: 'Слушаю микрофон…',
-  recording: 'Идёт запись',
-  transcribing: 'Идёт обработка',
-  copied: COPIED_FALLBACK,
+const COPY_KEYS = {
+  preview: 'OverlayPreview',
+  arming: 'OverlayArming',
+  recording: 'OverlayRecording',
+  transcribing: 'OverlayProcessing',
+  copied: 'OverlayCopied',
 };
 
-function message(state) {
-  if (state === 'idle') return `${hotkey} — диктовка`;
-  return COPY[state] ?? COPY.arming;
+/**
+ * Error descriptors whose pill wording is shorter than the lab's full
+ * sentence. The notice card is 344 px and its status line is clamped to two
+ * lines, so a long hint would be cut mid-sentence here; the lab card, which has
+ * room, keeps the full catalog message. Only the key is swapped — the
+ * descriptor stays the unit pages keep and re-render.
+ */
+const PILL_ERROR_KEYS = Object.freeze({ GoogleThinkingUnsupported: 'GoogleThinkingUnsupportedShort' });
+
+/** The pill's wording for an error: the shorter catalog variant when the descriptor's key has one. */
+function pillErrorText(error) {
+  const ui = error?.ui ?? error;
+  const key = ui != null && Object.hasOwn(PILL_ERROR_KEYS, ui.key)
+    ? PILL_ERROR_KEYS[ui.key]
+    : null;
+  return formatError(key === null ? error : { ...ui, key });
 }
 
-/** The second line: the mode that records, or what ended the dictation. */
+function message(state) {
+  if (state === 'idle') return t('OverlayIdle', { hotkey });
+  return t(COPY_KEYS[state] ?? COPY_KEYS.arming);
+}
+
+/** The second line follows the last paint, not mutable lifecycle/session state. */
 function detail(state) {
-  if (state === 'error') return 'Текст не вставлен';
-  if (state === 'copied') return 'Текст в буфере обмена';
-  // The mode belongs to the take: the shell names it with each dictation, and
-  // no settings response is drawn here.
-  return MODE_LABELS[session?.mode] ?? MODE_LABELS.live;
+  if (state === 'error') return t('OverlayNotPasted');
+  if (state === 'copied') return t('OverlayClipboardText');
+  return t(MODE_KEYS[display.mode] ?? MODE_KEYS.live);
 }
 
 /**
@@ -872,8 +880,19 @@ function render(state, options = {}) {
   // Only a real change is written: repeated renders of one state are not
   // transitions, and nothing else should have to filter them out.
   if (overlay.dataset.state !== state) overlay.dataset.state = state;
-  statusLine.textContent = options.message ?? message(state);
-  modeLine.textContent = options.detail ?? warningLine(state) ?? detail(state);
+  display = { state, options, mode: session?.mode || 'live', warning: warningLine(state) };
+  renderText();
+  if (state === 'idle') void refreshLanguageSnapshot();
+}
+
+/** Language updates paint only text; no transition, timer, IPC or window visibility. */
+function renderText() {
+  const { state, options, warning } = display;
+  statusLine.textContent = options.message == null ? message(state) : pillErrorText(options.message);
+  const fallback = !snapshotReady && ['idle', 'preview', 'arming', 'recording', 'transcribing'].includes(state)
+    ? { key: 'UiLanguageReadFailed' } : null;
+  const secondLine = options.detail ?? warning ?? fallback;
+  modeLine.textContent = secondLine == null ? detail(state) : (secondLine === '' ? '' : formatError(secondLine));
 }
 
 /** A running capture keeps running, but an error already reported stays visible. */
@@ -885,14 +904,21 @@ function renderProgress(active, state) {
   render(state);
 }
 
+function retainSessionError(active, error) {
+  if (!isLive(active)) return;
+  if (!active.error) active.error = error;
+  render('error', { message: active.error });
+}
+
 /* -------------------------------------------------------------------------- */
 /* Shell calls                                                                 */
 /* -------------------------------------------------------------------------- */
 
-function invoke(command, args) {
+function invoke(command, args, onError) {
   if (!shell) return Promise.resolve(null);
   return tauri.core.invoke(command, args).catch((error) => {
     console.error(`speechek overlay: ${command} failed`, error);
+    onError?.(error);
     return null;
   });
 }
@@ -901,24 +927,29 @@ function invoke(command, args) {
  * Calls a shell command whose answer is a value. Unlike `invoke`, a failure is
  * not flattened into `null`: the caller learns that there was no answer at all.
  */
-async function callShell(command, args) {
+async function callShell(command, args, onError) {
   if (!shell) return undefined;
   try {
     return await tauri.core.invoke(command, args);
   } catch (error) {
     console.error(`speechek overlay: ${command} failed`, error);
+    onError?.(error);
     return undefined;
   }
 }
 
-function messageOf(cause) {
-  return cause instanceof Error ? cause.message : String(cause ?? '');
+/** Original diagnostic data only: never use a translated rendering for denial. */
+function diagnosticMessageOf(cause) {
+  if (typeof cause === 'string') return cause;
+  if (typeof cause?.diagnosticMessage === 'string') return cause.diagnosticMessage;
+  if (typeof cause?.cause?.message === 'string') return cause.cause.message;
+  return typeof cause?.message === 'string' ? cause.message : '';
 }
 
 /** A microphone the system refused looks like this, whatever the browser calls it. */
 function looksDenied(cause) {
-  const name = cause?.name ?? '';
-  return name === 'NotAllowedError' || name === 'SecurityError' || /not.?allowed|denied|permission|доступ к микрофону запрещ|микрофон.*запрещ/i.test(messageOf(cause));
+  const name = cause?.cause?.name ?? cause?.name ?? '';
+  return name === 'NotAllowedError' || name === 'SecurityError' || /not.?allowed|denied|permission|доступ к микрофону запрещ|микрофон.*запрещ/i.test(diagnosticMessageOf(cause));
 }
 
 /** What the user can do about a capture failure: it is only a refusal when the
@@ -941,7 +972,7 @@ async function startCapture(generation) {
     return { capture: await tauri.core.invoke('start_native_capture', { generation }), reason: '' };
   } catch (error) {
     console.error('speechek overlay: start_native_capture failed', error);
-    return { capture: undefined, reason: messageOf(error).trim() };
+    return { capture: undefined, reason: error };
   }
 }
 
@@ -952,7 +983,7 @@ async function startCapture(generation) {
  * next dictation asks for it again.
  */
 function fallbackLine(device) {
-  return `Выбранный микрофон недоступен; запись с системного: ${device}`;
+  return { key: 'OverlayFallbackDevice', args: { device } };
 }
 
 /* -------------------------------------------------------------------------- */

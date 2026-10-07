@@ -14,6 +14,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
+use crate::i18n::{MessageId, UiError, UiMessage};
+
 /// The recording pill is 224×48 inside a 240×64 window, leaving an 8 px
 /// transparent edge while the meter, status and timer sit 12 px apart.
 const NORMAL_PILL: (f64, f64) = (240.0, 64.0);
@@ -36,10 +38,14 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 // Serialize a show with the generation check and hide: a stale hide cannot race a new show.
 static PLACEMENT: Mutex<()> = Mutex::new(());
 
-fn native_handle(window: &tauri::WebviewWindow) -> Result<HWND, String> {
-    let handle = window
-        .hwnd()
-        .map_err(|error| format!("Overlay HWND: {error}"))?;
+fn native_handle(window: &tauri::WebviewWindow) -> Result<HWND, UiError> {
+    let handle = window.hwnd().map_err(|error| {
+        UiError::new(
+            "OVERLAY_HANDLE_FAILED",
+            UiMessage::new(MessageId::OverlayHandleFailed)
+                .with_arg("detail", serde_json::Value::from(error.to_string())),
+        )
+    })?;
     // Tauri and our direct windows dependency may use different windows crate versions.
     Ok(HWND(handle.0 as _))
 }
@@ -116,7 +122,7 @@ fn position(window: &tauri::WebviewWindow, rectangle: (i32, i32, i32, i32)) -> R
     let (x, y, width, height) = rectangle;
     unsafe {
         SetWindowPos(
-            native_handle(window)?,
+            native_handle(window).map_err(|error| error.to_string())?,
             Some(HWND_TOPMOST),
             x,
             y,
@@ -146,7 +152,7 @@ fn reveal(app: &AppHandle, window_size: (f64, f64)) -> Result<tauri::WebviewWind
     position(&window, rectangle)?;
     unsafe {
         SetWindowPos(
-            native_handle(&window)?,
+            native_handle(&window).map_err(|error| error.to_string())?,
             Some(HWND_TOPMOST),
             0,
             0,
@@ -159,12 +165,15 @@ fn reveal(app: &AppHandle, window_size: (f64, f64)) -> Result<tauri::WebviewWind
     Ok(window)
 }
 
-pub fn create(app: &AppHandle) -> Result<(), String> {
+pub fn create(app: &AppHandle) -> Result<(), UiError> {
     if app.get_webview_window(OVERLAY).is_some() {
         return Ok(());
     }
     let window = WebviewWindowBuilder::new(app, OVERLAY, WebviewUrl::App("overlay.html".into()))
-        .title("Speechek recording")
+        .title(crate::localized(
+            crate::current_language(app),
+            crate::i18n::MessageId::OverlayTitle,
+        ))
         // The first size only: every reveal sets the size its state needs.
         .inner_size(NORMAL_PILL.0, NORMAL_PILL.1)
         .decorations(false)
@@ -177,7 +186,13 @@ pub fn create(app: &AppHandle) -> Result<(), String> {
         .focused(false)
         .visible(false)
         .build()
-        .map_err(|error| format!("Cannot create recording overlay: {error}"))?;
+        .map_err(|error| {
+            UiError::new(
+                "OVERLAY_CREATE_FAILED",
+                UiMessage::new(MessageId::OverlayWindowCreateFailed)
+                    .with_arg("detail", serde_json::Value::from(error.to_string())),
+            )
+        })?;
     let hwnd = native_handle(&window)?;
     unsafe {
         let styles = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);

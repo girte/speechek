@@ -6,7 +6,7 @@ Thanks for wanting to help. This guide covers the toolchain, building, testing a
 
 - **Windows 11 x64** with **Visual Studio 2022 BuildTools** (the MSVC toolchain).
 - **Rust 1.97.1** — install with [rustup](https://rustup.rs/) and use the `x86_64-pc-windows-msvc` target. The version is pinned in `rust-toolchain.toml`.
-- **Bun 1.4.2** — only needed for the Tauri CLI. It is a build tool, not a runtime requirement.
+- **Bun 1.4.2** — needed for the Tauri CLI and GUI-free localization checks, not for running the app.
 - **Microsoft WebView2 Runtime** for running a build.
 
 ## Build
@@ -43,6 +43,27 @@ cargo test --manifest-path src-tauri\Cargo.toml --locked --no-default-features -
 The `test-provider` feature and the `SPEECHEK_TEST_PROVIDER_HTTP` / `SPEECHEK_TEST_PROVIDER_WSS` overrides exist **only in debug builds**. Use a temporary or absolute `%APPDATA%` path and fake keys. **Never** run automated checks with real keys or real speech, and never commit `settings.json`, `secrets.bin` or `keys.txt`.
 
 These checks must stay **GUI-free**: do not launch `cargo run`, a debug or release executable, or any visible-window scenario from an automated run. The visible-window smoke (overlay, tray, microphone, paste) is performed by hand by the owner. Portable previews handed to the owner are built with `scripts/prepare-preview.ps1` — see [docs/releasing.md](docs/releasing.md).
+
+## Localization
+
+`public/messages.json` is the single catalog for native and web UI. Add new messages in every supported language in the same change as the feature. When an existing message changes meaning, review every translation; do not assume an unchanged translation is still correct. Keep keys for typo/style fixes; use distinct semantic keys for different actions or causes. Speech, transcripts, device names, external diagnostics and legal texts remain data, not translated UI copy.
+
+Run the full GUI-free control from the repository root:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/check-localization.ps1
+```
+
+The command activates the pinned Rust/MSVC environment and reuses the build-time catalog validator through `cargo check`: every message must have non-blank EN/RU values and matching valid placeholders. Generated `MessageId` references are checked by Rust. It then installs the locked development dependencies with lifecycle scripts disabled, runs the checker regressions, checks static JS/HTML keys and statically known missing arguments, and warns about possible direct UI text in HTML/JS/Rust. These parsers are development tools only; nothing is added to the application runtime.
+
+The Git report shows only added, removed or changed messages, including their before/after values. Changes in only some languages get an advisory `REVIEW` notice, with the unchanged translations shown for comparison. Confirm that they still match the meaning; no artificial edit or per-string approval record is required. By default the baseline is the highest-version reachable `vX.Y.Z` release tag, or `HEAD` if none exists. This includes committed, staged and unstaged changes since that baseline. To review a smaller change, pass `-BaseRef HEAD` or another existing commit/tag.
+
+Missing translations, invalid placeholders, unknown static keys, missing static arguments and unparseable JavaScript block the control. Literal-text warnings and one-language-only changes require review, not another release approval. The literal scan is heuristic, not proof that every text is translated: dynamic values are not executed or guessed. The lab's dynamic text containers start empty and are filled from retained message descriptors before the interface is shown; do not add permanent `data-i18n` markers to transcript containers, because a language change must leave dictated text untouched.
+
+For intentional non-translatable data or catalog-failure fallbacks, a narrow `// i18n-ignore-next: reason` in JS or `<!-- i18n-ignore-next: reason -->` in HTML suppresses warnings for the next statement/node only. Give a concrete reason; key and argument errors remain blocking. Review new warnings instead of hiding an entire screen.
+
+`scripts/prepare-preview.ps1` runs this control after its existing `cargo check`, without a second catalog validator or duplicate Cargo step. Native UI and text smoke remain exclusively owner-run; the publication/owner-approval process is unchanged.
+
 
 ## Code layout
 

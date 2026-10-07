@@ -15,16 +15,27 @@
  *   onLevel(level)          peak level 0..1, at most ~30 reports per second
  *   onInterim(mode, text)   provisional text; never a result
  *   onFinal(mode, text)     confirmed text only
- *   onError(mode, message)  mode is 'live' | 'smart' | 'verbatim', or '' for
+ *   onError(mode, message, ui)  mode is 'live' | 'smart' | 'verbatim', or '' for
  *                           session errors (capture, cap, short recording) that
- *                           belong to no single mode
+ *                           belong to no single mode. `message` is the report
+ *                           rendered in the language current at that moment;
+ *                           `ui` is the `{ key, args }` descriptor pages keep to
+ *                           re-render the same report after a language change.
  *
  * `start`, `stop`, `acceptPcmChunk` and `dispose` are the whole surface. `stop`
  * is what produces the text; `dispose` is the opposite: it drops the take and
  * its instance, aborting a batch upload that is already in flight and closing
  * the Live socket, so nothing of that take is transcribed, uploaded or
  * reported, and a caller that wants the recording again builds a new recorder.
+ *
+ * `stop` resolves with `{ results, errors, errorDetails }`: `errors` maps each
+ * failed mode to the message rendered when it was reported, `errorDetails` to
+ * its descriptor. A failed `start` rejects with an `Error` whose `.ui` is that
+ * descriptor, `.diagnosticMessage` the original raw text and `.cause` the
+ * original exception, whose `name` is preserved on it.
  */
+
+import { formatError } from './i18n.js';
 
 const WORKLET_URL = '/pcm-worklet.js';
 const LIVE_URL = '/api/live';
@@ -55,7 +66,67 @@ const PCM16_PEAK = 32768;
 
 const noop = () => {};
 
-const emptyResult = () => ({ results: {}, errors: {} });
+const emptyResult = () => ({ results: {}, errors: {}, errorDetails: {} });
+
+/** A catalog descriptor: `{ key, args? }`, the wire shape of a UiMessage. */
+function uiMsg(key, args) {
+  return args === undefined ? { key } : { key, args };
+}
+
+/** Narrows a value to a descriptor without depending on i18n internals. */
+function isDescriptor(value) {
+  return typeof value === 'object' && value !== null && typeof value.key === 'string' && value.key.length > 0;
+}
+
+/**
+ * Raw detail of any thrown value, safe to show as data: an `Error` yields its
+ * original diagnostic text, never `String(object)`.
+ */
+function diagnosticOf(cause) {
+  if (cause instanceof Error) {
+    if (typeof cause.diagnosticMessage === 'string' && cause.diagnosticMessage) return cause.diagnosticMessage;
+    return typeof cause.message === 'string' ? cause.message : '';
+  }
+  if (cause && typeof cause === 'object') {
+    if (typeof cause.diagnosticMessage === 'string' && cause.diagnosticMessage) return cause.diagnosticMessage;
+    return typeof cause.message === 'string' ? cause.message : '';
+  }
+  if (typeof cause === 'string') return cause;
+  if (typeof cause === 'number' || typeof cause === 'boolean') return String(cause);
+  return '';
+}
+
+/** Renders a descriptor in the current language; the raw detail is a last resort. */
+function renderUi(ui, diagnostic = '') {
+  return formatError({ ui, message: diagnostic }, diagnostic);
+}
+
+/**
+ * An `Error` that keeps its catalog descriptor, the raw diagnostic and the
+ * original failure, so no layer has to parse translated prose.
+ */
+function uiFailure(ui, diagnostic = '', cause = null) {
+  const failure = new Error(renderUi(ui, diagnostic));
+  failure.ui = ui;
+  failure.diagnosticMessage = diagnostic;
+  failure.cause = cause;
+  return failure;
+}
+
+/** Turns a failed HTTP answer into an `Error` carrying the catalog descriptor. */
+function httpFailure(result, status, fallbackDiagnostic = '') {
+  const error = result?.error;
+  const structured = isDescriptor(error?.ui) ? error.ui : null;
+  const body = typeof error?.message === 'string' && error.message ? error.message : '';
+  const diagnostic = body || fallbackDiagnostic;
+  const code = typeof error?.code === 'string' && error.code ? error.code : null;
+  const ui = structured ?? (code === 'MISSING_API_KEY'
+    ? uiMsg('RecorderMissingApiKey')
+    : uiMsg('RecorderRequestFailed', { detail: diagnostic || uiMsg('RecorderHttpStatus', { status }) }));
+  const failure = uiFailure(ui, diagnostic);
+  failure.code = code;
+  return failure;
+}
 
 export function createRecorder(handlers = {}) {
   const onState = typeof handlers.onState === 'function' ? handlers.onState : () => {};
@@ -114,6 +185,8 @@ export function createRecorder(handlers = {}) {
   let needsLive = false;
   let needsBatch = false;
   let errors = {};
+  /** Descriptors behind `errors`, kept so a page can re-render after a switch. */
+  let errorDetails = {};
 
   let levelAt = 0;
   let levelPeak = 0;
@@ -133,11 +206,16 @@ export function createRecorder(handlers = {}) {
     onLevel(Math.max(0, Math.min(1, value)));
   }
 
-  /** Reports each mode at most once, keeping the returned `errors` in sync. */
-  function reportError(name, message) {
+  /**
+   * Reports each mode at most once: `errors` keeps the text rendered at report
+   * time, `errorDetails` the descriptor pages keep for a later re-render.
+   */
+  function reportError(name, ui, diagnostic = '') {
     if (name in errors) return;
+    const message = renderUi(ui, diagnostic);
     errors[name] = message;
-    if (!disposed) onError(name, message);
+    errorDetails[name] = ui;
+    if (!disposed) onError(name, message, ui);
   }
 
   function delay(ms) {
@@ -181,7 +259,7 @@ export function createRecorder(handlers = {}) {
     queue = [];
     ready = false;
     liveFailed = true;
-    reportError(LIVE_MODE, 'Live недоступен: сервер не ответил за 10 секунд.');
+    reportError(LIVE_MODE, uiMsg('RecorderLiveServerTimeout'));
     socket?.close();
   }
 
@@ -226,25 +304,29 @@ export function createRecorder(handlers = {}) {
         liveFailed = true;
         ready = false;
         queue = [];
-        reportError(LIVE_MODE, `Live недоступен: ${message.message || 'ошибка сервиса'}`);
+        const structured = isDescriptor(message.ui) ? message.ui : null;
+        const raw = typeof message.message === 'string' && message.message ? message.message : '';
+        reportError(LIVE_MODE, structured ?? uiMsg('RecorderLiveServiceError', {
+          detail: raw || uiMsg('RecorderLiveServiceUnknown'),
+        }), raw);
         finishLive();
       } else if (message.type === 'done') {
         if (!liveFailed && !liveFinal.some(Boolean)) {
-          reportError(LIVE_MODE, 'Live не вернул подтверждённый текст. Попробуйте более длинную фразу.');
+          reportError(LIVE_MODE, uiMsg('RecorderLiveNoText'));
         }
         finishLive();
       }
     };
     socket.onerror = () => {
       liveFailed = true;
-      reportError(LIVE_MODE, 'Live недоступен: ошибка соединения.');
+      reportError(LIVE_MODE, uiMsg('RecorderLiveConnectionFailed'));
       finishLive();
     };
     socket.onclose = () => {
       ready = false;
       if (!liveFinish) return;
       liveFailed = true;
-      reportError(LIVE_MODE, 'Live прервался до завершения.');
+      reportError(LIVE_MODE, uiMsg('RecorderLiveInterrupted'));
       finishLive();
     };
   }
@@ -380,6 +462,7 @@ export function createRecorder(handlers = {}) {
     liveFinal = [];
     liveInterim = '';
     errors = {};
+    errorDetails = {};
     levelAt = 0;
     levelPeak = 0;
     abort = new AbortController();
@@ -425,11 +508,12 @@ export function createRecorder(handlers = {}) {
       if (pending === mine) pending = null;
       if (stale()) return;
       setState('idle');
-      const message = cause?.name === 'NotAllowedError'
-        ? 'Доступ к микрофону запрещён. Разрешите его для localhost в настройках браузера.'
-        : `Не удалось начать запись: ${cause?.message ?? cause}`;
-      reportError('', message);
-      throw new Error(message);
+      const diagnostic = diagnosticOf(cause);
+      const ui = isDescriptor(cause?.ui) ? cause.ui : cause?.name === 'NotAllowedError'
+        ? uiMsg('RecorderMicDenied')
+        : uiMsg('RecorderStartFailed', { detail: diagnostic || uiMsg('RecorderUnknownCause') });
+      reportError('', ui, diagnostic);
+      throw uiFailure(ui, diagnostic, cause);
     }
   }
 
@@ -457,19 +541,26 @@ export function createRecorder(handlers = {}) {
         body: wave,
         signal,
       });
-      const result = await response.json();
-      if (!response.ok) {
-        throw new Error(result.error?.code === 'MISSING_API_KEY'
-          ? 'Ключ Gemini не задан. Добавьте его в настройках Speechek (раздел «API-ключи»).'
-          : result.error?.message || `HTTP ${response.status}`);
-      }
-      if (typeof result.text !== 'string' || !result.text.trim()) throw new Error('Модель вернула пустой текст.');
+      let parseError = null;
+      const result = await response.json().catch((error) => {
+        // An aborted take keeps its own meaning; a broken body is reported by status.
+        if (error?.name === 'AbortError') throw error;
+        parseError = error;
+        return null;
+      });
+      if (!response.ok) throw httpFailure(result, response.status);
+      if (result === null) throw httpFailure(null, response.status, diagnosticOf(parseError));
+      if (typeof result.text !== 'string' || !result.text.trim()) throw uiFailure(uiMsg('RecorderEmptyText'));
       return { text: result.text };
     } catch (cause) {
       // A request disposed with its take is not a transcription failure: the
       // session it belonged to is gone and no answer of it has anywhere to go.
       if (cause?.name === 'AbortError') return { aborted: true };
-      return { message: cause.message };
+      if (cause instanceof Error && isDescriptor(cause.ui)) {
+        return { ui: cause.ui, diagnostic: typeof cause.diagnosticMessage === 'string' ? cause.diagnosticMessage : '' };
+      }
+      const diagnostic = diagnosticOf(cause);
+      return { ui: uiMsg('RecorderRequestFailed', { detail: diagnostic || uiMsg('RecorderUnknownCause') }), diagnostic };
     }
   }
 
@@ -504,7 +595,7 @@ export function createRecorder(handlers = {}) {
         await Promise.race([liveDone, delay(LIVE_DRAIN_MS)]);
         if (liveFinish) {
           liveFailed = true;
-          reportError(LIVE_MODE, 'Live не успел завершить расшифровку.');
+          reportError(LIVE_MODE, uiMsg('RecorderLiveTimeout'));
           finishLive();
         }
         await closeSocket();
@@ -513,8 +604,8 @@ export function createRecorder(handlers = {}) {
       if (liveFinal.some(Boolean) && !liveFailed) results.live = liveFinal.filter(Boolean).join(' ');
 
       if (samples < MIN_SAMPLES) {
-        reportError('', 'Запись короче 0,1 секунды. Произнесите фразу и повторите.');
-        return { results, errors };
+        reportError('', uiMsg('RecorderTooShort'));
+        return { results, errors, errorDetails };
       }
 
       if (needsBatch) {
@@ -528,14 +619,16 @@ export function createRecorder(handlers = {}) {
             results[name] = outcome.text;
             onFinal(name, outcome.text);
           } else if (!outcome.aborted) {
-            reportError(name, outcome.message);
+            reportError(name, outcome.ui, outcome.diagnostic);
           }
         });
       }
-      return { results, errors };
+      return { results, errors, errorDetails };
     } catch (cause) {
-      reportError('', `Не удалось обработать запись: ${cause.message}`);
-      return { results, errors };
+      const diagnostic = diagnosticOf(cause);
+      const ui = isDescriptor(cause?.ui) ? cause.ui : uiMsg('RecorderStopFailed', { detail: diagnostic || uiMsg('RecorderUnknownCause') });
+      reportError('', ui, diagnostic);
+      return { results, errors, errorDetails };
     } finally {
       chunks = null;
       samples = 0;

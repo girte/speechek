@@ -27,7 +27,7 @@
 //! notification reports; a mute the user had set before the take is never
 //! cleared either. Everything here is best effort: a device that disappeared, a
 //! COM call that failed or a worker that did not answer is reported so the pill
-//! can show [`MUTE_FAILED`], and the dictation goes on recording regardless.
+//! can show [`mute_failed`], and the dictation goes on recording regardless.
 //!
 //! The decision logic (`Book` over the `Endpoint` trait) is plain Rust and is
 //! unit-tested; the COM plumbing below it runs on one worker thread, which is
@@ -48,10 +48,14 @@ use windows::Win32::Media::Audio::{
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
 };
+use crate::i18n::{MessageId, UiMessage};
 
-/// The one fixed warning a failed mute produces, shown on the pill exactly as
-/// written — it says what happened, not why, and never names a device.
-pub const MUTE_FAILED: &str = "Не удалось отключить звук во время записи";
+/// The one fixed warning a failed mute produces, as a catalog descriptor: the
+/// pill renders it in the current language, and it says what happened, not why,
+/// and never names a device.
+pub fn mute_failed() -> UiMessage {
+    UiMessage::new(MessageId::AudioMuteFailed)
+}
 
 /// The event context every `SetMute` of this module carries, so the change
 /// notification can tell this module's own mute from one the user made.

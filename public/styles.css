@@ -1,6 +1,8 @@
 :root { color-scheme: dark; --bg:#242424; --surface:#303030; --line:#545454; --text:#F5F5F5; --muted:#BDBDBD; --accent:#8A2BE2; --accent-text:#CBA5F5; --accent-hover:#7420C8; --accent-active:#6F1DBD; --error:#ffbdad; --line-soft:rgba(245,245,245,.14); --error-bg:#3C2724; --error-line:#9E5851; scrollbar-color:var(--accent-text) var(--surface); font-family: Inter, "Segoe UI", system-ui, sans-serif; }
 * { box-sizing:border-box; }
 body { margin:0; background:var(--bg); color:var(--text); }
+body[data-i18n-pending] { visibility:hidden; }
+.ui-language-notice { max-width:1184px; margin:24px auto; padding:12px 16px; color:#F3E2B0; background:#3A3323; border:1px solid #8C7B45; border-radius:6px; font-size:13px; line-height:1.5; }
 .shell { max-width:1240px; margin:auto; padding:32px 28px 60px; }
 .brand { display:flex; align-items:center; gap:10px; font-size:14px; font-weight:800; letter-spacing:.19em; }
 .brand-mark { color:var(--accent); font-size:24px; line-height:1; }

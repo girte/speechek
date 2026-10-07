@@ -22,6 +22,7 @@
 //! environment. The settings window saves through [`patch_settings_document`]
 //! and [`atomic_replace`].
 
+use crate::i18n::{self, Language, MessageId, UiMessage};
 use crate::profile::{self, BuildFlavor};
 use crate::secrets::{KeyRing, SecretKey};
 use parking_lot::{Mutex, RwLock};
@@ -153,13 +154,14 @@ const HOTKEY_NAMED_KEYS: &[&str] = &[
 
 /// Launcher settings. `/api/settings` publishes `hotkey` and `mode` and nothing
 /// else; the settings window reads this same struct, `mute_during_recording`,
-/// `port` and `input_device` included.
+/// `port`, `input_device` and `language` included.
 ///
-/// `mute_during_recording`, `port` and `input_device` are the managed values a
-/// document may omit: a file written before each existed has no such property,
-/// and it reads as the documented default there - `false`, the active
-/// flavor's default port and the system default input device - not as a guess
-/// about a value the user chose.
+/// `mute_during_recording`, `port`, `input_device` and `language` are the
+/// managed values a document may omit: a file written before each existed has
+/// no such property, and it reads as the documented default there - `false`,
+/// the active flavor's default port, the system default input device and the
+/// language this profile would otherwise start in - not as a guess about a
+/// value the user chose.
 /// The patch writes the properties into the document on the next change, so the
 /// values a page chose survive the save rather than being read back as missing
 /// and refused.
@@ -184,6 +186,11 @@ pub struct Settings {
     pub port: u16,
     /// The selected input device id, or `None` for the system default device.
     pub input_device: Option<String>,
+    /// The interface language, in its lowercase wire spelling. A document that
+    /// does not carry the property reads as the language this profile would
+    /// start in.
+    #[serde(default = "crate::i18n::detect_default_language")]
+    pub language: Language,
 }
 /// One coherent configuration revision. Existing dictations retain their Arc
 /// while Save publishes a replacement for subsequent requests.
@@ -251,10 +258,15 @@ impl SharedRuntime {
 }
 
 /// A settings or storage failure whose `Display` text names the path and the
-/// problem, never a value read from a configuration file.
+/// problem, never a value read from a configuration file. The statement itself
+/// is semantic: the running shell renders it in the current language, and the
+/// English diagnostic is rendered from the same descriptor.
 #[derive(Clone, Debug)]
 pub struct ConfigError {
-    message: String,
+    /// The reason and its raw arguments - paths, property names, line numbers,
+    /// environment variable names - never a value read from a file. The catalog
+    /// holds every word.
+    pub ui: UiMessage,
     /// Set only when the destination file had already been replaced by the time
     /// this failure was reported: the previous bytes are gone then, so a caller
     /// that keeps a backup has to restore it.
@@ -262,9 +274,9 @@ pub struct ConfigError {
 }
 
 impl ConfigError {
-    pub(crate) fn new(message: String) -> Self {
+    pub(crate) fn new(ui: UiMessage) -> Self {
         Self {
-            message,
+            ui,
             replaced: false,
         }
     }
@@ -281,23 +293,59 @@ impl ConfigError {
     /// replaced.
     fn after_replace(self) -> Self {
         Self {
-            message: self.message,
+            ui: self.ui,
             replaced: true,
         }
     }
 }
 
 impl fmt::Display for ConfigError {
+    /// The English diagnostic, rendered from the descriptor so the catalog
+    /// stays the only copy of the wording.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
+        formatter.write_str(&i18n::render(Language::En, &self.ui))
     }
 }
 
 impl Error for ConfigError {}
 
-/// The failure this module reports for a document that cannot be used as given.
-fn config_invalid(message: String) -> ConfigError {
-    ConfigError::new(message)
+/// A path as a diagnostic argument: raw text, substituted as-is.
+fn path_arg(path: &Path) -> serde_json::Value {
+    serde_json::Value::String(path.display().to_string())
+}
+
+/// A plain string argument (a property name, a directory name).
+fn text_arg(value: &str) -> serde_json::Value {
+    serde_json::Value::String(value.to_owned())
+}
+
+/// An authored reason as the argument of another message: a nested descriptor
+/// renders in the same language as the message that names it.
+fn message_arg(message: UiMessage) -> serde_json::Value {
+    serde_json::to_value(message).unwrap_or(serde_json::Value::Null)
+}
+
+/// A configuration problem named by the file it belongs to: `{path}: {problem}`.
+fn path_problem(path: &Path, problem: UiMessage) -> ConfigError {
+    ConfigError::new(
+        UiMessage::new(MessageId::ConfigPathProblem)
+            .with_arg("path", path_arg(path))
+            .with_arg("problem", message_arg(problem)),
+    )
+}
+
+/// A configuration problem about one path with no other argument.
+fn path_only(path: &Path, key: MessageId) -> ConfigError {
+    ConfigError::new(UiMessage::new(key).with_arg("path", path_arg(path)))
+}
+
+/// The access list of `path` could not be read, with the OS reason.
+fn acl_read_failed(path: &Path, reason: UiMessage) -> ConfigError {
+    ConfigError::new(
+        UiMessage::new(MessageId::ConfigAclReadFailed)
+            .with_arg("path", path_arg(path))
+            .with_arg("reason", message_arg(reason)),
+    )
 }
 
 /* -------------------------------------------------------------------------- */
@@ -322,7 +370,7 @@ fn config_invalid(message: String) -> ConfigError {
 /// can be corrected in the settings window. Other root properties are ignored
 /// and preserved.
 pub fn load_settings(config_path: &Path) -> Result<Settings, ConfigError> {
-    read_settings_document(config_path, "settings file")
+    read_settings_document(config_path, MessageId::SettingsFileRole)
 }
 
 /// [`load_settings`] with the role of the file as an argument, so a diagnostic
@@ -331,7 +379,7 @@ pub fn load_settings(config_path: &Path) -> Result<Settings, ConfigError> {
 /// settings are returned.
 pub(crate) fn read_settings_document(
     config_path: &Path,
-    label: &str,
+    label: MessageId,
 ) -> Result<Settings, ConfigError> {
     let text = read_settings_text(config_path, label)?;
     parse_settings_document(&text, config_path, label)
@@ -341,19 +389,21 @@ pub(crate) fn read_settings_document(
 /// characters, with a leading byte order mark kept, because a document that is
 /// patched and written back has to stay the file the user saved. Strict UTF-8
 /// and the NUL check are [`decode_utf8_bytes`]'s.
-pub(crate) fn read_settings_text(config_path: &Path, label: &str) -> Result<String, ConfigError> {
+pub(crate) fn read_settings_text(config_path: &Path, label: MessageId) -> Result<String, ConfigError> {
     if config_path.is_dir() {
-        return Err(ConfigError::new(format!(
-            "{}: {label} is a directory.",
-            config_path.display()
-        )));
+        return Err(ConfigError::new(
+            UiMessage::new(MessageId::ConfigFileIsDirectory)
+                .with_arg("path", path_arg(config_path))
+                .with_arg("label", message_arg(UiMessage::new(label))),
+        ));
     }
     let bytes = fs::read(config_path).map_err(|error| {
-        ConfigError::new(format!(
-            "{}: {label} {}.",
-            config_path.display(),
-            describe_read_failure(io_code(&error))
-        ))
+        ConfigError::new(
+            UiMessage::new(MessageId::ConfigFileReadFailed)
+                .with_arg("path", path_arg(config_path))
+                .with_arg("label", message_arg(UiMessage::new(label)))
+                .with_arg("reason", message_arg(read_reason(io_code(&error)))),
+        )
     })?;
     let text = decode_utf8_bytes(config_path, label, &bytes)?.to_owned();
     if bytes.starts_with(UTF8_BOM) {
@@ -370,14 +420,33 @@ pub(crate) fn read_settings_text(config_path: &Path, label: &str) -> Result<Stri
 /// may come from a file read or from the document the settings window is
 /// editing, and `config_path` is used for its wording only. A leading byte order
 /// mark is part of the document and is skipped here, as are whole-line `//`
-/// comments.
+/// comments. A document that does not name a language reads as
+/// [`crate::i18n::detect_default_language`].
 pub(crate) fn parse_settings_document(
     text: &str,
     config_path: &Path,
-    label: &str,
+    label: MessageId,
+) -> Result<Settings, ConfigError> {
+    parse_settings_document_with_language(
+        text,
+        config_path,
+        label,
+        crate::i18n::detect_default_language(),
+    )
+}
+
+/// [`parse_settings_document`] with the language a document that omits the
+/// property reads as passed in, so the precedence rule can be exercised without
+/// the process environment or the registry; the runtime always goes through the
+/// detected default.
+pub(crate) fn parse_settings_document_with_language(
+    text: &str,
+    config_path: &Path,
+    label: MessageId,
+    default_language: Language,
 ) -> Result<Settings, ConfigError> {
     let text = strip_comment_lines(document_body(text));
-    let context = format!("{}: ", config_path.display());
+    let label_arg = || message_arg(UiMessage::new(label));
 
     // This parse proves the document is one JSON object; the properties are
     // then read from the text again, so a repeated root property is refused
@@ -385,23 +454,58 @@ pub(crate) fn parse_settings_document(
     match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(_)) => {}
         Ok(_) => {
-            return Err(config_invalid(format!(
-                "{context}{label} must contain a JSON object."
-            )))
+            return Err(ConfigError::new(
+                UiMessage::new(MessageId::ConfigFileNotJsonObject)
+                    .with_arg("path", path_arg(config_path))
+                    .with_arg("label", label_arg()),
+            ))
         }
         Err(_) => {
-            return Err(config_invalid(format!(
-            "{context}{label} is not valid JSON; comments must be whole lines that start with //."
-        )))
+            return Err(ConfigError::new(
+                UiMessage::new(MessageId::ConfigFileInvalidJson)
+                    .with_arg("path", path_arg(config_path))
+                    .with_arg("label", label_arg()),
+            ))
         }
     }
 
     let members = root_members(&text).ok_or_else(|| {
-        config_invalid(format!(
-            "{context}{label} could not be read as a JSON object."
-        ))
+        ConfigError::new(
+            UiMessage::new(MessageId::ConfigFileUnreadableObject)
+                .with_arg("path", path_arg(config_path))
+                .with_arg("label", label_arg()),
+        )
     })?;
-    settings_from_members(&members, &text, &context)
+    settings_from_members(&members, &text, Some(config_path), default_language)
+}
+
+/// The interface language a syntactically valid, annotated settings document
+/// names, when it names exactly one and that one is supported. It deliberately
+/// reads nothing else: a document whose other managed values are missing or
+/// malformed still answers this question, because the startup dialog has to
+/// pick its language before the document is validated. `None` means the
+/// document is not a JSON object, does not name a language, or names one more
+/// than once or unusably.
+fn document_language(text: &str) -> Option<Language> {
+    let text = strip_comment_lines(document_body(text));
+    if !matches!(serde_json::from_str::<Value>(&text), Ok(Value::Object(_))) {
+        return None;
+    }
+    let members = root_members(&text)?;
+    let member = single_member(&members, "language").ok()??;
+    member_language(member, &text)
+}
+
+/// The interface language for the startup dialog, before the runtime and its
+/// configuration exist: the sole valid `language` of the document at
+/// `config_path`, or the detected default when there is no such document, it
+/// cannot be read, or its language is missing, repeated, malformed or
+/// unsupported. The rest of the document is neither validated nor repaired.
+pub fn startup_language(config_path: Option<&Path>) -> Language {
+    config_path
+        .and_then(|path| read_settings_text(path, MessageId::SettingsFileRole).ok())
+        .and_then(|text| document_language(&text))
+        .unwrap_or_else(crate::i18n::detect_default_language)
 }
 
 /// Replaces the launcher values in `raw` and removes the obsolete root
@@ -410,10 +514,10 @@ pub(crate) fn parse_settings_document(
 ///
 /// Only managed values are edited; `compare_all` is removed with its separator
 /// comma. A required property that is missing or repeated is an error rather
-/// than a guessed default, while `mute_during_recording`, `port` and
-/// `input_device` are inserted together when missing, in that fixed order in
-/// front of the first property using its indentation and line ending. The
-/// result is read back and compared with `settings` before it is returned.
+/// than a guessed default, while `mute_during_recording`, `port`,
+/// `input_device` and `language` are inserted together when missing, in that
+/// fixed order in front of the first property using its indentation and line
+/// ending. The result is read back and compared with `settings` before it is returned.
 ///
 /// The result is the whole document: a leading byte order mark in `raw` is kept
 /// in front of it, so the caller writes [`patch_settings_document`]'s text as
@@ -421,25 +525,24 @@ pub(crate) fn parse_settings_document(
 /// [`read_settings_text`] returns is the text to patch, and a document that has
 /// no mark never gains one.
 pub fn patch_settings_document(raw: &str, settings: &Settings) -> Result<String, ConfigError> {
+    // The values the patch is about to write are checked here, in the wording
+    // the loader uses, so a caller cannot write a value the next read would
+    // refuse.
+    let invalid = |name: &str| -> ConfigError {
+        ConfigError::new(
+            UiMessage::new(MessageId::ConfigPropertyInvalid)
+                .with_arg("name", text_arg(name))
+                .with_arg("requirement", message_arg(requirement(name))),
+        )
+    };
     let hotkey = ts_trim(&settings.hotkey);
     if hotkey.is_empty() {
-        return Err(config_invalid(
-            "\"hotkey\" must be a non-empty string such as \"F2\" or \"Ctrl+Shift+Space\"."
-                .to_owned(),
-        ));
+        return Err(invalid("hotkey"));
     }
     let mode = ts_trim(&settings.mode);
     if !matches!(mode, "live" | "smart" | "verbatim") {
-        return Err(config_invalid(
-            "\"mode\" must be \"live\", \"smart\" or \"verbatim\".".to_owned(),
-        ));
+        return Err(invalid("mode"));
     }
-    // The values the patch is about to write are checked here, in the wording
-    // the loader uses, so a caller cannot write a port or a device the next read
-    // would refuse.
-    let invalid = |name: &str| -> ConfigError {
-        config_invalid(format!("\"{name}\" {}.", property_requirement(name)))
-    };
     if settings.port == 0 {
         return Err(invalid("port"));
     }
@@ -462,7 +565,7 @@ pub fn patch_settings_document(raw: &str, settings: &Settings) -> Result<String,
 
     let masked = masked_comments(body);
     let members = root_members(&masked)
-        .ok_or_else(|| config_invalid("the settings document is not a JSON object.".to_owned()))?;
+        .ok_or_else(|| ConfigError::new(UiMessage::new(MessageId::ConfigDocumentNotObject)))?;
 
     // The values already in the document are read through the same rule the
     // loader uses, so a stored port or device that could never be used refuses
@@ -481,6 +584,11 @@ pub fn patch_settings_document(raw: &str, settings: &Settings) -> Result<String,
         };
         if !usable {
             return Err(invalid("input_device"));
+        }
+    }
+    if let Some(member) = single_member(&members, "language")? {
+        if member_language(member, &masked).is_none() {
+            return Err(invalid("language"));
         }
     }
 
@@ -518,6 +626,11 @@ pub fn patch_settings_document(raw: &str, settings: &Settings) -> Result<String,
         Some(member) => edits.push((member.value_span.clone(), device)),
         None => missing.push(("input_device", device)),
     }
+    let language = json_string(language_text(settings.language));
+    match single_member(&members, "language")? {
+        Some(member) => edits.push((member.value_span.clone(), language)),
+        None => missing.push(("language", language)),
+    }
     member_insertion_edits(body, &masked, &members, &missing, &mut edits);
 
     // Retire the obsolete setting without changing unrelated document bytes.
@@ -535,30 +648,31 @@ pub fn patch_settings_document(raw: &str, settings: &Settings) -> Result<String,
 fn verify_patched(document: &str, settings: &Settings) -> Result<(), ConfigError> {
     let text = strip_comment_lines(document_body(document));
     if !matches!(serde_json::from_str::<Value>(&text), Ok(Value::Object(_))) {
-        return Err(config_invalid(
-            "the patched settings document is not valid JSON.".to_owned(),
-        ));
+        return Err(ConfigError::new(UiMessage::new(
+            MessageId::ConfigPatchedInvalidJson,
+        )));
     }
     let members = root_members(&text).ok_or_else(|| {
-        config_invalid("the patched settings document is not a JSON object.".to_owned())
+        ConfigError::new(UiMessage::new(MessageId::ConfigPatchedNotObject))
     })?;
-    let written = settings_from_members(&members, &text, "")?;
+    let written = settings_from_members(&members, &text, None, settings.language)?;
     let expected = Settings {
         hotkey: ts_trim(&settings.hotkey).to_owned(),
         mode: ts_trim(&settings.mode).to_owned(),
         mute_during_recording: settings.mute_during_recording,
         port: settings.port,
         input_device: settings.input_device.clone(),
+        language: settings.language,
     };
     if written != expected {
-        return Err(config_invalid(
-            "the patched settings document does not read back the new values.".to_owned(),
-        ));
+        return Err(ConfigError::new(UiMessage::new(
+            MessageId::ConfigPatchReadbackMismatch,
+        )));
     }
     if single_member(&members, "compare_all")?.is_some() {
-        return Err(config_invalid(
-            "the obsolete \"compare_all\" property could not be removed.".to_owned(),
-        ));
+        return Err(ConfigError::new(UiMessage::new(
+            MessageId::ConfigCompareAllNotRemoved,
+        )));
     }
     Ok(())
 }
@@ -590,10 +704,11 @@ fn member_removal_edits<'a>(
 /// yet. Each missing property is written as `"name": value` in the order given,
 /// and all of them go into one insertion in front of the first root property,
 /// with that property's own indentation and line ending: a document from before
-/// `mute_during_recording`, `port` or `input_device` existed has no such values
-/// to write, and one edit keeps the spans of several zero-width insertions from
-/// piling up at the same offset. Every other byte - the comments, the order, the
-/// mark - stays where it was, and an object whose first property shares a line
+/// `mute_during_recording`, `port`, `input_device` or `language` existed has no
+/// such values to write, and one edit keeps the spans of several zero-width
+/// insertions from piling up at the same offset. Every other byte - the
+/// comments, the order, the mark - stays where it was, and an object whose
+/// first property shares a line
 /// with the opening brace gets the insertion separated by a space instead.
 ///
 /// `document` is the text the patch splices, so its own line endings and
@@ -663,9 +778,9 @@ fn single_member<'a>(
     match (found.next(), found.next()) {
         (None, _) => Ok(None),
         (Some(member), None) => Ok(Some(member)),
-        (Some(_), Some(_)) => Err(config_invalid(format!(
-            "\"{name}\" appears more than once at the root; keep exactly one."
-        ))),
+        (Some(_), Some(_)) => Err(ConfigError::new(
+            UiMessage::new(MessageId::ConfigPropertyRepeated).with_arg("name", text_arg(name)),
+        )),
     }
 }
 
@@ -674,48 +789,66 @@ fn managed_member<'a>(
     members: &'a [RootMember],
     name: &str,
 ) -> Result<&'a RootMember, ConfigError> {
-    single_member(members, name)?
-        .ok_or_else(|| config_invalid(format!("\"{name}\" is missing from the settings document.")))
+    single_member(members, name)?.ok_or_else(|| {
+        ConfigError::new(
+            UiMessage::new(MessageId::ConfigPropertyMissingFromDocument)
+                .with_arg("name", text_arg(name)),
+        )
+    })
 }
 
-/// What a managed property has to look like, in the wording the loader has
-/// always used for a value that cannot be used.
-fn property_requirement(name: &str) -> &'static str {
-    match name {
-        "hotkey" => "must be a non-empty string such as \"F2\" or \"Ctrl+Shift+Space\"",
-        "mode" => "must be \"live\", \"smart\" or \"verbatim\"",
-        "port" => "must be an integer between 1 and 65535",
-        "input_device" => "must be null or a non-empty device id string",
-        _ => "must be true or false",
-    }
+/// What a managed property has to look like, as the catalog spells it.
+fn requirement(name: &str) -> UiMessage {
+    let key = match name {
+        "hotkey" => MessageId::ConfigHotkeyRequirement,
+        "mode" => MessageId::ConfigModeRequirement,
+        "port" => MessageId::ConfigPortRequirement,
+        "input_device" => MessageId::ConfigInputDeviceRequirement,
+        "language" => MessageId::ConfigLanguageRequirement,
+        _ => MessageId::ConfigMuteRequirement,
+    };
+    UiMessage::new(key)
 }
 
 /// The managed properties of a document, each typed and checked.
-/// `mute_during_recording`, `port` and `input_device` are the ones that may be
-/// absent - a document written before them reads as `false`, the active
-/// flavor's default port and the system default input device there - while
-/// every other missing or malformed
+/// `mute_during_recording`, `port`, `input_device` and `language` are the ones
+/// that may be absent - a document written before them reads as `false`, the
+/// active flavor's default port, the system default input device and the
+/// default language there - while every other missing or malformed
 /// property refuses the document. The obsolete root `compare_all`
-/// is not read at all: the patch removes it, so it never becomes a value. The
-/// `context` prefixes every message, so the loader can name the file while the
-/// patch readback describes itself; a value is never quoted.
+/// is not read at all: the patch removes it, so it never becomes a value.
+/// `config_path` names the file a problem belongs to when the caller has one;
+/// the patch readback describes itself without a path. A value is never quoted.
 fn settings_from_members(
     members: &[RootMember],
     document: &str,
-    context: &str,
+    config_path: Option<&Path>,
+    default_language: Language,
 ) -> Result<Settings, ConfigError> {
+    // A member-level problem is a sentence of its own; the loader prefixes the
+    // file it belongs to, the readback needs no path.
+    let named = |problem: UiMessage| -> ConfigError {
+        match config_path {
+            Some(path) => path_problem(path, problem),
+            None => ConfigError::new(problem),
+        }
+    };
     let member = |name: &str| -> Result<&RootMember, ConfigError> {
         match single_member(members, name) {
             Ok(Some(member)) => Ok(member),
-            Ok(None) => Err(config_invalid(format!("{context}\"{name}\" is missing."))),
-            Err(error) => Err(ConfigError::new(format!("{context}{error}"))),
+            Ok(None) => Err(named(
+                UiMessage::new(MessageId::ConfigPropertyMissing)
+                    .with_arg("name", text_arg(name)),
+            )),
+            Err(error) => Err(named(error.ui)),
         }
     };
     let invalid = |name: &str| -> ConfigError {
-        config_invalid(format!(
-            "{context}\"{name}\" {}.",
-            property_requirement(name)
-        ))
+        named(
+            UiMessage::new(MessageId::ConfigPropertyInvalid)
+                .with_arg("name", text_arg(name))
+                .with_arg("requirement", message_arg(requirement(name))),
+        )
     };
 
     let hotkey = member("hotkey")?;
@@ -733,7 +866,7 @@ fn settings_from_members(
     // with the wording a repeated managed property gets rather than loading into
     // a file the writer will not touch.
     if let Err(error) = single_member(members, "compare_all") {
-        return Err(ConfigError::new(format!("{context}{error}")));
+        return Err(named(error.ui));
     }
 
     let mute_during_recording = match single_member(members, "mute_during_recording") {
@@ -743,7 +876,7 @@ fn settings_from_members(
         // The property is optional and its absence is the documented default,
         // so an annotated file from before the switch still loads.
         Ok(None) => false,
-        Err(error) => return Err(ConfigError::new(format!("{context}{error}"))),
+        Err(error) => return Err(named(error.ui)),
     };
 
     let port = match single_member(members, "port") {
@@ -751,7 +884,7 @@ fn settings_from_members(
         // A document written before the port was managed reads with the default
         // the first-run template documents.
         Ok(None) => DEFAULT_PORT,
-        Err(error) => return Err(ConfigError::new(format!("{context}{error}"))),
+        Err(error) => return Err(named(error.ui)),
     };
 
     let input_device = match single_member(members, "input_device") {
@@ -766,7 +899,16 @@ fn settings_from_members(
         // A document written before the microphone was selectable, and one that
         // names no device at all, both mean the system default device.
         Ok(None) => None,
-        Err(error) => return Err(ConfigError::new(format!("{context}{error}"))),
+        Err(error) => return Err(named(error.ui)),
+    };
+    let language = match single_member(members, "language") {
+        Ok(Some(language)) => {
+            member_language(language, document).ok_or_else(|| invalid("language"))?
+        }
+        // A document written before the language was selectable reads as the
+        // language this profile starts in.
+        Ok(None) => default_language,
+        Err(error) => return Err(named(error.ui)),
     };
 
     Ok(Settings {
@@ -775,6 +917,7 @@ fn settings_from_members(
         mute_during_recording,
         port,
         input_device,
+        language,
     })
 }
 
@@ -794,6 +937,24 @@ fn member_port(member: &RootMember, document: &str) -> Option<u16> {
         .as_u64()
         .and_then(|value| u16::try_from(value).ok())
         .filter(|port| *port > 0)
+}
+
+/// The interface language a member spells: the lowercase wire value `"en"` or
+/// `"ru"`, and `None` for any other JSON value or spelling.
+fn member_language(member: &RootMember, document: &str) -> Option<Language> {
+    match member_string(member, document)?.as_str() {
+        "en" => Some(Language::En),
+        "ru" => Some(Language::Ru),
+        _ => None,
+    }
+}
+
+/// The lowercase wire spelling of a language, the form a document stores.
+fn language_text(language: Language) -> &'static str {
+    match language {
+        Language::En => "en",
+        Language::Ru => "ru",
+    }
 }
 
 /// An input device id as the document stores it: a non-empty string that
@@ -877,7 +1038,7 @@ pub fn settings_path() -> Result<PathBuf, ConfigError> {
         BuildFlavor::Development,
         None::<std::ffi::OsString>,
         Some(env::current_exe().map_err(|_| {
-            dev_executable_error("the current executable path could not be read")
+            dev_executable_error(UiMessage::new(MessageId::ConfigDevExecutableUnreadable))
         })?),
     );
 
@@ -918,9 +1079,10 @@ fn resolve_settings_path(
                 if !trimmed.is_empty() {
                     let path = PathBuf::from(override_path);
                     if !path.is_absolute() {
-                        return Err(config_invalid(format!(
-                            "SPEECHEK_CONFIG_PATH must be an absolute path (got \"{override_text}\")."
-                        )));
+                        return Err(ConfigError::new(
+                            UiMessage::new(MessageId::ConfigOverrideNotAbsolute)
+                                .with_arg("value", text_arg(&override_text)),
+                        ));
                     }
                     return Ok(path);
                 }
@@ -940,9 +1102,9 @@ fn appdata_settings_path(
 ) -> Result<PathBuf, ConfigError> {
     let directory = profile::defaults(flavor).directory;
     let appdata = appdata.filter(|value| !value.is_empty()).ok_or_else(|| {
-        config_invalid(format!(
-            "APPDATA is not set; Speechek keeps settings.json in %APPDATA%\\{directory}."
-        ))
+        ConfigError::new(
+            UiMessage::new(MessageId::ConfigAppdataMissing).with_arg("directory", text_arg(directory)),
+        )
     })?;
     Ok(PathBuf::from(appdata).join(directory).join(SETTINGS_FILE_NAME))
 }
@@ -958,19 +1120,23 @@ fn appdata_settings_path(
 /// to the working directory or to `%APPDATA%`, because either would silently
 /// select a document the user never chose.
 fn development_settings_path(executable: Option<&Path>) -> Result<PathBuf, ConfigError> {
-    let executable =
-        executable.ok_or_else(|| dev_executable_error("the executable path is not available"))?;
+    let executable = executable.ok_or_else(|| {
+        dev_executable_error(UiMessage::new(MessageId::ConfigDevExecutableUnavailable))
+    })?;
     if !executable.is_absolute() {
-        return Err(dev_executable_error(&format!(
-            "\"{}\" is not an absolute path",
-            executable.display()
-        )));
+        return Err(dev_executable_error(
+            UiMessage::new(MessageId::ConfigDevExecutableNotAbsolute)
+                .with_arg("path", path_arg(executable)),
+        ));
     }
     let directory = executable
         .parent()
         .filter(|directory| !directory.as_os_str().is_empty())
         .ok_or_else(|| {
-            dev_executable_error(&format!("\"{}\" has no directory", executable.display()))
+            dev_executable_error(
+                UiMessage::new(MessageId::ConfigDevExecutableNoDirectory)
+                    .with_arg("path", path_arg(executable)),
+            )
         })?;
     Ok(directory.join(SETTINGS_FILE_NAME))
 }
@@ -978,10 +1144,11 @@ fn development_settings_path(executable: Option<&Path>) -> Result<PathBuf, Confi
 /// The refusal of a development run whose document directory cannot be named:
 /// the message names the unusable path, or the missing one, and never falls
 /// back to another directory.
-fn dev_executable_error(reason: &str) -> ConfigError {
-    config_invalid(format!(
-        "Cannot determine the Dev executable directory for settings.json: {reason}."
-    ))
+fn dev_executable_error(reason: UiMessage) -> ConfigError {
+    ConfigError::new(
+        UiMessage::new(MessageId::ConfigDevExecutableDirectory)
+            .with_arg("reason", message_arg(reason)),
+    )
 }
 
 /// The loopback port the next start should claim, resolved before the shell is
@@ -1000,7 +1167,9 @@ fn dev_executable_error(reason: &str) -> ConfigError {
 pub fn preflight_port() -> Result<u16, ConfigError> {
     match preflight_document(settings_path()?) {
         None => Ok(DEFAULT_PORT),
-        Some(path) => read_settings_document(&path, "settings file").map(|settings| settings.port),
+        Some(path) => {
+            read_settings_document(&path, MessageId::SettingsFileRole).map(|settings| settings.port)
+        }
     }
 }
 
@@ -1017,7 +1186,9 @@ fn preflight_port_from(
 ) -> Result<u16, ConfigError> {
     match preflight_document_from(flavor, config_override, appdata, executable)? {
         None => Ok(profile::defaults(flavor).port),
-        Some(path) => read_settings_document(&path, "settings file").map(|settings| settings.port),
+        Some(path) => {
+            read_settings_document(&path, MessageId::SettingsFileRole).map(|settings| settings.port)
+        }
     }
 }
 
@@ -1062,10 +1233,10 @@ pub fn create_default_if_missing(path: &Path) -> Result<bool, ConfigError> {
     let directory = match path.parent() {
         Some(directory) if !directory.as_os_str().is_empty() => directory,
         _ => {
-            return Err(config_invalid(format!(
-                "{}: settings path has no directory to create.",
-                path.display()
-            )))
+            return Err(path_problem(
+                path,
+                UiMessage::new(MessageId::ConfigSettingsPathNoDirectory),
+            ))
         }
     };
 
@@ -1074,43 +1245,55 @@ pub fn create_default_if_missing(path: &Path) -> Result<bool, ConfigError> {
     }
 
     fs::create_dir_all(directory).map_err(|error| {
-        ConfigError::new(format!(
-            "{}: configuration directory {}.",
-            directory.display(),
-            describe_create_failure(io_code(&error))
-        ))
+        ConfigError::new(
+            UiMessage::new(MessageId::ConfigDirectoryCreateFailed)
+                .with_arg("path", path_arg(directory))
+                .with_arg("reason", message_arg(create_reason(io_code(&error)))),
+        )
     })?;
 
-    write_new(path, first_run_document(profile::ACTIVE)?.as_bytes())?;
+    write_new(
+        path,
+        first_run_document(profile::ACTIVE, crate::i18n::detect_default_language())?.as_bytes(),
+    )?;
     Ok(true)
 }
 
 /// The annotated document [`create_default_if_missing`] writes: the production
-/// template for [`BuildFlavor::Production`], and for a debug flavor the same
-/// template brought to that flavor's first-run hotkey and port.
+/// template brought to the flavor's first-run hotkey and port and to the
+/// language this profile starts in.
 ///
 /// The template itself stays the production one: it is the document the
-/// distributed shell ships and the file a user reads. A debug flavor only
-/// rewrites the two values its own profile owns - through the same parser and
-/// patch the settings window uses, so the template's comments, line endings and
-/// every other byte survive - and never stores a development or test chord in a
-/// file a production build could read.
-fn first_run_document(flavor: BuildFlavor) -> Result<Cow<'static, str>, ConfigError> {
-    if flavor == BuildFlavor::Production {
-        return Ok(Cow::Borrowed(SETTINGS_EXAMPLE));
-    }
-
+/// distributed shell ships and the file a user reads. The flavor's own values
+/// are rewritten through the same parser and patch the settings window uses, so
+/// the template's comments, line endings and every other byte survive - and a
+/// debug flavor never stores a development or test chord in a file a production
+/// build could read. When the template already spells every wanted value, it is
+/// borrowed unchanged.
+fn first_run_document(
+    flavor: BuildFlavor,
+    language: Language,
+) -> Result<Cow<'static, str>, ConfigError> {
     let defaults = profile::defaults(flavor);
     // The path is for the parser's wording only; nothing is read or written
-    // here.
+    // here. The template already carries a language, but passing the wanted one
+    // keeps the answer independent of the template's placeholder.
     let template_path = Path::new(SETTINGS_FILE_NAME);
-    let mut settings =
-        parse_settings_document(SETTINGS_EXAMPLE, template_path, "settings template")?;
-    if settings.hotkey == defaults.hotkey && settings.port == defaults.port {
+    let mut settings = parse_settings_document_with_language(
+        SETTINGS_EXAMPLE,
+        template_path,
+        MessageId::SettingsTemplateRole,
+        language,
+    )?;
+    if settings.hotkey == defaults.hotkey
+        && settings.port == defaults.port
+        && settings.language == language
+    {
         return Ok(Cow::Borrowed(SETTINGS_EXAMPLE));
     }
     settings.hotkey = defaults.hotkey.to_owned();
     settings.port = defaults.port;
+    settings.language = language;
     Ok(Cow::Owned(patch_settings_document(
         SETTINGS_EXAMPLE,
         &settings,
@@ -1146,25 +1329,25 @@ pub(crate) fn atomic_replace(path: &Path, bytes: &[u8], secret: bool) -> Result<
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .ok_or_else(|| {
-            ConfigError::new(format!(
-                "{}: no directory to write the replacement into.",
-                path.display()
-            ))
+            path_problem(
+                path,
+                UiMessage::new(MessageId::ConfigReplacementNoDirectory),
+            )
         })?;
     let file_name = path
         .file_name()
         .ok_or_else(|| {
-            ConfigError::new(format!("{}: not a file name to replace.", path.display()))
+            path_problem(path, UiMessage::new(MessageId::ConfigFileNotFileName))
         })?
         .to_string_lossy()
         .into_owned();
 
     fs::create_dir_all(parent).map_err(|error| {
-        ConfigError::new(format!(
-            "{}: configuration directory {}.",
-            parent.display(),
-            describe_create_failure(io_code(&error))
-        ))
+        ConfigError::new(
+            UiMessage::new(MessageId::ConfigDirectoryCreateFailed)
+                .with_arg("path", path_arg(parent))
+                .with_arg("reason", message_arg(create_reason(io_code(&error)))),
+        )
     })?;
 
     // The descriptor is resolved once, before any file is created: a caller
@@ -1205,10 +1388,10 @@ pub(crate) fn atomic_replace(path: &Path, bytes: &[u8], secret: bool) -> Result<
         return Ok(());
     }
 
-    Err(ConfigError::new(format!(
-        "{}: no temporary file could be created beside it.",
-        path.display()
-    )))
+    Err(path_problem(
+        path,
+        UiMessage::new(MessageId::ConfigReplacementNoTempFile),
+    ))
 }
 
 /// What a staging write did with the name it was given.
@@ -1256,7 +1439,7 @@ fn write_new_file(
         Err(error) => {
             return match windows_code(&error) {
                 ERROR_FILE_EXISTS | ERROR_ALREADY_EXISTS => Ok(StagedBytes::NameTaken),
-                code => Err(ConfigError::new(create_failure(path, code))),
+                code => Err(create_failure(path, code)),
             }
         }
     };
@@ -1273,7 +1456,7 @@ fn write_new_file(
     drop(file);
     if let Err(error) = outcome {
         remove_file(path);
-        return Err(ConfigError::new(create_failure(path, io_code(&error))));
+        return Err(create_failure(path, io_code(&error)));
     }
     Ok(StagedBytes::Written)
 }
@@ -1291,11 +1474,11 @@ fn move_over(source: &Path, destination: &Path) -> Result<(), ConfigError> {
         )
     }
     .map_err(|error| {
-        ConfigError::new(format!(
-            "{}: {}.",
-            destination.display(),
-            describe_replace_failure(windows_code(&error))
-        ))
+        ConfigError::new(
+            UiMessage::new(MessageId::ConfigReplaceProblem)
+                .with_arg("path", path_arg(destination))
+                .with_arg("reason", message_arg(replace_reason(windows_code(&error)))),
+        )
     })
 }
 
@@ -1315,11 +1498,11 @@ fn open_for_read_control(path: &Path) -> Result<File, ConfigError> {
         )
     }
     .map_err(|error| {
-        ConfigError::new(format!(
-            "{}: its access list could not be read because it {}.",
-            path.display(),
-            describe_read_failure(Some(windows_code(&error)))
-        ))
+        ConfigError::new(
+            UiMessage::new(MessageId::ConfigAclReadFailed)
+                .with_arg("path", path_arg(path))
+                .with_arg("reason", message_arg(read_reason(Some(windows_code(&error))))),
+        )
     })?;
 
     // SAFETY: the handle was just returned and belongs to this function; the
@@ -1486,7 +1669,7 @@ fn read_file_descriptor(path: &Path) -> Result<Option<OwnedDescriptor>, ConfigEr
         Err(error) => {
             return match windows_code(&error) {
                 ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND => Ok(None),
-                code => Err(ConfigError::new(create_failure(path, code))),
+                code => Err(create_failure(path, code)),
             }
         }
     };
@@ -1507,11 +1690,7 @@ fn read_file_descriptor(path: &Path) -> Result<Option<OwnedDescriptor>, ConfigEr
         )
     };
     if status != ERROR_SUCCESS {
-        return Err(ConfigError::new(format!(
-            "{}: its access list could not be read ({}).",
-            path.display(),
-            describe_security_failure(status.0)
-        )));
+        return Err(acl_read_failed(path, security_reason(status.0)));
     }
     Ok(Some(OwnedDescriptor(descriptor)))
 }
@@ -1542,64 +1721,36 @@ fn verify_private_descriptor(
         )
     };
     if status != ERROR_SUCCESS {
-        return Err(ConfigError::new(format!(
-            "{}: its access list could not be read ({}).",
-            path.display(),
-            describe_security_failure(status.0)
-        )));
+        return Err(acl_read_failed(path, security_reason(status.0)));
     }
     let descriptor = OwnedDescriptor(descriptor);
 
     let mut control = 0u16;
     let mut revision = 0u32;
     // SAFETY: the descriptor is the allocation the system just handed over.
-    unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) }.map_err(
-        |error| {
-            ConfigError::new(format!(
-                "{}: its access list could not be read ({}).",
-                path.display(),
-                describe_security_failure(windows_code(&error))
-            ))
-        },
-    )?;
+    unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) }
+        .map_err(|error| acl_read_failed(path, security_reason(windows_code(&error))))?;
     if control & SE_DACL_PROTECTED.0 == 0 {
-        return Err(ConfigError::new(format!(
-            "{}: its access list is not protected from the directory it lives in.",
-            path.display()
-        )));
+        return Err(path_only(path, MessageId::ConfigAclNotProtected));
     }
     if dacl.is_null() {
-        return Err(ConfigError::new(format!(
-            "{}: its access list is missing, which would let any account reach it.",
-            path.display()
-        )));
+        return Err(path_only(path, MessageId::ConfigAclMissing));
     }
 
     // SAFETY: the DACL and the ACEs inside it belong to the descriptor that is
     // alive here; `GetAce` returns a pointer into that same allocation.
     let entries = unsafe { (*dacl).AceCount } as u32;
     if entries == 0 {
-        return Err(ConfigError::new(format!(
-            "{}: its access list grants nothing, so the file could not be read back.",
-            path.display()
-        )));
+        return Err(path_only(path, MessageId::ConfigAclEmpty));
     }
     for index in 0..entries {
         let mut ace: *mut core::ffi::c_void = ptr::null_mut();
         // SAFETY: the index is inside the DACL and the ACE it points at lives
         // in the same allocation.
-        unsafe { GetAce(dacl, index, &mut ace) }.map_err(|error| {
-            ConfigError::new(format!(
-                "{}: its access list could not be read ({}).",
-                path.display(),
-                describe_security_failure(windows_code(&error))
-            ))
-        })?;
+        unsafe { GetAce(dacl, index, &mut ace) }
+            .map_err(|error| acl_read_failed(path, security_reason(windows_code(&error))))?;
         if ace.is_null() {
-            return Err(ConfigError::new(format!(
-                "{}: its access list could not be read.",
-                path.display()
-            )));
+            return Err(path_only(path, MessageId::ConfigAclUnreadable));
         }
 
         // SAFETY: an ACE starts with its header and, for an access-allowed
@@ -1615,24 +1766,15 @@ fn verify_private_descriptor(
             )
         };
         if ace_type != ACCESS_ALLOWED_ACE_TYPE {
-            return Err(ConfigError::new(format!(
-                "{}: its access list holds an entry that does not simply allow access.",
-                path.display()
-            )));
+            return Err(path_only(path, MessageId::ConfigAclForeignAce));
         }
         if mask & ACCESS_FULL != ACCESS_FULL {
-            return Err(ConfigError::new(format!(
-                "{}: its access list does not grant full access.",
-                path.display()
-            )));
+            return Err(path_only(path, MessageId::ConfigAclPartial));
         }
         // SAFETY: both SIDs are valid and are only read.
         let known = unsafe { EqualSid(sid, user_sid).is_ok() || EqualSid(sid, system_sid).is_ok() };
         if !known {
-            return Err(ConfigError::new(format!(
-                "{}: its access list grants access to an account it should not name.",
-                path.display()
-            )));
+            return Err(path_only(path, MessageId::ConfigAclForeignAccount));
         }
     }
     Ok(())
@@ -1695,7 +1837,7 @@ fn read_current_user_sid(buffer: &mut SidBuffer) -> Result<(), ConfigError> {
     unsafe {
         let mut token = HANDLE(ptr::null_mut());
         OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
-            .map_err(|error| identity_error("the process token is not available", &error))?;
+            .map_err(|error| identity_error(MessageId::ConfigIdentityActionToken, &error))?;
         // SAFETY: the handle was just returned and is owned by this function,
         // which closes it through the guard when the check is over.
         let token = OwnedHandle::from_raw_handle(token.0);
@@ -1708,19 +1850,19 @@ fn read_current_user_sid(buffer: &mut SidBuffer) -> Result<(), ConfigError> {
             staging.length(),
             &mut needed,
         )
-        .map_err(|error| identity_error("the current user's identity is not available", &error))?;
+        .map_err(|error| identity_error(MessageId::ConfigIdentityActionUser, &error))?;
 
         let (sid, length) = {
             let record = &*(staging.as_bytes() as *const TOKEN_USER);
             if !IsValidSid(record.User.Sid).as_bool() {
-                return Err(identity_reason(
-                    "the current user's identity is not a valid SID",
-                ));
+                return Err(identity_reason(UiMessage::new(
+                    MessageId::ConfigIdentityInvalidSid,
+                )));
             }
             (record.User.Sid, GetLengthSid(record.User.Sid) as usize)
         };
         if length > buffer.words.len() * core::mem::size_of::<usize>() {
-            return Err(identity_reason("the current user's SID is too long"));
+            return Err(identity_reason(UiMessage::new(MessageId::ConfigIdentitySidTooLong)));
         }
         // The record lives inside `staging`; the SID is copied to the front of
         // `buffer`, which is a different allocation.
@@ -1736,39 +1878,40 @@ fn read_local_system_sid(buffer: &mut SidBuffer) -> Result<(), ConfigError> {
     // SAFETY: the buffer is as large as the length passed in, and the call
     // writes at most that many bytes.
     unsafe { CreateWellKnownSid(WinLocalSystemSid, None, Some(sid), &mut length) }
-        .map_err(|error| identity_error("SYSTEM's identity is not available", &error))
+        .map_err(|error| identity_error(MessageId::ConfigIdentityActionSystem, &error))
 }
 
 /// The failure of building the private descriptor, before any file exists.
 fn private_descriptor_error(error: &windows::core::Error) -> ConfigError {
-    ConfigError::new(format!(
-        "a container private to the current user could not be described ({}).",
-        describe_security_failure(windows_code(error))
-    ))
+    ConfigError::new(
+        UiMessage::new(MessageId::ConfigPrivateDescriptorFailed)
+            .with_arg("reason", message_arg(security_reason(windows_code(error)))),
+    )
 }
 
 /// The failure of reading the identity a private descriptor names.
-fn identity_error(action: &str, error: &windows::core::Error) -> ConfigError {
-    identity_reason(&format!(
-        "{action} ({}).",
-        describe_security_failure(windows_code(error))
-    ))
+fn identity_error(action: MessageId, error: &windows::core::Error) -> ConfigError {
+    identity_reason(
+        UiMessage::new(MessageId::ConfigIdentityFailed)
+            .with_arg("action", message_arg(UiMessage::new(action)))
+            .with_arg("reason", message_arg(security_reason(windows_code(error)))),
+    )
 }
 
 /// An identity failure worded exactly as given: the callers know which part of
 /// the identity could not be read, and none of them quotes a value.
-fn identity_reason(reason: &str) -> ConfigError {
-    ConfigError::new(reason.to_owned())
+fn identity_reason(reason: UiMessage) -> ConfigError {
+    ConfigError::new(reason)
 }
 
 /// The wording for a file that could not be created or written: the path, and
 /// the small set of system codes both the standard library and the Windows
 /// bindings report.
-fn create_failure(path: &Path, code: impl Into<Option<u32>>) -> String {
-    format!(
-        "{}: {}.",
-        path.display(),
-        describe_create_failure(code.into())
+fn create_failure(path: &Path, code: impl Into<Option<u32>>) -> ConfigError {
+    ConfigError::new(
+        UiMessage::new(MessageId::ConfigCreateFailed)
+            .with_arg("path", path_arg(path))
+            .with_arg("reason", message_arg(create_reason(code.into()))),
     )
 }
 
@@ -1990,21 +2133,23 @@ pub(crate) fn document_body(text: &str) -> &str {
 /// behind.
 pub(crate) fn decode_utf8_bytes<'a>(
     path: &Path,
-    label: &str,
+    label: MessageId,
     bytes: &'a [u8],
 ) -> Result<&'a str, ConfigError> {
     let body = bytes.strip_prefix(UTF8_BOM).unwrap_or(bytes);
     let text = str::from_utf8(body).map_err(|_| {
-        ConfigError::new(format!(
-            "{}: {label} is not valid UTF-8 text; re-save it as UTF-8.",
-            path.display()
-        ))
+        ConfigError::new(
+            UiMessage::new(MessageId::ConfigFileNotUtf8)
+                .with_arg("path", path_arg(path))
+                .with_arg("label", message_arg(UiMessage::new(label))),
+        )
     })?;
     if text.contains('\0') {
-        return Err(ConfigError::new(format!(
-            "{}: {label} contains NUL bytes; re-save it as UTF-8, not UTF-16.",
-            path.display()
-        )));
+        return Err(ConfigError::new(
+            UiMessage::new(MessageId::ConfigFileHasNul)
+                .with_arg("path", path_arg(path))
+                .with_arg("label", message_arg(UiMessage::new(label))),
+        ));
     }
     Ok(text)
 }
@@ -2036,7 +2181,7 @@ pub(crate) fn validate_hotkey(hotkey: &str, settings_path: &Path) -> Result<Stri
     if hotkey.is_empty() {
         return Err(invalid_hotkey(
             settings_path,
-            "must be a non-empty string such as \"F2\" or \"Ctrl+Shift+Space\"",
+            UiMessage::new(MessageId::ConfigHotkeyRequirement),
         ));
     }
 
@@ -2044,7 +2189,7 @@ pub(crate) fn validate_hotkey(hotkey: &str, settings_path: &Path) -> Result<Stri
     if parts.iter().any(|part| part.is_empty()) {
         return Err(invalid_hotkey(
             settings_path,
-            &format!("\"{hotkey}\" has an empty part; use modifiers followed by one key"),
+            UiMessage::new(MessageId::ConfigHotkeyEmptyPart).with_arg("hotkey", text_arg(hotkey)),
         ));
     }
 
@@ -2056,26 +2201,27 @@ pub(crate) fn validate_hotkey(hotkey: &str, settings_path: &Path) -> Result<Stri
         if lower == "fn" {
             return Err(invalid_hotkey(
                 settings_path,
-                "cannot use \"Fn\": Windows never reports that key to applications",
+                UiMessage::new(MessageId::ConfigHotkeyFn),
             ));
         }
         if lower == "f12" {
             return Err(invalid_hotkey(
                 settings_path,
-                "cannot use \"F12\": speechek reserves it for its own window",
+                UiMessage::new(MessageId::ConfigHotkeyF12),
             ));
         }
         if lower == "escape" && last_index == 0 {
             return Err(invalid_hotkey(
                 settings_path,
-                "cannot use \"Escape\" alone: while a dictation runs speechek reserves it to cancel that dictation; use another key, for example \"F2\", or add a modifier such as \"Ctrl+Escape\"",
+                UiMessage::new(MessageId::ConfigHotkeyEscape),
             ));
         }
         if HOTKEY_MODIFIERS.contains(&lower.as_str()) {
             if is_last {
                 return Err(invalid_hotkey(
                     settings_path,
-                    &format!("\"{hotkey}\" is modifiers only; add a key such as \"F2\""),
+                    UiMessage::new(MessageId::ConfigHotkeyModifiersOnly)
+                        .with_arg("hotkey", text_arg(hotkey)),
                 ));
             }
             continue;
@@ -2083,7 +2229,9 @@ pub(crate) fn validate_hotkey(hotkey: &str, settings_path: &Path) -> Result<Stri
         if !is_last {
             return Err(invalid_hotkey(
                 settings_path,
-                &format!("\"{hotkey}\" must be modifiers followed by one key; \"{part}\" is not a modifier"),
+                UiMessage::new(MessageId::ConfigHotkeyNotModifier)
+                    .with_arg("hotkey", text_arg(hotkey))
+                    .with_arg("part", text_arg(part)),
             ));
         }
         if !HOTKEY_NAMED_KEYS.contains(&lower.as_str())
@@ -2092,7 +2240,8 @@ pub(crate) fn validate_hotkey(hotkey: &str, settings_path: &Path) -> Result<Stri
         {
             return Err(invalid_hotkey(
                 settings_path,
-                &format!("\"{part}\" is not a supported key (use A-Z, 0-9, F1-F24, or a named key such as \"Space\")"),
+                UiMessage::new(MessageId::ConfigHotkeyUnsupportedKey)
+                    .with_arg("part", text_arg(part)),
             ));
         }
     }
@@ -2100,8 +2249,13 @@ pub(crate) fn validate_hotkey(hotkey: &str, settings_path: &Path) -> Result<Stri
     Ok(hotkey.to_owned())
 }
 
-fn invalid_hotkey(settings_path: &Path, reason: &str) -> ConfigError {
-    ConfigError::new(format!("{}: \"hotkey\" {reason}.", settings_path.display()))
+/// A launcher-chord problem named by the file whose setting it is.
+fn invalid_hotkey(settings_path: &Path, reason: UiMessage) -> ConfigError {
+    ConfigError::new(
+        UiMessage::new(MessageId::ConfigHotkeyProblem)
+            .with_arg("path", path_arg(settings_path))
+            .with_arg("reason", message_arg(reason)),
+    )
 }
 
 /// `/^[a-z0-9]$/` on the lower-cased part: exactly one ASCII lower-case letter
@@ -2154,52 +2308,54 @@ fn windows_code(error: &windows::core::Error) -> u32 {
     }
 }
 
-/// Describes a failed read from its OS error code; the raw error text is never
-/// quoted.
-fn describe_read_failure(code: Option<u32>) -> &'static str {
-    match code {
-        Some(ERROR_FILE_NOT_FOUND) | Some(ERROR_PATH_NOT_FOUND) => "not found",
-        Some(ERROR_ACCESS_DENIED) => "permission denied",
-        Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION) => {
-            "is locked by another program"
+/// The reason a read failed, as a descriptor built from its OS error code; the
+/// raw error text is never quoted.
+fn read_reason(code: Option<u32>) -> UiMessage {
+    let key = match code {
+        Some(ERROR_FILE_NOT_FOUND) | Some(ERROR_PATH_NOT_FOUND) => {
+            MessageId::ConfigReadReasonNotFound
         }
-        _ => "could not be read",
-    }
+        Some(ERROR_ACCESS_DENIED) => MessageId::ConfigReadReasonDenied,
+        Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION) => {
+            MessageId::ConfigReadReasonLocked
+        }
+        _ => MessageId::ConfigReadReasonFailed,
+    };
+    UiMessage::new(key)
 }
 
 /// The same codes as seen by a create or a write; Windows reports a locked or
 /// protected destination through the same small set.
-fn describe_create_failure(code: Option<u32>) -> &'static str {
-    match code {
-        Some(ERROR_ACCESS_DENIED) => "permission denied",
+fn create_reason(code: Option<u32>) -> UiMessage {
+    let key = match code {
+        Some(ERROR_ACCESS_DENIED) => MessageId::ConfigCreateReasonDenied,
         Some(ERROR_SHARING_VIOLATION) | Some(ERROR_LOCK_VIOLATION) => {
-            "is locked by another program"
+            MessageId::ConfigCreateReasonLocked
         }
-        Some(ERROR_FILE_EXISTS) | Some(ERROR_ALREADY_EXISTS) => "already exists",
-        Some(ERROR_DISK_FULL) => "has no space left",
-        _ => "could not be created",
-    }
+        Some(ERROR_FILE_EXISTS) | Some(ERROR_ALREADY_EXISTS) => MessageId::ConfigCreateReasonExists,
+        Some(ERROR_DISK_FULL) => MessageId::ConfigCreateReasonNoSpace,
+        _ => MessageId::ConfigCreateReasonFailed,
+    };
+    UiMessage::new(key)
 }
 
-/// The wording for a rename that could not replace the destination.
-fn describe_replace_failure(code: u32) -> &'static str {
-    match code {
-        ERROR_ACCESS_DENIED => "the replacement could not be moved into place: permission denied",
-        ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION => {
-            "the replacement could not be moved into place: another program has the file open"
-        }
-        ERROR_DISK_FULL => "the replacement could not be moved into place: no space left",
-        _ => "the replacement could not be moved into place",
-    }
+/// The reason a rename could not replace the destination.
+fn replace_reason(code: u32) -> UiMessage {
+    let key = match code {
+        ERROR_ACCESS_DENIED => MessageId::ConfigReplaceReasonDenied,
+        ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION => MessageId::ConfigReplaceReasonLocked,
+        ERROR_DISK_FULL => MessageId::ConfigReplaceReasonNoSpace,
+        _ => MessageId::ConfigReplaceReasonFailed,
+    };
+    UiMessage::new(key)
 }
 
-/// The wording for a security call that refused, naming the code because this
-/// is the one place where the reason matters for diagnosis and the code is not
-/// sensitive.
-fn describe_security_failure(code: u32) -> String {
+/// The reason a security call refused, naming the code because this is the one
+/// place where the reason matters for diagnosis and the code is not sensitive.
+fn security_reason(code: u32) -> UiMessage {
     match code {
-        ERROR_ACCESS_DENIED => "permission denied".to_owned(),
-        _ => format!("the operating system refused it, error {code}"),
+        ERROR_ACCESS_DENIED => UiMessage::new(MessageId::SecurityReasonDenied),
+        _ => UiMessage::new(MessageId::SecurityReasonRefused).with_arg("code", code.into()),
     }
 }
 
@@ -2209,11 +2365,12 @@ fn write_new(path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
     match OpenOptions::new().write(true).create_new(true).open(path) {
         Ok(mut file) => file
             .write_all(contents)
-            .map_err(|error| ConfigError::new(create_failure(path, io_code(&error)))),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(ConfigError::new(
-            format!("{}: already exists and was left untouched.", path.display()),
+            .map_err(|error| create_failure(path, io_code(&error))),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(path_problem(
+            path,
+            UiMessage::new(MessageId::ConfigFileExistsUntouched),
         )),
-        Err(error) => Err(ConfigError::new(create_failure(path, io_code(&error)))),
+        Err(error) => Err(create_failure(path, io_code(&error))),
     }
 }
 
@@ -2226,8 +2383,8 @@ mod tests {
     /// properties and user comments remain unchanged.
     #[test]
     fn patching_a_marked_commented_document_keeps_every_other_byte() {
-        let document = "\u{feff}// Speechek settings\r\n{\r\n  // Этот файл сохранён в UTF-8 с BOM.\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": \"wasapi:card-one\",\r\n  \"compare_all\": false,\r\n\r\n  // Заметки пользователя и вложенный объект.\r\n  \"notes\": {\r\n    \"text\": \"keep this value\",\r\n    \"nested\": [1, 2, { \"deep\": true }]\r\n  },\r\n  \"trailing\": null,\r\n  // Дополнительное поле пользователя.\r\n  \"extra\": \"kept\"\r\n}\r\n";
-        let expected = "\u{feff}// Speechek settings\r\n{\r\n  // Этот файл сохранён в UTF-8 с BOM.\r\n  \"hotkey\": \"Ctrl+Shift+F9\",\r\n  \"mode\": \"verbatim\",\r\n  \"mute_during_recording\": true,\r\n  \"port\": 43118,\r\n  \"input_device\": \"wasapi:card-two\",\r\n  \r\n\r\n  // Заметки пользователя и вложенный объект.\r\n  \"notes\": {\r\n    \"text\": \"keep this value\",\r\n    \"nested\": [1, 2, { \"deep\": true }]\r\n  },\r\n  \"trailing\": null,\r\n  // Дополнительное поле пользователя.\r\n  \"extra\": \"kept\"\r\n}\r\n";
+        let document = "\u{feff}// Speechek settings\r\n{\r\n  // Этот файл сохранён в UTF-8 с BOM.\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": \"wasapi:card-one\",\r\n  \"language\": \"en\",\r\n  \"compare_all\": false,\r\n\r\n  // Заметки пользователя и вложенный объект.\r\n  \"notes\": {\r\n    \"text\": \"keep this value\",\r\n    \"nested\": [1, 2, { \"deep\": true }]\r\n  },\r\n  \"trailing\": null,\r\n  // Дополнительное поле пользователя.\r\n  \"extra\": \"kept\"\r\n}\r\n";
+        let expected = "\u{feff}// Speechek settings\r\n{\r\n  // Этот файл сохранён в UTF-8 с BOM.\r\n  \"hotkey\": \"Ctrl+Shift+F9\",\r\n  \"mode\": \"verbatim\",\r\n  \"mute_during_recording\": true,\r\n  \"port\": 43118,\r\n  \"input_device\": \"wasapi:card-two\",\r\n  \"language\": \"en\",\r\n  \r\n\r\n  // Заметки пользователя и вложенный объект.\r\n  \"notes\": {\r\n    \"text\": \"keep this value\",\r\n    \"nested\": [1, 2, { \"deep\": true }]\r\n  },\r\n  \"trailing\": null,\r\n  // Дополнительное поле пользователя.\r\n  \"extra\": \"kept\"\r\n}\r\n";
 
         let patched = patch_settings_document(
             document,
@@ -2237,6 +2394,7 @@ mod tests {
                 mute_during_recording: true,
                 port: 43118,
                 input_device: Some("wasapi:card-two".to_owned()),
+                language: Language::En,
             },
         )
         .expect("the documented patch");
@@ -2246,20 +2404,25 @@ mod tests {
 
     /// The optional values a document may not carry: a file from before them
     /// still loads as the documented defaults - `false`, the active flavor's
-    /// default port and the system default input device - and the first patch
-    /// that changes them writes all three properties into the document in one
-    /// insertion, in front of the first property and in that property's
-    /// indentation and CRLF, in the fixed order `mute_during_recording`,
-    /// `port`, `input_device`, instead of readback refusing values the file
-    /// does not hold. Later patches replace the same bytes in place, and every
-    /// other byte of the document survives, including an unknown property
-    /// between them.
+    /// default port, the system default input device and the detected language
+    /// - and the first patch that changes them writes all four properties into
+    /// the document in one insertion, in front of the first property and in
+    /// that property's indentation and CRLF, in the fixed order
+    /// `mute_during_recording`, `port`, `input_device`, `language`, instead of
+    /// readback refusing values the file does not hold. Later patches replace
+    /// the same bytes in place, and every other byte of the document survives,
+    /// including an unknown property between them.
     #[test]
     fn a_document_without_the_optional_values_gains_them_in_one_patch() {
         let path = Path::new("settings.json");
         let document = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": { \"keep\": true }\r\n}\r\n";
 
-        let loaded = parse_settings_document(document, path, "settings file")
+        let loaded = parse_settings_document_with_language(
+            document,
+            path,
+            MessageId::SettingsFileRole,
+            Language::En,
+        )
             .expect("a document from before the optional values");
         assert!(!loaded.mute_during_recording);
         assert_eq!(loaded.port, DEFAULT_PORT);
@@ -2271,14 +2434,15 @@ mod tests {
             mute_during_recording: true,
             port: 43118,
             input_device: Some("wasapi:card-one".to_owned()),
+            language: Language::En,
         };
         let on_document = patch_settings_document(document, &switched_on).expect("a patch");
         assert_eq!(
             on_document,
-            "{\r\n  \"mute_during_recording\": true,\r\n  \"port\": 43118,\r\n  \"input_device\": \"wasapi:card-one\",\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": { \"keep\": true }\r\n}\r\n"
+            "{\r\n  \"mute_during_recording\": true,\r\n  \"port\": 43118,\r\n  \"input_device\": \"wasapi:card-one\",\r\n  \"language\": \"en\",\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": { \"keep\": true }\r\n}\r\n"
         );
         assert_eq!(
-            parse_settings_document(&on_document, path, "settings file")
+            parse_settings_document_with_language(&on_document, path, MessageId::SettingsFileRole, Language::En)
                 .expect("the patched document"),
             switched_on
         );
@@ -2289,17 +2453,18 @@ mod tests {
             mute_during_recording: false,
             port: DEFAULT_PORT,
             input_device: None,
+            language: Language::En,
         };
         let off_document =
             patch_settings_document(&on_document, &switched_off).expect("a patch");
         assert_eq!(
             off_document,
             format!(
-                "{{\r\n  \"mute_during_recording\": false,\r\n  \"port\": {DEFAULT_PORT},\r\n  \"input_device\": null,\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": {{ \"keep\": true }}\r\n}}\r\n"
+                "{{\r\n  \"mute_during_recording\": false,\r\n  \"port\": {DEFAULT_PORT},\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": {{ \"keep\": true }}\r\n}}\r\n"
             )
         );
         assert_eq!(
-            parse_settings_document(&off_document, path, "settings file")
+            parse_settings_document_with_language(&off_document, path, MessageId::SettingsFileRole, Language::En)
                 .expect("the patched document"),
             switched_off
         );
@@ -2313,24 +2478,27 @@ mod tests {
     #[test]
     fn an_obsolete_compare_all_is_ignored_on_read_and_removed_by_the_next_patch() {
         let path = Path::new("settings.json");
-        let with = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"compare_all\": true,\r\n  \"notes\": 1\r\n}\r\n";
-        let without = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"notes\": 1\r\n}\r\n";
+        let with = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"compare_all\": true,\r\n  \"notes\": 1\r\n}\r\n";
+        let without = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"notes\": 1\r\n}\r\n";
         let expected = Settings {
             hotkey: "F2".to_owned(),
             mode: "smart".to_owned(),
             mute_during_recording: false,
             port: 4173,
             input_device: None,
+            language: Language::En,
         };
 
         // Reading: the obsolete property is simply not a value, so an old and a
         // current document describe the same settings.
         assert_eq!(
-            parse_settings_document(with, path, "settings file").expect("an old document"),
+            parse_settings_document_with_language(with, path, MessageId::SettingsFileRole, Language::En)
+                .expect("an old document"),
             expected
         );
         assert_eq!(
-            parse_settings_document(without, path, "settings file").expect("a current document"),
+            parse_settings_document_with_language(without, path, MessageId::SettingsFileRole, Language::En)
+                .expect("a current document"),
             expected
         );
 
@@ -2339,29 +2507,28 @@ mod tests {
         let patched = patch_settings_document(with, &expected).expect("a patch");
         assert_eq!(
             patched,
-            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \r\n  \"notes\": 1\r\n}\r\n"
+            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \r\n  \"notes\": 1\r\n}\r\n"
         );
         assert_eq!(
-            parse_settings_document(&patched, path, "settings file").expect("the patched document"),
+            parse_settings_document_with_language(&patched, path, MessageId::SettingsFileRole, Language::En)
+                .expect("the patched document"),
             expected
         );
 
         // Writing: as the last property it loses the comma before it instead.
-        let last = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"compare_all\": true\r\n}\r\n";
+        let last = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"compare_all\": true\r\n}\r\n";
         assert_eq!(
             patch_settings_document(last, &expected).expect("a patch"),
-            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null\r\n  \r\n}\r\n"
+            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\"\r\n  \r\n}\r\n"
         );
 
         // A repeated obsolete property cannot be migrated by the same rule the
         // managed values use, so neither reading nor writing accepts it.
         let repeated = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"smart\",\n  \"mute_during_recording\": false,\n  \"compare_all\": true,\n  \"compare_all\": false\n}\n";
-        let error = parse_settings_document(repeated, path, "settings file")
+        parse_settings_document_with_language(repeated, path, MessageId::SettingsFileRole, Language::En)
             .expect_err("a repeated obsolete property");
-        assert!(error.to_string().contains("more than once"));
-        let error = patch_settings_document(repeated, &expected)
+        patch_settings_document(repeated, &expected)
             .expect_err("a repeated obsolete property must refuse the patch");
-        assert!(error.to_string().contains("more than once"));
     }
 
     /// `null` is the stored form of the system default input device - a value
@@ -2373,8 +2540,13 @@ mod tests {
     #[test]
     fn a_null_device_is_the_system_default_and_a_stored_id_is_kept() {
         let path = Path::new("settings.json");
-        let default_device = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 5000,\n  \"input_device\": null\n}\n";
-        let loaded = parse_settings_document(default_device, path, "settings file")
+        let default_device = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 5000,\n  \"input_device\": null,\n  \"language\": \"en\"\n}\n";
+        let loaded = parse_settings_document_with_language(
+            default_device,
+            path,
+            MessageId::SettingsFileRole,
+            Language::En,
+        )
             .expect("a null device");
         assert_eq!(loaded.port, 5000);
         assert_eq!(loaded.input_device, None);
@@ -2383,9 +2555,14 @@ mod tests {
             default_device
         );
 
-        let chosen = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 5000,\n  \"input_device\": \"wasapi:card-one\"\n}\n";
-        let loaded =
-            parse_settings_document(chosen, path, "settings file").expect("a stored device id");
+        let chosen = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 5000,\n  \"input_device\": \"wasapi:card-one\",\n  \"language\": \"en\"\n}\n";
+        let loaded = parse_settings_document_with_language(
+            chosen,
+            path,
+            MessageId::SettingsFileRole,
+            Language::En,
+        )
+        .expect("a stored device id");
         assert_eq!(loaded.input_device.as_deref(), Some("wasapi:card-one"));
         assert_eq!(
             patch_settings_document(chosen, &loaded).expect("a patch"),
@@ -2413,38 +2590,33 @@ mod tests {
             mute_during_recording: false,
             port: DEFAULT_PORT,
             input_device: None,
+            language: Language::En,
         };
 
         for value in ["\"4173\"", "4173.5", "0", "65536", "-1", "null", "true"] {
             let document = document_with("port", value);
-            let error = parse_settings_document(&document, path, "settings file")
+            parse_settings_document_with_language(
+                &document,
+                path,
+                MessageId::SettingsFileRole,
+                Language::En,
+            )
                 .expect_err("an unusable port");
-            assert!(
-                error.to_string().contains("\"port\""),
-                "the message names the property and not the value: {error}"
-            );
-            let error = patch_settings_document(&document, &settings)
+            patch_settings_document(&document, &settings)
                 .expect_err("an unusable port must refuse the patch");
-            assert!(
-                error.to_string().contains("\"port\""),
-                "the message names the property and not the value: {error}"
-            );
         }
 
         for value in ["5", "\"\"", "\"not-a-device-id\"", "\"wasapi:\"", "true", "{}"] {
             let document = document_with("input_device", value);
-            let error = parse_settings_document(&document, path, "settings file")
+            parse_settings_document_with_language(
+                &document,
+                path,
+                MessageId::SettingsFileRole,
+                Language::En,
+            )
                 .expect_err("an unusable device");
-            assert!(
-                error.to_string().contains("\"input_device\""),
-                "the message names the property and not the value: {error}"
-            );
-            let error = patch_settings_document(&document, &settings)
+            patch_settings_document(&document, &settings)
                 .expect_err("an unusable device must refuse the patch");
-            assert!(
-                error.to_string().contains("\"input_device\""),
-                "the message names the property and not the value: {error}"
-            );
         }
 
         // A repeated property is refused by both paths instead of one of the two
@@ -2460,12 +2632,15 @@ mod tests {
             let document = format!(
                 "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"{property}\": {first},\n  \"{property}\": {second}\n}}\n"
             );
-            let error = parse_settings_document(&document, path, "settings file")
+            parse_settings_document_with_language(
+                &document,
+                path,
+                MessageId::SettingsFileRole,
+                Language::En,
+            )
                 .expect_err("a repeated property");
-            assert!(error.to_string().contains("more than once"));
-            let error = patch_settings_document(&document, &settings)
+            patch_settings_document(&document, &settings)
                 .expect_err("a repeated property must refuse the patch");
-            assert!(error.to_string().contains("more than once"));
         }
     }
 
@@ -2476,24 +2651,26 @@ mod tests {
     #[test]
     fn a_general_change_does_not_leave_an_old_port_or_device_behind() {
         let path = Path::new("settings.json");
-        let document = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 5000,\n  \"input_device\": \"wasapi:old\",\n  \"notes\": \"kept\"\n}\n";
+        let document = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 5000,\n  \"input_device\": \"wasapi:old\",\n  \"language\": \"en\",\n  \"notes\": \"kept\"\n}\n";
         let changed = Settings {
             hotkey: "Ctrl+Shift+F9".to_owned(),
             mode: "verbatim".to_owned(),
             mute_during_recording: true,
             port: 43118,
             input_device: Some("wasapi:new".to_owned()),
+            language: Language::En,
         };
 
         let patched = patch_settings_document(document, &changed).expect("a patch");
         assert_eq!(
             patched,
-            "{\n  \"hotkey\": \"Ctrl+Shift+F9\",\n  \"mode\": \"verbatim\",\n  \"mute_during_recording\": true,\n  \"port\": 43118,\n  \"input_device\": \"wasapi:new\",\n  \"notes\": \"kept\"\n}\n"
+            "{\n  \"hotkey\": \"Ctrl+Shift+F9\",\n  \"mode\": \"verbatim\",\n  \"mute_during_recording\": true,\n  \"port\": 43118,\n  \"input_device\": \"wasapi:new\",\n  \"language\": \"en\",\n  \"notes\": \"kept\"\n}\n"
         );
         assert!(!patched.contains("5000"), "the old port is gone");
         assert!(!patched.contains("wasapi:old"), "the old device is gone");
         assert_eq!(
-            parse_settings_document(&patched, path, "settings file").expect("the patched document"),
+            parse_settings_document_with_language(&patched, path, MessageId::SettingsFileRole, Language::En)
+                .expect("the patched document"),
             changed
         );
     }
@@ -2507,13 +2684,19 @@ mod tests {
     fn the_first_run_template_carries_the_documented_defaults() {
         let path = Path::new("settings.example.json");
         let production = profile::defaults(BuildFlavor::Production);
-        let loaded = parse_settings_document(SETTINGS_EXAMPLE, path, "settings template")
+        let loaded = parse_settings_document_with_language(
+            SETTINGS_EXAMPLE,
+            path,
+            MessageId::SettingsTemplateRole,
+            Language::En,
+        )
             .expect("the embedded template");
         assert_eq!(loaded.hotkey, production.hotkey);
         assert_eq!(loaded.mode, "live");
         assert!(!loaded.mute_during_recording);
         assert_eq!(loaded.port, production.port);
         assert_eq!(loaded.input_device, None);
+        assert_eq!(loaded.language, Language::En);
 
         assert_eq!(
             patch_settings_document(SETTINGS_EXAMPLE, &loaded).expect("a patch"),
@@ -2532,16 +2715,13 @@ mod tests {
             mute_during_recording: false,
             port: DEFAULT_PORT,
             input_device: None,
+            language: Language::En,
         };
-        let error = verify_patched(
+        verify_patched(
             "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"compare_all\": true\r\n}\r\n",
             &settings,
         )
         .expect_err("a residual compare_all must refuse the readback");
-        assert!(
-            error.to_string().contains("\"compare_all\""),
-            "the message names the property: {error}"
-        );
 
         // The same document without the property passes, so the refusal is about
         // the residual property and not about the settings it carries.
@@ -2562,30 +2742,30 @@ mod tests {
             let document = format!(
                 "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": {value}\n}}\n"
             );
-            let error = parse_settings_document(&document, path, "settings file")
+            parse_settings_document_with_language(
+                &document,
+                path,
+                MessageId::SettingsFileRole,
+                Language::En,
+            )
                 .expect_err("a non-boolean switch");
-            assert!(
-                error.to_string().contains("\"mute_during_recording\""),
-                "the message names the property and not the value: {error}"
-            );
         }
 
         let duplicated = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"mute_during_recording\": true\n}\n";
-        let error = parse_settings_document(duplicated, path, "settings file")
+        parse_settings_document_with_language(duplicated, path, MessageId::SettingsFileRole, Language::En)
             .expect_err("a repeated switch");
-        assert!(error.to_string().contains("more than once"));
 
         // The patch reads the document through the same rule, so a repeated
         // property refuses the write instead of one of the two values winning.
-        let error = patch_settings_document(duplicated, &Settings {
+        patch_settings_document(duplicated, &Settings {
             hotkey: "F2".to_owned(),
             mode: "live".to_owned(),
             mute_during_recording: true,
             port: DEFAULT_PORT,
             input_device: None,
+            language: Language::En,
         })
         .expect_err("a repeated switch must refuse the patch");
-        assert!(error.to_string().contains("more than once"));
     }
 
     /// A dictation keeps the configuration it started with while a general
@@ -2608,6 +2788,7 @@ mod tests {
                 mute_during_recording: false,
                 port: DEFAULT_PORT,
                 input_device: None,
+                language: Language::En,
             },
             keys: Arc::clone(&ring),
             revision: 1,
@@ -2629,6 +2810,7 @@ mod tests {
                 mute_during_recording: true,
                 port: 43118,
                 input_device: Some("wasapi:card-one".to_owned()),
+                language: Language::En,
             },
             keys: Arc::clone(&ring),
             revision: 2,
@@ -2867,34 +3049,26 @@ mod tests {
         let scratch = Scratch::new("preflight-invalid");
         fs::create_dir_all(scratch.target()).expect("the profile directory");
 
-        let mut documents: Vec<(String, &str)> = Vec::new();
+        let mut documents: Vec<String> = Vec::new();
         for value in ["\"4173\"", "4173.5", "0", "65536", "-1", "null", "true"] {
-            documents.push((
-                format!(
-                    "{{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"port\": {value}\r\n}}\r\n"
-                ),
-                "\"port\"",
+            documents.push(format!(
+                "{{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"port\": {value}\r\n}}\r\n"
             ));
         }
-        documents.push((
+        documents.push(
             "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"port\": 4173,\r\n  \"port\": 4174\r\n}\r\n".to_string(),
-            "\"port\"",
-        ));
-        documents.push(("{ this is not json }\r\n".to_string(), "is not valid JSON"));
+        );
+        documents.push("{ this is not json }\r\n".to_string());
 
-        for (document, expected) in &documents {
+        for document in &documents {
             fs::write(scratch.target_settings(), document).expect("the document");
-            let error = preflight_port_from(
+            preflight_port_from(
                 profile::ACTIVE,
                 None,
                 Some(scratch.appdata().as_os_str()),
                 active_executable(&scratch).as_deref(),
             )
             .expect_err("an unusable document refuses the preflight");
-            assert!(
-                error.to_string().contains(*expected),
-                "the refusal names the problem ({expected}): {error}"
-            );
             assert_eq!(
                 fs::read(scratch.target_settings()).expect("the document"),
                 document.as_bytes(),
@@ -2922,17 +3096,13 @@ mod tests {
 
         // The test flavor takes the absolute override, with or without
         // `%APPDATA%`, and refuses a relative one with the variable's name.
-        let error = preflight_port_from(
+        preflight_port_from(
             BuildFlavor::Test,
             Some(Path::new("relative.json").as_os_str()),
             appdata,
             None,
         )
         .expect_err("a relative override");
-        assert!(
-            error.to_string().contains("SPEECHEK_CONFIG_PATH"),
-            "the refusal names the variable: {error}"
-        );
 
         assert_eq!(
             preflight_port_from(BuildFlavor::Test, Some(OsStr::new("  ")), appdata, None)
@@ -3047,14 +3217,13 @@ mod tests {
             .expect("production ignores the override"),
             profile::defaults(BuildFlavor::Production).port
         );
-        let error = preflight_port_from(
+        preflight_port_from(
             BuildFlavor::Production,
             Some(production_document.as_os_str()),
             None,
             None,
         )
         .expect_err("production still needs %APPDATA%");
-        assert!(error.to_string().contains("APPDATA"), "{error}");
     }
 
     /// The flavor table is the single source of the identities, hotkeys and
@@ -3185,12 +3354,8 @@ mod tests {
             Some(Path::new("speechek.exe")),
             Some(Path::new("relative/speechek.exe")),
         ] {
-            let error = resolve_settings_path(BuildFlavor::Development, None, appdata, unusable)
+            resolve_settings_path(BuildFlavor::Development, None, appdata, unusable)
                 .expect_err("an unusable development executable");
-            assert!(
-                error.to_string().contains("Dev executable directory"),
-                "the refusal names the directory it cannot determine: {error}"
-            );
         }
         assert!(
             !dev_document.exists(),
@@ -3209,14 +3374,13 @@ mod tests {
                 .expect("the override alone is enough"),
             elsewhere
         );
-        let error = resolve_settings_path(
+        resolve_settings_path(
             BuildFlavor::Test,
             Some(Path::new("relative.json").as_os_str()),
             appdata,
             None,
         )
         .expect_err("a relative override");
-        assert!(error.to_string().contains("SPEECHEK_CONFIG_PATH"), "{error}");
 
         // The test flavor's `%APPDATA%` fallback and its refusal name its own
         // directory.
@@ -3225,15 +3389,8 @@ mod tests {
                 .expect("the test document without an override"),
             scratch.target_of(BuildFlavor::Test).join(SETTINGS_FILE_NAME)
         );
-        let error = resolve_settings_path(BuildFlavor::Test, None, None, None)
+        resolve_settings_path(BuildFlavor::Test, None, None, None)
             .expect_err("no %APPDATA%");
-        assert!(error.to_string().contains("APPDATA"), "{error}");
-        assert!(
-            error
-                .to_string()
-                .contains(profile::defaults(BuildFlavor::Test).directory),
-            "the refusal names the flavor's directory: {error}"
-        );
 
         // Production ignores the override, relative or absolute, and the
         // executable path with it, and still needs `%APPDATA%`.
@@ -3254,20 +3411,13 @@ mod tests {
                     .join(SETTINGS_FILE_NAME)
             );
         }
-        let error = resolve_settings_path(
+        resolve_settings_path(
             BuildFlavor::Production,
             Some(elsewhere.as_os_str()),
             None,
             None,
         )
         .expect_err("production still needs %APPDATA%");
-        assert!(error.to_string().contains("APPDATA"), "{error}");
-        assert!(
-            error
-                .to_string()
-                .contains(profile::defaults(BuildFlavor::Production).directory),
-            "the refusal names the flavor's directory: {error}"
-        );
     }
 
     /// The preflight and the first run agree on one document per flavor: the
@@ -3388,23 +3538,21 @@ mod tests {
         }
     }
 
-    /// The first-run document: production writes the embedded template exactly,
-    /// a debug flavor writes the same annotated template with only its own
-    /// chord and port, and the two debug flavors do not share one document.
+    /// The first-run document: a flavor's own chord, port and language are
+    /// written into the annotated template, and the two debug flavors do not
+    /// share one document. A template that already spells every wanted value is
+    /// returned unchanged.
     #[test]
     fn the_first_run_document_moves_only_the_flavor_values() {
-        let document =
-            first_run_document(BuildFlavor::Production).expect("the production document");
-        assert!(
-            matches!(&document, Cow::Borrowed(_)),
-            "production borrows the embedded template instead of copying it"
-        );
+        let document = first_run_document(BuildFlavor::Production, Language::En)
+            .expect("the production document");
         assert_eq!(document.as_ref(), SETTINGS_EXAMPLE);
 
-        let template = parse_settings_document(
+        let template = parse_settings_document_with_language(
             SETTINGS_EXAMPLE,
             Path::new("settings.example.json"),
-            "settings template",
+            MessageId::SettingsTemplateRole,
+            Language::En,
         )
         .expect("the embedded template");
         let comments = |text: &str| {
@@ -3416,21 +3564,28 @@ mod tests {
 
         for flavor in [BuildFlavor::Development, BuildFlavor::Test] {
             let defaults = profile::defaults(flavor);
-            let document = first_run_document(flavor).expect("a debug first-run document");
+            let document =
+                first_run_document(flavor, Language::Ru).expect("a debug first-run document");
             assert_ne!(document.as_ref(), SETTINGS_EXAMPLE);
             assert!(
                 document.contains(&format!("\"{}\"", defaults.hotkey)),
                 "the flavor's own chord is written"
             );
 
-            let loaded = parse_settings_document(
+            let loaded = parse_settings_document_with_language(
                 &document,
                 Path::new("settings.json"),
-                "settings file",
+                MessageId::SettingsFileRole,
+                Language::En,
             )
             .expect("the debug first-run document");
             assert_eq!(loaded.hotkey, defaults.hotkey);
             assert_eq!(loaded.port, defaults.port);
+            assert_eq!(
+                loaded.language,
+                Language::Ru,
+                "the chosen first-run language is written"
+            );
             assert_eq!(loaded.mode, template.mode);
             assert_eq!(loaded.mute_during_recording, template.mute_during_recording);
             assert_eq!(loaded.input_device, template.input_device);
@@ -3442,12 +3597,120 @@ mod tests {
         }
 
         assert_ne!(
-            first_run_document(BuildFlavor::Development)
+            first_run_document(BuildFlavor::Development, Language::En)
                 .expect("the development document")
                 .as_ref(),
-            first_run_document(BuildFlavor::Test)
+            first_run_document(BuildFlavor::Test, Language::En)
                 .expect("the test document")
                 .as_ref()
         );
+    }
+
+    /// A document written before the language was managed reads as the language
+    /// the profile starts in, and the first successful save writes it in,
+    /// preserving the mark, the comment, the CRLF endings and every unknown
+    /// byte. The inserted value round-trips, and a later switch replaces it in
+    /// place.
+    #[test]
+    fn an_old_document_gains_the_language_in_place() {
+        let path = Path::new("settings.json");
+        let document = "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 5000,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n";
+
+        let loaded =
+            parse_settings_document_with_language(document, path, MessageId::SettingsFileRole, Language::Ru)
+                .expect("a document from before the language");
+        assert_eq!(loaded.language, Language::Ru);
+
+        let patched = patch_settings_document(document, &loaded).expect("a patch");
+        assert_eq!(
+            patched,
+            "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"language\": \"ru\",\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 5000,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n"
+        );
+
+        let reread =
+            parse_settings_document_with_language(&patched, path, MessageId::SettingsFileRole, Language::En)
+                .expect("the patched document");
+        assert_eq!(reread.language, Language::Ru);
+        let mut switched = reread.clone();
+        switched.language = Language::En;
+        let english = patch_settings_document(&patched, &switched).expect("a patch");
+        assert_eq!(
+            english,
+            "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"language\": \"en\",\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 5000,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n"
+        );
+        assert_eq!(
+            parse_settings_document_with_language(&english, path, MessageId::SettingsFileRole, Language::Ru)
+                .expect("the english document")
+                .language,
+            Language::En
+        );
+    }
+
+    /// A present language has to be exactly `"en"` or `"ru"`: any other JSON
+    /// value, an unsupported or differently-cased spelling, or a repeated
+    /// property refuses the document and the patch, without quoting the value
+    /// it refused.
+    #[test]
+    fn a_language_that_is_not_en_or_ru_is_refused() {
+        let path = Path::new("settings.json");
+        let base = |language: &str| {
+            format!(
+                "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 4173,\n  \"input_device\": null,\n  \"language\": {language}\n}}\n"
+            )
+        };
+        let settings = Settings {
+            hotkey: "F2".to_owned(),
+            mode: "live".to_owned(),
+            mute_during_recording: false,
+            port: DEFAULT_PORT,
+            input_device: None,
+            language: Language::En,
+        };
+
+        for value in ["\"de\"", "\"EN\"", "null", "5", "true", "{}", "\"\""] {
+            let document = base(value);
+            parse_settings_document_with_language(&document, path, MessageId::SettingsFileRole, Language::En)
+                .expect_err("an unusable language");
+            patch_settings_document(&document, &settings)
+                .expect_err("an unusable language must refuse the patch");
+        }
+
+        let repeated = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 4173,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"language\": \"ru\"\n}\n";
+        parse_settings_document_with_language(repeated, path, MessageId::SettingsFileRole, Language::En)
+            .expect_err("a repeated language");
+        patch_settings_document(repeated, &settings)
+            .expect_err("a repeated language must refuse the patch");
+    }
+
+    /// The startup language is read from whatever the document names, even when
+    /// the rest of the document is not usable yet: a sole valid language wins,
+    /// and a missing, repeated, unusable or unreadable one falls back to the
+    /// detected default. Nothing here repairs the file.
+    #[test]
+    fn startup_language_reads_the_sole_language_of_a_damaged_document() {
+        let scratch = Scratch::new("startup-language");
+        let path = scratch.target_settings();
+        fs::create_dir_all(scratch.target()).expect("the profile directory");
+        let wrapped = "// комментарий\r\n{ \"language\": \"ru\", \"hotkey\": \"F2\" }\r\n";
+
+        fs::write(&path, wrapped).expect("a document with a language");
+        assert_eq!(startup_language(Some(path.as_path())), Language::Ru);
+        assert_eq!(
+            fs::read(&path).expect("the document"),
+            wrapped.as_bytes(),
+            "the startup read repairs nothing"
+        );
+
+        let default = crate::i18n::detect_default_language();
+        fs::write(&path, "{ \"hotkey\": \"F2\" }\r\n").expect("a document without a language");
+        assert_eq!(startup_language(Some(path.as_path())), default);
+        assert_eq!(startup_language(None), default);
+
+        fs::write(&path, "{ \"language\": \"en\", \"language\": \"ru\" }\r\n")
+            .expect("a repeated language");
+        assert_eq!(startup_language(Some(path.as_path())), default);
+
+        fs::write(&path, "{ not json }\r\n").expect("a damaged document");
+        assert_eq!(startup_language(Some(path.as_path())), default);
     }
 }

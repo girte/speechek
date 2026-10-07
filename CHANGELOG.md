@@ -7,6 +7,19 @@ The text of each GitHub Release is generated from the matching version section b
 
 ## [Unreleased]
 
+### Added
+
+- Full English/Russian app localization with a **Language / Язык интерфейса** selector above both settings tabs; a successful choice is saved and applied immediately to native windows, the lab, overlay, tray, titles, hints and messages without restarting, stopping recording or losing the API-key draft. Speech and transcripts are not translated, and the NSIS installer/uninstaller language is unchanged. A separately opened browser lab refreshes on activation. ([#1](https://github.com/girte/speechek/issues/1))
+- GUI-free localization maintenance control before the owner preview: shared catalog validation, static UI message-key and argument checks, advisory direct-text warnings, and a Git-only changed-message report with review notices for edits in only some languages. Native UI/text smoke and owner approval remain manual; no translation service or per-string approval state is introduced. ([#3](https://github.com/girte/speechek/issues/3))
+
+### Changed
+
+- Settings now store `language` as `en` or `ru`. Initial selection uses the saved app choice, then a supported English/Russian installer choice, then the Windows UI language (Russian primary language selects Russian; all others select English). Missing, unreadable, malformed or unsupported installer values fall back to Windows; Development ignores installer registry values, and Test reads only its isolated entry. Older files without `language` use the detected default without a startup rewrite; the next successful settings write inserts the field, while a no-op apply without a write leaves the file unchanged.
+
+### Fixed
+
+- Smart and Verbatim transcription no longer shows Google's raw HTTP 400 thinking-setting rejection. That failure is now the localized hint to switch to **Live Smart** in settings while the problem stays on Google's side; the request payload is unchanged, so neither mode sends a thinking field, and Live Smart is unaffected.
+
 ## [0.2.1] - 2026-10-02
 
 ### Changed

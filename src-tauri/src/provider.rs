@@ -5,8 +5,9 @@
 //! Wire behavior is pinned:
 //!
 //! * Files API resumable upload: `Provider::upload_audio_file`.
-//! * Interactions transcription call: `Provider::transcribe_uploaded_file`,
-//!   with `extract_interaction_text` reading the transcript.
+//! * Interactions transcription body: `interaction_payload`, sent by
+//!   `Provider::transcribe_uploaded_file`, with `extract_interaction_text`
+//!   reading the transcript.
 //! * Cleanup DELETE: `Provider::delete_uploaded_file`.
 //! * Request deadlines and Google error mapping: `send_checked` and
 //!   `google_failure`.
@@ -26,10 +27,10 @@
 //! * An upload never outlives its request; the DELETE is best effort and its
 //!   failure never changes the transcription result.
 //! * Every message that can leave this module passes through
-//!   [`crate::backend::redact`], so a configured key cannot escape through a
-//!   response body or a log line. The key itself only travels in the
-//!   `x-goog-api-key` header and, for Live, as a percent-encoded query
-//!   parameter of the URL built by `Provider::live_url`.
+//!   [`crate::backend::redact`] with the request-selected ring, so a configured
+//!   key cannot escape through a response body or a log line. The chosen key
+//!   itself only travels in the `x-goog-api-key` header and, for Live, as a
+//!   percent-encoded query parameter of the URL built by `Provider::live_url`.
 //! * A key check reports one fixed category and builds no message at all: the
 //!   page it reads is only classified, so no Google body, URL or key can reach a
 //!   response or a log line, and a check never rotates the ring.
@@ -44,6 +45,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::backend::{redact, ApiError};
+use crate::i18n::{MessageId, UiMessage};
 use crate::secrets::SecretKey;
 
 /// Google's Generative Language API over HTTPS. Production builds never talk
@@ -81,8 +83,6 @@ const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 /// without reading a model or touching a recording.
 const MODELS_CHECK_PATH: &str = "/v1beta/models?pageSize=1";
 
-/// Appended verbatim to mapped 401/403 failures.
-const AUTH_HINT: &str = " The Gemini API key used for this request was rejected by Google.";
 
 /* -------------------------------------------------------------------------- */
 /* Key check outcome                                                          */
@@ -116,19 +116,13 @@ pub enum CheckFailure {
 }
 
 impl CheckFailure {
-    /// The fixed line the page shows for this reason.
-    pub fn message(self) -> String {
+    pub fn ui(self) -> UiMessage {
         match self {
-            CheckFailure::Network => "Не удалось завершить проверку: сеть недоступна".to_owned(),
-            CheckFailure::RateLimited => {
-                "Не удалось завершить проверку: превышен лимит запросов".to_owned()
-            }
-            CheckFailure::Malformed => {
-                "Не удалось завершить проверку: ответ сервиса не распознан".to_owned()
-            }
-            CheckFailure::Status(status) => {
-                format!("Не удалось завершить проверку: сервис ответил кодом {status}")
-            }
+            CheckFailure::Network => UiMessage::new(MessageId::KeyCheckNetwork),
+            CheckFailure::RateLimited => UiMessage::new(MessageId::KeyCheckRateLimited),
+            CheckFailure::Malformed => UiMessage::new(MessageId::KeyCheckMalformed),
+            CheckFailure::Status(status) => UiMessage::new(MessageId::KeyCheckStatus)
+                .with_arg("status", json!(status)),
         }
     }
 }
@@ -221,6 +215,7 @@ impl Provider {
     pub async fn transcribe(
         &self,
         key: &Arc<SecretKey>,
+        keys: &[Arc<SecretKey>],
         mode: &str,
         wav: Vec<u8>,
     ) -> Result<String, ApiError> {
@@ -231,14 +226,14 @@ impl Provider {
                 return Err(ApiError::new(
                     400,
                     "INVALID_MODE",
-                    "mode must be 'smart' or 'verbatim'.",
+                    UiMessage::new(MessageId::InvalidMode),
                 ));
             }
         };
 
-        // The recording is bound to one key, so redaction only ever needs that
-        // one: a borrowed one-element slice, never a copy of the secret.
-        let keys = std::slice::from_ref(key);
+        // Transport still uses exactly one chosen key. Diagnostic redaction
+        // borrows the entire request-selected ring before any truncation, so a
+        // Google body cannot expose a prefix of another key in that revision.
 
         let uploaded = self.upload_audio_file(key, keys, wav).await?;
         let result = self
@@ -274,7 +269,7 @@ impl Provider {
             .body(json!({ "file": { "display_name": DISPLAY_NAME } }).to_string());
         let start_response = send_checked(
             start,
-            "Could not start the file upload",
+            MessageId::GoogleUploadStartFailed,
             keys,
             UPLOAD_START_TIMEOUT,
         )
@@ -292,7 +287,7 @@ impl Provider {
             return Err(ApiError::new(
                 502,
                 "UPSTREAM_ERROR",
-                "Gemini did not return an upload URL.",
+                UiMessage::new(MessageId::UploadUrlMissing),
             ));
         };
 
@@ -306,7 +301,7 @@ impl Provider {
             .body(bytes);
         let uploaded = send_checked(
             finalize,
-            "Could not upload the recording",
+            MessageId::GoogleUploadFailed,
             keys,
             UPLOAD_FINALIZE_TIMEOUT,
         )
@@ -327,7 +322,7 @@ impl Provider {
             return Err(ApiError::new(
                 502,
                 "UPSTREAM_ERROR",
-                "Gemini upload response is missing the file name or URI.",
+                UiMessage::new(MessageId::UploadFileMetadataMissing),
             ));
         };
         if file
@@ -338,7 +333,7 @@ impl Provider {
             return Err(ApiError::new(
                 502,
                 "UPSTREAM_ERROR",
-                "Gemini rejected the uploaded recording.",
+                UiMessage::new(MessageId::UploadRejected),
             ));
         }
         Ok(UploadedFile {
@@ -347,10 +342,10 @@ impl Provider {
         })
     }
 
-    /// Interactions API transcription: uploaded file URI, the mode object
-    /// (`"smart"` or `{"type":"verbatim"}`), `language_codes: []` for automatic
-    /// detection and `store: false`. The transcript is `output_text`; when it is
-    /// blank, the text parts of `outputs` and then of `steps` content are used.
+    /// Interactions API transcription: the body built by [`interaction_payload`],
+    /// pinned to `gemini-3.5-transcribe`. The transcript is `output_text`; when
+    /// it is blank, the text parts of `outputs` and then of `steps` content are
+    /// used.
     async fn transcribe_uploaded_file(
         &self,
         key: &Arc<SecretKey>,
@@ -363,30 +358,22 @@ impl Provider {
             .post(format!("{}{}", self.http_base, INTERACTIONS_PATH))
             .header("x-goog-api-key", key.as_str())
             .header("content-type", "application/json")
-            .body(
-                json!({
-                    "model": BATCH_MODEL,
-                    "input": [{ "type": "audio", "uri": file_uri, "mime_type": WAV_MIME_TYPE }],
-                    "generation_config": {
-                        "transcription_config": { "mode": mode_payload, "language_codes": [] },
-                    },
-                    "store": false,
-                })
-                .to_string(),
-            );
+            .body(interaction_payload(file_uri, mode_payload).to_string());
         let response =
-            send_checked(request, "Transcription failed", keys, INTERACTION_TIMEOUT).await?;
+            send_checked(request, MessageId::GoogleTranscriptionFailed, keys, INTERACTION_TIMEOUT).await?;
 
         let payload: Option<Value> = response.json::<Value>().await.ok().filter(Value::is_object);
         let Some(payload) = payload else {
             return Err(ApiError::new(
                 502,
                 "UPSTREAM_ERROR",
-                "Gemini returned an unreadable transcription response.",
+                UiMessage::new(MessageId::TranscriptionUnreadable),
             ));
         };
         if let Some(failure) = upstream_error_message(&payload) {
-            return Err(ApiError::new(502, "UPSTREAM_ERROR", redact(&failure, keys)));
+            return Err(ApiError::new(502, "UPSTREAM_ERROR",
+                UiMessage::new(MessageId::GoogleRequestFailed)
+                    .with_arg("detail", json!(redact(&failure, keys)))));
         }
 
         let text = extract_interaction_text(&payload);
@@ -394,14 +381,13 @@ impl Provider {
             let status = payload
                 .get("status")
                 .and_then(Value::as_str)
-                .unwrap_or("unknown");
+                .map(|status| json!(redact(status, keys)))
+                .unwrap_or_else(|| json!(UiMessage::new(MessageId::InteractionStatusUnknown)));
             return Err(ApiError::new(
                 502,
                 "EMPTY_TRANSCRIPT",
-                redact(
-                    &format!("Gemini returned an empty transcript (interaction status: {status})."),
-                    keys,
-                ),
+                UiMessage::new(MessageId::EmptyTranscript)
+                    .with_arg("status", status),
             ));
         }
         Ok(text)
@@ -436,6 +422,22 @@ impl Provider {
     }
 }
 
+/// The exact `POST /v1beta/interactions` body for one transcription, field for
+/// field: the uploaded file URI, the mode (`"smart"` or `{"type":"verbatim"}`),
+/// `language_codes: []` for automatic detection and `store: false`. Kept as one
+/// function so the wire shape is pinned by the tests below instead of drifting
+/// here.
+fn interaction_payload(file_uri: &str, mode_payload: Value) -> Value {
+    json!({
+        "model": BATCH_MODEL,
+        "input": [{ "type": "audio", "uri": file_uri, "mime_type": WAV_MIME_TYPE }],
+        "generation_config": {
+            "transcription_config": { "mode": mode_payload, "language_codes": [] },
+        },
+        "store": false,
+    })
+}
+
 /// The uploaded file that `finally` has to delete.
 struct UploadedFile {
     name: String,
@@ -446,7 +448,7 @@ struct UploadedFile {
 /// (including an aborted timeout) to `UPSTREAM_UNREACHABLE`.
 async fn send_checked(
     request: reqwest::RequestBuilder,
-    detail: &str,
+    action: MessageId,
     keys: &[Arc<SecretKey>],
     timeout: Duration,
 ) -> Result<reqwest::Response, ApiError> {
@@ -454,57 +456,100 @@ async fn send_checked(
         ApiError::new(
             502,
             "UPSTREAM_UNREACHABLE",
-            redact(&format!("Could not reach the Gemini API: {error}"), keys),
+            UiMessage::new(MessageId::UpstreamUnreachable)
+                .with_arg("detail", json!(redact(&error.to_string(), keys))),
         )
     })?;
     if response.status().is_success() {
         Ok(response)
     } else {
-        Err(google_failure(response, detail, keys).await)
+        Err(google_failure(response, action, keys).await)
     }
 }
 
-/// Non-2xx from Google -> the mapped error, carrying Google's own message when
-/// the body has one (redacted, 300 characters at most).
+/// Non-2xx from Google, carrying redacted diagnostics inside an authored reason.
 async fn google_failure(
     response: reqwest::Response,
-    detail: &str,
+    action: MessageId,
     keys: &[Arc<SecretKey>],
 ) -> ApiError {
     let google_status = response.status().as_u16();
-    let (status, code, hint) = status_mapping(google_status);
     let body = response.text().await.unwrap_or_default();
-    let body_detail = if body.trim().is_empty() {
-        "Gemini API request failed".to_string()
-    } else {
-        match serde_json::from_str::<Value>(&body)
-            .ok()
-            .as_ref()
-            .and_then(upstream_error_message)
-        {
-            Some(message) => message,
-            None => body.trim().chars().take(300).collect(),
-        }
-    };
-    ApiError::new(
-        status,
-        code,
-        redact(
-            &format!("{detail}: {body_detail} (Google HTTP {google_status}).{hint}"),
-            keys,
-        ),
-    )
+    google_failure_body(google_status, action, &body, keys)
 }
 
-/// Google HTTP status -> the status/code/hint triple the browser sees:
-/// everything unmapped is a 502 `UPSTREAM_ERROR`.
-fn status_mapping(google_status: u16) -> (u16, &'static str, &'static str) {
+/// Classifies one non-2xx body. The thinking gate the unary
+/// `gemini-3.5-transcribe` route currently rejects every transcription with is
+/// reported as the standalone hint instead of the upstream text; every other
+/// failure keeps the redacted detail. Split from [`google_failure`] so the
+/// classification is testable without an HTTP response.
+fn google_failure_body(
+    google_status: u16,
+    action: MessageId,
+    body: &str,
+    keys: &[Arc<SecretKey>],
+) -> ApiError {
+    let (status, code) = status_mapping(google_status);
+    let parsed = serde_json::from_str::<Value>(body).ok();
+    let raw = parsed.as_ref().and_then(upstream_error_message)
+        .unwrap_or_else(|| body.trim());
+    if action == MessageId::GoogleTranscriptionFailed && is_thinking_gate_error(google_status, raw) {
+        return ApiError::new(
+            status,
+            code,
+            UiMessage::new(MessageId::GoogleThinkingUnsupported),
+        );
+    }
+    let action = if matches!(google_status, 401 | 403) {
+        match action {
+            MessageId::GoogleUploadStartFailed => MessageId::GoogleUploadStartAuthRejected,
+            MessageId::GoogleUploadFailed => MessageId::GoogleUploadAuthRejected,
+            MessageId::GoogleTranscriptionFailed => MessageId::GoogleTranscriptionAuthRejected,
+            _ => action,
+        }
+    } else {
+        action
+    };
+    let detail = if body.trim().is_empty() {
+        json!(UiMessage::new(MessageId::GoogleEmptyErrorBody))
+    } else {
+        // Redact before truncating: truncation must not expose a key prefix.
+        json!(redact(raw, keys).chars().take(300).collect::<String>())
+    };
+    ApiError::new(status, code, UiMessage::new(action)
+        .with_arg("detail", detail)
+        .with_arg("status", json!(google_status)))
+}
+
+/// The thinking gate: an HTTP 400 whose upstream message names the thinking
+/// setting the unary `gemini-3.5-transcribe` route currently rejects every
+/// request over (googleapis/js-genai#2011). Only this status and these two
+/// wordings qualify, so an unrelated 400 keeps its redacted detail; Live Smart
+/// never reaches this mapping at all.
+fn is_thinking_gate_error(google_status: u16, message: &str) -> bool {
+    google_status == 400
+        && (contains_ignore_ascii_case(message, "thinking is not enabled")
+            || contains_ignore_ascii_case(message, "thinking level"))
+}
+
+/// `haystack.contains(needle)` ignoring ASCII case, without allocating.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let haystack = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+/// Google HTTP status maps to the existing browser status/code pair.
+fn status_mapping(google_status: u16) -> (u16, &'static str) {
     match google_status {
-        400 => (400, "BAD_REQUEST", ""),
-        401 | 403 => (502, "AUTH_FAILED", AUTH_HINT),
-        404 => (404, "NOT_FOUND", ""),
-        429 => (429, "RATE_LIMITED", ""),
-        _ => (502, "UPSTREAM_ERROR", ""),
+        400 => (400, "BAD_REQUEST"),
+        401 | 403 => (502, "AUTH_FAILED"),
+        404 => (404, "NOT_FOUND"),
+        429 => (429, "RATE_LIMITED"),
+        _ => (502, "UPSTREAM_ERROR"),
     }
 }
 
@@ -600,14 +645,14 @@ fn names_invalid_api_key(payload: &Value) -> bool {
 
 /// The OpenAI-shaped `{ "error": { "message": string } }` node Google returns,
 /// trimmed; `None` when it is absent, of another type or blank.
-fn upstream_error_message(payload: &Value) -> Option<String> {
+fn upstream_error_message(payload: &Value) -> Option<&str> {
     let message = payload
         .get("error")
         .and_then(Value::as_object)?
         .get("message")
         .and_then(Value::as_str)?;
     let trimmed = message.trim();
-    (!trimmed.is_empty()).then(|| trimmed.to_string())
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 /// `encodeURIComponent`: unreserved characters plus the ECMAScript extras
@@ -665,4 +710,130 @@ fn configure_bases() -> (String, String) {
     let (http_base, wss_base) = (GOOGLE_HTTP_BASE.to_string(), GOOGLE_WSS_BASE.to_string());
 
     (http_base, wss_base)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A smart request: the mode is the bare `"smart"` string the parameter
+    /// reference documents.
+    #[test]
+    fn smart_interaction_payload_matches_the_documented_shape() {
+        let payload = interaction_payload("files/abc", Value::String("smart".to_owned()));
+        assert_eq!(payload["model"], BATCH_MODEL);
+        assert_eq!(payload["input"][0]["type"], "audio");
+        assert_eq!(payload["input"][0]["uri"], "files/abc");
+        assert_eq!(payload["input"][0]["mime_type"], WAV_MIME_TYPE);
+        assert_eq!(
+            payload["generation_config"]["transcription_config"]["mode"],
+            "smart"
+        );
+        assert_eq!(
+            payload["generation_config"]["transcription_config"]["language_codes"],
+            json!([])
+        );
+        assert_eq!(payload["store"], false);
+    }
+
+    /// Verbatim keeps the object form of the mode, which is what the reference
+    /// requires (`{"type":"verbatim"}`).
+    #[test]
+    fn verbatim_interaction_payload_carries_the_mode_object() {
+        let payload = interaction_payload("files/abc", json!({ "type": "verbatim" }));
+        assert_eq!(
+            payload["generation_config"]["transcription_config"]["mode"],
+            json!({ "type": "verbatim" })
+        );
+    }
+
+    /// The regression guard: the batch body stays exactly the shape that worked
+    /// through 2026-10-06, so neither mode carries a thinking field
+    /// (`thinking_level`, `thinking_config`, `thinking_budget` or
+    /// `thinking_summaries`). Pinning a level is not a fix: since 2026-10-07
+    /// Google's unary `gemini-3.5-transcribe` route rejects every body,
+    /// including this one, with HTTP 400 `Thinking is not enabled for this
+    /// model`, and adding a level only changes that message to `Thinking level
+    /// is not supported for this model`.
+    #[test]
+    fn transcription_requests_never_ask_for_thinking() {
+        for mode in [Value::String("smart".to_owned()), json!({ "type": "verbatim" })] {
+            let payload = interaction_payload("files/abc", mode.clone());
+            assert_eq!(
+                payload,
+                json!({
+                    "model": BATCH_MODEL,
+                    "input": [{ "type": "audio", "uri": "files/abc", "mime_type": WAV_MIME_TYPE }],
+                    "generation_config": {
+                        "transcription_config": { "mode": mode, "language_codes": [] },
+                    },
+                    "store": false,
+                })
+            );
+        }
+    }
+
+    /// Every wording the thinking gate returns since 2026-10-07 maps to the
+    /// standalone hint: no upstream text, no arguments, nothing to redact.
+    #[test]
+    fn thinking_gate_400_maps_to_the_hint() {
+        use crate::i18n::Language;
+
+        let bodies = [
+            "Thinking is not enabled for this model",
+            "Thinking level is not supported for this model.",
+            "'medium' is not a supported thinking level for this model. Allowed values are: high, low.",
+        ];
+        for body in bodies {
+            let failure = google_failure_body(
+                400,
+                MessageId::GoogleTranscriptionFailed,
+                &json!({ "error": { "message": body } }).to_string(),
+                &[],
+            );
+            assert_eq!(failure.status, 400);
+            assert_eq!(failure.code, "BAD_REQUEST");
+            assert_eq!(failure.ui.key, MessageId::GoogleThinkingUnsupported);
+            assert_eq!(failure.ui.args, None);
+            assert_eq!(
+                failure.message,
+                MessageId::GoogleThinkingUnsupported.template(Language::En)
+            );
+        }
+    }
+
+    /// The gate is narrow: the same 400 status without a thinking wording, a
+    /// thinking wording on another status, and a thinking wording on another
+    /// request all keep their own failure and its detail.
+    #[test]
+    fn failures_outside_the_thinking_gate_keep_their_detail() {
+        let unrelated = json!({ "error": { "message": "Invalid JSON payload received." } }).to_string();
+        let failure = google_failure_body(400, MessageId::GoogleTranscriptionFailed, &unrelated, &[]);
+        assert_eq!(failure.code, "BAD_REQUEST");
+        assert_eq!(failure.ui.key, MessageId::GoogleTranscriptionFailed);
+        assert_eq!(
+            failure.ui.args.as_ref().and_then(|args| args.get("status")),
+            Some(&json!(400u16))
+        );
+        assert!(failure.message.contains("Invalid JSON payload received."));
+
+        let thinking = json!({ "error": { "message": "Thinking is not enabled for this model" } }).to_string();
+        let other_status = google_failure_body(502, MessageId::GoogleTranscriptionFailed, &thinking, &[]);
+        assert_eq!(other_status.ui.key, MessageId::GoogleTranscriptionFailed);
+        assert!(other_status.message.contains("Thinking is not enabled for this model"));
+
+        let other_action = google_failure_body(400, MessageId::GoogleUploadFailed, &thinking, &[]);
+        assert_eq!(other_action.ui.key, MessageId::GoogleUploadFailed);
+    }
+
+    /// The gate matches ASCII case-insensitively and only on its two wordings.
+    #[test]
+    fn thinking_gate_wording_is_matched_case_insensitively() {
+        assert!(is_thinking_gate_error(400, "THINKING LEVEL IS NOT SUPPORTED FOR THIS MODEL."));
+        assert!(is_thinking_gate_error(400, "thinking is not enabled for this model"));
+        assert!(is_thinking_gate_error(400, "not a supported thinking level"));
+        assert!(!is_thinking_gate_error(400, "Thinking budget is out of range."));
+        assert!(!is_thinking_gate_error(400, ""));
+        assert!(!is_thinking_gate_error(429, "Thinking level is not supported for this model."));
+    }
 }

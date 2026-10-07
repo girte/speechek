@@ -35,6 +35,9 @@
  *    the document through textContent or textarea.value only.
  */
 
+/** The runtime language snapshot every accepted view carries goes to here. */
+import { acceptLanguageSnapshot, initI18n, onLanguageChange, applyTranslations, formatMessage, formatError, keyCountText, refreshLanguageSnapshot } from './i18n.js';
+
 /** The shell asks for a section; it is sent after the window is shown. */
 const EVENT_OPEN_REQUEST = 'speechek:settings-open-request';
 /** The window was asked to close (its own close button, or the app quitting). */
@@ -74,38 +77,15 @@ const TYPING_IDLE_MS = 350;
  * Why the chord field is locked while a dictation runs; native
  * `DICTATION_ACTIVE` stays the backstop against the race.
  */
-const DICTATION_HINT = 'Диктовка выполняется: горячую клавишу сейчас изменить нельзя.';
+const DICTATION_HINT = msg('SettingsDictationHint');
 /** Why the port field was refused; the shell uses the same line for a zero port. */
-const PORT_INVALID_MESSAGE = 'Укажите целое число от 1 до 65535.';
+const PORT_INVALID_MESSAGE = msg('SettingsPortInvalid');
 /**
  * Why the autostart switch is mixed and disabled; the shell could not read the
  * registration it would have to change.
  */
-const AUTOSTART_UNKNOWN = 'Состояние автозагрузки определить не удалось: запись Windows недоступна. Изменить её сейчас нельзя.';
+const AUTOSTART_UNKNOWN = msg('SettingsAutostartUnknown');
 
-/** Fixed Russian texts for codes the shell may answer with. */
-const FALLBACK_MESSAGES = {
-  FORBIDDEN: 'Это окно не имеет доступа к настройкам.',
-  STALE_DRAFT: 'Черновик изменился: данные обновлены, повторите действие.',
-  UNSAVED_CHANGES: 'В черновике есть несохранённые изменения.',
-  CONFIRM_REQUIRED: 'Действие требует подтверждения.',
-  DICTATION_ACTIVE: 'Чтобы изменить горячую клавишу, завершите или отмените диктовку.',
-  KEY_LIST_INVALID: 'В списке ключей есть ошибка.',
-  SECRETS_UNAVAILABLE: 'Хранилище ключей недоступно: сохранённый список прочитать не удалось.',
-  REVEAL_FAILED: 'Не удалось прочитать ключи для показа.',
-  INVALID_MODE: 'Неизвестный режим распознавания.',
-  HOTKEY_INVALID: 'Это сочетание не подходит для горячей клавиши.',
-  HOTKEY_CONFLICT: 'Это сочетание занято другой программой. Выберите другое или закройте её.',
-  CLOSING: 'Приложение завершает работу: настройки сейчас изменить нельзя.',
-  INPUT_DEVICES_UNAVAILABLE: 'Не удалось получить список микрофонов. Проверьте доступ к устройствам записи.',
-  INVALID_ACTION: 'Неизвестное действие.',
-  SAVE_FAILED: 'Не удалось сохранить настройки: проверьте доступ к файлам.',
-  SAVE_PARTIAL: 'Файлы могли измениться частично; приложение продолжает использовать прежние настройки. Устраните ошибку доступа и повторите.',
-  CHECK_IN_PROGRESS: 'Проверка ключей уже выполняется.',
-  INTERNAL: 'Внутренняя ошибка приложения.',
-  AUTOSTART_UNAVAILABLE: 'Автозагрузку сейчас изменить нельзя: запись Windows занята другой программой или недоступна.',
-  AUTOSTART_FAILED: 'Не удалось изменить автозагрузку: проверьте доступ к реестру и повторите.',
-};
 
 const tauri = globalThis.__TAURI__;
 let shell = Boolean(tauri?.core?.invoke && tauri?.event?.listen);
@@ -155,6 +135,61 @@ const dialogConfirm = el('dialog-confirm');
 const dialogConfirmText = el('dialog-confirm-text');
 const dialogConfirmOk = el('dialog-confirm-ok');
 const dialogConfirmCancel = el('dialog-confirm-cancel');
+
+// Translation-only display state: never stores editor values or changes controls.
+const retainedText = new Map();
+let catalogReady = false;
+let runtimeLanguage = null;
+const languageSelect = el('ui-language');
+const titleSuffix = document.title.match(/\s(?:\[(?:Dev|Test)\]|\((?:Dev|Test)\)|— (?:Dev|Test)|(?:Dev|Test))$/)?.[0] ?? '';
+document.querySelector('title')?.removeAttribute('data-i18n');
+
+function msg(key, args = {}) {
+  return { key, args };
+}
+
+function displayText(value) {
+  if (value === '' || value == null) return '';
+  if (typeof value === 'string' || typeof value === 'number') return String(value);
+  if (Object.hasOwn(value, 'keyCount')) return keyCountText(value.keyCount);
+  if (typeof value.key === 'string') {
+    const args = {};
+    for (const [name, arg] of Object.entries(value.args || {})) {
+      args[name] = arg && typeof arg === 'object' ? displayText(arg) : arg;
+    }
+    return formatMessage({ key: value.key, args });
+  }
+  return formatError(value);
+}
+
+function setText(node, value, property = 'textContent') {
+  let state = retainedText.get(node);
+  if (!state) retainedText.set(node, state = {});
+  state[property] = value;
+  node[property] = displayText(value);
+}
+
+function keyErrorMessage(error) {
+  return typeof error.line === 'number'
+    ? msg('SettingsErrorAtLine', { line: error.line, message: error })
+    : messageOf(error);
+}
+
+function translateSettings(language) {
+  if (language === 'en' || language === 'ru') runtimeLanguage = language;
+  // An event may arrive before its command reply, or from another window.
+  // Reflect committed language only when no picker intent is outstanding.
+  if (pendingLanguage === null && runtimeLanguage !== null) languageSelect.value = runtimeLanguage;
+  applyTranslations();
+  for (const [node, state] of retainedText) {
+    if (!node.isConnected) {
+      retainedText.delete(node);
+      continue;
+    }
+    for (const [property, value] of Object.entries(state)) node[property] = displayText(value);
+  }
+  document.title = `${formatMessage(msg('SettingsDocumentTitle'))}${titleSuffix}`;
+}
 
 /* -------------------------------------------------------------------------- */
 /* State                                                                       */
@@ -245,6 +280,13 @@ let portDirty = false;
  */
 let pendingPort = null;
 /**
+ * The language the user chose but the shell has not confirmed yet. It travels
+ * with every general change, so a choice made while another send is in flight
+ * cannot put the old language back; until the selector exists it stays null
+ * and the running document's language travels instead.
+ */
+let pendingLanguage = null;
+/**
  * The device picker holds a choice the shell has not confirmed yet. Like the
  * port, it travels with every later general change until an answer reports it;
  * `null` is the system default, and the flag says the value is the user's
@@ -284,11 +326,11 @@ function payloadOf(event) {
 }
 
 function errorOf(cause) {
-  if (cause && typeof cause === 'object' && typeof cause.code === 'string') return cause;
+  if (cause && typeof cause === 'object') return cause;
   if (typeof cause === 'string') {
     try {
       const parsed = JSON.parse(cause);
-      if (parsed && typeof parsed === 'object' && typeof parsed.code === 'string') return parsed;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
     } catch {
       // The shell answered with a plain string; its text is the only detail.
       return { code: 'INTERNAL', message: cause };
@@ -298,12 +340,11 @@ function errorOf(cause) {
 }
 
 function messageOf(error) {
-  const own = typeof error.message === 'string' ? error.message.trim() : '';
-  return own || FALLBACK_MESSAGES[error.code] || FALLBACK_MESSAGES.INTERNAL;
+  return error;
 }
 
 function setStatus(text) {
-  statusLine.textContent = text;
+  setText(statusLine, text);
 }
 
 function show(node) {
@@ -319,19 +360,10 @@ function clearChildren(node) {
 }
 
 function setError(node, text) {
-  node.textContent = text;
+  setText(node, text);
   node.hidden = text === '';
 }
 
-/** Russian count agreement, used for the key counter only. */
-function keyCountText(count) {
-  const mod100 = count % 100;
-  const mod10 = count % 10;
-  if (mod100 >= 11 && mod100 <= 14) return `${count} ключей`;
-  if (mod10 === 1) return `${count} ключ`;
-  if (mod10 >= 2 && mod10 <= 4) return `${count} ключа`;
-  return `${count} ключей`;
-}
 
 function invoke(command, args) {
   return tauri.core.invoke(command, args);
@@ -441,6 +473,15 @@ function currentInputDevice() {
   return typeof device === 'string' && device !== '' ? device : null;
 }
 
+/** The language the general form carries: the picker's choice until the shell
+ * confirms it, otherwise the running document's language. */
+function generalLanguage() {
+  if (pendingLanguage !== null) return pendingLanguage;
+  if (runtimeLanguage !== null) return runtimeLanguage;
+  const language = view?.settings?.language;
+  return language === 'en' || language === 'ru' ? language : 'en';
+}
+
 function renderSection() {
   for (const name of SECTIONS) {
     const on = name === section;
@@ -454,7 +495,7 @@ function renderControls() {
   // A close flow in flight freezes the page too: its own settings_close answer
   // must not be raced by a new chord or general intent, and a late answer must
   // not revive the draft the close is dropping.
-  const ready = view !== null && !busy && !closed && !closePending;
+  const ready = catalogReady && !formDisabled && view !== null && !busy && !closed && !closePending;
   // An explicit Apply keys or a close holds the page; a dictation forbids a
   // chord change. Neither one may touch the text already typed in the field.
   const usable = ready;
@@ -479,6 +520,7 @@ function renderControls() {
   if (hotkeyWasHeld && hotkeyInput.disabled) signalHotkeyField(false);
   portInput.disabled = !usable;
   deviceSelect.disabled = !usable;
+  languageSelect.disabled = !usable;
 }
 
 function renderHotkey() {
@@ -489,7 +531,7 @@ function renderHotkey() {
   // The field belongs to the user the moment it holds text the shell has not
   // taken: a view that paints a general or key answer must not erase it.
   if (!hotkeyDirty && hotkeyInput.value !== hotkey) hotkeyInput.value = hotkey;
-  const native = typeof view?.hotkeyError === 'string' ? view.hotkeyError : '';
+  const native = view?.hotkeyErrorUi ? { ui: view.hotkeyErrorUi } : view?.hotkeyError ? { message: view.hotkeyError } : '';
   setError(hotkeyError, native || hotkeyFailure);
 }
 
@@ -506,6 +548,8 @@ function renderGeneral() {
   // The autostart switch is painted from the same view as the other general
   // controls: a send in flight keeps this painting away until its answer lands.
   renderAutostart();
+  if (pendingLanguage === view?.settings?.language) pendingLanguage = null;
+  languageSelect.value = generalLanguage();
   // The port field belongs to the user while it holds text the shell has not
   // taken: a view that paints a general, chord or key answer must not erase
   // what was typed but not yet committed. A field that already holds the
@@ -541,20 +585,20 @@ function renderPortNotice() {
   }
   if (view.portFallback === true) {
     setPortNotice(
-      `При запуске порт ${view.startupPort} был занят, временно используется ${view.runningPort}. Он освободится при следующем запуске.`,
+      msg('SettingsPortFallback', { startup: view.startupPort, running: view.runningPort }),
     );
     return;
   }
   const saved = Number.isInteger(view.settings?.port) ? view.settings.port : null;
   if (saved !== null && Number.isInteger(view.runningPort) && saved !== view.runningPort) {
-    setPortNotice(`Порт ${saved} применится после перезапуска приложения.`);
+    setPortNotice(msg('SettingsPortRestart', { port: saved }));
     return;
   }
   setPortNotice('');
 }
 
 function setPortNotice(text) {
-  portNotice.textContent = text;
+  setText(portNotice, text);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -591,11 +635,11 @@ function renderDevices() {
   }
   const chosen = deviceDirty ? pendingDevice : saved;
   const options = new Map();
-  options.set('', 'Системное устройство по умолчанию');
+  options.set('', msg('SettingsSystemDevice'));
   for (const device of listed) {
     if (!device || typeof device.id !== 'string' || device.id === '') continue;
     const name = typeof device.name === 'string' && device.name !== '' ? device.name : device.id;
-    options.set(device.id, device.isDefault === true ? `${name} (по умолчанию)` : name);
+    options.set(device.id, device.isDefault === true ? msg('SettingsDeviceDefault', { name }) : name);
   }
   // A device the list does not know - the host's list is unreadable, or the
   // device is gone - stays on screen as its own entry, so the picker never
@@ -605,15 +649,15 @@ function renderDevices() {
     options.set(
       value,
       deviceList === null
-        ? 'Текущее выбранное устройство (список недоступен)'
-        : 'Выбранное устройство недоступно',
+        ? msg('SettingsDeviceListUnavailable')
+        : msg('SettingsDeviceUnavailable'),
     );
   }
   clearChildren(deviceSelect);
   for (const [value, label] of options) {
     const option = document.createElement('option');
     option.value = value;
-    option.textContent = label;
+    setText(option, label);
     deviceSelect.appendChild(option);
   }
   deviceSelect.value = typeof chosen === 'string' ? chosen : '';
@@ -633,11 +677,10 @@ function renderDevices() {
 function renderDeviceNotice(saved, listed) {
   const missing = saved !== null && Array.isArray(deviceList) && !listed.some((device) => device && device.id === saved);
   if (!missing) {
-    deviceNotice.textContent = '';
+    setText(deviceNotice, '');
     return;
   }
-  deviceNotice.textContent =
-    'Сохранённое устройство не найдено среди подключённых: запись пойдёт с системного микрофона. Сохранённый выбор не заменяется — выберите устройство заново, когда оно появится.';
+  setText(deviceNotice, msg('SettingsDeviceMissingNotice'));
 }
 
 /**
@@ -674,53 +717,51 @@ async function refreshDevices() {
  * editor instead of promising a list the shell cannot read.
  */
 function revealLabel() {
-  if (editorMode === 'revealed') return 'Скрыть ключи';
-  if (editorMode === 'replace') return 'Ввести ключи';
-  if (view !== null && view.secretsStatus === 'unavailable') return 'Ввести ключи';
-  return 'Показать ключи';
+  if (editorMode === 'revealed') return msg('SettingsHideKeys');
+  if (editorMode === 'replace') return msg('SettingsEnterKeys');
+  if (view !== null && view.secretsStatus === 'unavailable') return msg('SettingsEnterKeys');
+  return msg('SettingsRevealKeys');
 }
 
 function keysSummaryText() {
   const count = typeof view?.keyCount === 'number' ? view.keyCount : 0;
   if (view?.keyError) {
-    return `Ранее сохранённых ключей: ${keyCountText(count)}. Исправьте список и примените ключи.`;
+    return msg('SettingsKeysInvalidSummary', { count: { keyCount: count } });
   }
   if (view.secretsStatus === 'unavailable') {
     if (view.keysChanged) {
-      return `Хранилище ключей недоступно: сохранённый список прочитать не удалось. В черновике ${keyCountText(count)} — он заменит неизвестное содержимое только после подтверждённого применения.`;
+      return msg('SettingsKeysReplacementSummary', { count: { keyCount: count } });
     }
-    return 'Хранилище ключей недоступно: сохранённый список прочитать не удалось. Показать или проверить сохранённые ключи нельзя.';
+    return msg('SettingsStoreUnavailableSummary');
   }
   if (view.keysChanged) {
-    return `В новом списке ${keyCountText(count)} — изменения не применены.`;
+    return msg('SettingsKeysChangedSummary', { count: { keyCount: count } });
   }
   if (view.secretsStatus === 'missing') {
-    return 'Сохранённых ключей нет: диктовка недоступна, пока вы не добавите ключ и не примените список.';
+    return msg('SettingsNoKeysSummary');
   }
-  return `Сохранено ключей: ${keyCountText(count)}. Значения скрыты.`;
+  return msg('SettingsKeysSavedSummary', { count: { keyCount: count } });
 }
 
 function renderKeys() {
   if (view === null) return;
-  keysSummary.textContent = keysSummaryText();
+  setText(keysSummary, keysSummaryText());
   if (view.keyError) {
-    const line = typeof view.keyError.line === 'number' ? `Строка ${view.keyError.line}: ` : '';
-    setError(keysError, `${line}${view.keyError.message}`);
+    setError(keysError, keyErrorMessage(view.keyError));
   } else {
     setError(keysError, '');
   }
   // The one control that opens the field carries the wording of what it will
   // do next: reveal the saved list, hide it, or open an empty editor when the
   // store cannot be read.
-  keyReveal.textContent = revealLabel();
-  const partial = typeof view.partialPersistence === 'string' ? view.partialPersistence : '';
+  setText(keyReveal, revealLabel());
+  const partial = view.partialPersistenceUi ? { ui: view.partialPersistenceUi } : typeof view.partialPersistence === 'string' ? { message: view.partialPersistence } : '';
   const flagged = partialObligation || (view.partialPersistence !== false && view.partialPersistence !== undefined);
   if (!flagged) {
     hide(partialWarning);
   } else {
-    partialWarning.textContent =
-      partial ||
-      'Предыдущее сохранение завершилось частично: файлы могли измениться не полностью, при следующем запуске настройки могут отличаться от текущих. Устраните проблему доступа и повторите.';
+    setText(partialWarning, partial ||
+      msg('SettingsPartialNotice'));
     show(partialWarning);
   }
 }
@@ -732,6 +773,10 @@ function renderKeys() {
  */
 function applyView(next, { reopen = false, repaintGeneral } = {}) {
   if (!next || typeof next !== 'object') return;
+  // The language follows the runtime revision, not this draft's revision: a
+  // view that loses the draft race may still carry the newest language, and the
+  // module itself drops anything older than what it has already applied.
+  acceptLanguageSnapshot(next);
   if (closed && !reopen) return;
   if (view !== null && next.draftId === view.draftId && typeof next.revision === 'number' && typeof view.revision === 'number') {
     // A view older than the one on screen says nothing new about the draft.
@@ -748,7 +793,7 @@ function applyView(next, { reopen = false, repaintGeneral } = {}) {
   // A window opened while a dictation runs missed the event that started it, so
   // the view alone says why its field is locked. Only the active hint is painted
   // here: the line about the applied chord belongs to the next event to clear.
-  if (dictationActive) hotkeyState.textContent = DICTATION_HINT;
+  if (dictationActive) setText(hotkeyState, DICTATION_HINT);
   renderHotkey();
   // The decision belongs to this moment, not to the moment a caller's own await
   // began: a predicate is evaluated here, so an interaction that happened while
@@ -766,10 +811,10 @@ function applyView(next, { reopen = false, repaintGeneral } = {}) {
 
 function showEditor(mode, label, help) {
   editorMode = mode;
-  keysEditorLabel.textContent = label;
-  keysEditorHelp.textContent = help;
+  setText(keysEditorLabel, label);
+  setText(keysEditorHelp, help);
   show(keysEditor);
-  keyReveal.textContent = revealLabel();
+  setText(keyReveal, revealLabel());
 }
 
 /**
@@ -786,9 +831,9 @@ function invalidateReveal() {
   replaceTouched = false;
   editorMode = 'hidden';
   keysText.value = '';
-  keysText.placeholder = '';
+  setText(keysText, '', 'placeholder');
   hide(keysEditor);
-  keyReveal.textContent = revealLabel();
+  setText(keyReveal, revealLabel());
 }
 
 /** True while an answer for this epoch and draft may still be drawn. */
@@ -841,8 +886,8 @@ async function sendKeys(snapshot) {
     const next = await invoke(CMD.setKeys, { draftId, revision, text });
     applyView(next);
     acceptedEpoch = editorMode !== 'hidden' && editEpoch === epoch ? epoch : -1;
-    if (keyErrorEcho !== '' && !view?.keyError && statusLine.textContent === keyErrorEcho) {
-      setStatus('Черновик ключей обновлён: примените его кнопкой «Применить ключи».');
+    if (keyErrorEcho !== '' && !view?.keyError && retainedText.get(statusLine)?.textContent === keyErrorEcho) {
+      setStatus(msg('SettingsDraftUpdated'));
     }
     keyErrorEcho = '';
     return true;
@@ -865,8 +910,8 @@ async function sendKeys(snapshot) {
       keysText.value = text;
       editEpoch += 1;
       replaceTouched = true;
-      keysText.placeholder = 'Новый полный список заменит прежний после применения';
-      showEditor('replace', 'Новый список ключей', 'Введите полный список ключей: по одному в строке. Для замены недоступного хранилища потребуется подтверждение.');
+      setText(keysText, msg('SettingsReplacementPlaceholder'), 'placeholder');
+      showEditor('replace', msg('SettingsNewKeysLabel'), msg('SettingsReplacementHelp'));
     }
     // A failure leaves the field and its text alone: nothing is lost to it.
     showKeyError(error);
@@ -992,9 +1037,8 @@ function scheduleTyping() {
 /* -------------------------------------------------------------------------- */
 
 function showKeyError(error) {
-  const line = typeof error.line === 'number' ? `Строка ${error.line}: ` : '';
   const message = messageOf(error);
-  setError(keysError, `${line}${message}`);
+  setError(keysError, keyErrorMessage(error));
   // Remembered so a later accepted send can replace the echoed failure text.
   keyErrorEcho = message;
   setStatus(message);
@@ -1023,10 +1067,10 @@ function askConfirm(title, text, confirmLabel) {
     };
     // A dialog closed by something other than these buttons is a refusal.
     const onClose = () => done(false);
-    dialogConfirm.dataset.title = title;
-    el('dialog-confirm-title').textContent = title;
-    dialogConfirmText.textContent = text;
-    dialogConfirmOk.textContent = confirmLabel || 'Продолжить';
+    dialogConfirm.dataset.title = displayText(title);
+    setText(el('dialog-confirm-title'), title);
+    setText(dialogConfirmText, text);
+    setText(dialogConfirmOk, confirmLabel || msg('SettingsContinue'));
     dialogConfirmOk.addEventListener('click', onOk);
     dialogConfirmCancel.addEventListener('click', onCancel);
     dialogConfirm.addEventListener('cancel', onCancel);
@@ -1061,11 +1105,10 @@ function askUnsaved(reason) {
       done('return');
     };
     const onClose = () => done('return');
-    dialogCloseTitle.textContent = 'Неприменённые изменения API-ключей';
-    dialogCloseText.textContent =
-      reason === 'quit'
-        ? 'В черновике API-ключей есть изменения. Применить их перед выходом?'
-        : 'В черновике API-ключей есть изменения. Применить их перед закрытием?';
+    setText(dialogCloseTitle, msg('SettingsUnsavedKeysTitle'));
+    setText(dialogCloseText, reason === 'quit'
+        ? msg('SettingsUnsavedQuit')
+        : msg('SettingsUnsavedClose'));
     dialogCloseSave.addEventListener('click', onSave);
     dialogCloseDiscard.addEventListener('click', onDiscard);
     dialogCloseReturn.addEventListener('click', onReturn);
@@ -1096,7 +1139,7 @@ function renderAutostart() {
   const state = autostartState();
   autostartToggle.checked = state === true;
   autostartToggle.indeterminate = state === null;
-  autostartNotice.textContent = state === null && view !== null ? AUTOSTART_UNKNOWN : '';
+  setText(autostartNotice, state === null && view !== null ? AUTOSTART_UNKNOWN : '');
   setError(autostartError, autostartFailure);
 }
 
@@ -1124,6 +1167,7 @@ async function refreshAutostartOnActivation() {
     // answers may move the switch: a send that ran while this read was in
     // flight has already reported its own, newer registration.
     if (!next || typeof next !== 'object' || next.draftId !== view.draftId) return;
+    acceptLanguageSnapshot(next);
     if (typeof next.revision === 'number' && typeof view.revision === 'number' && next.revision < view.revision) return;
     // The shell answers `true`, `false` or `null`; anything else means this
     // page cannot tell Windows' state and must not invent one.
@@ -1158,7 +1202,7 @@ function onAutostartChange() {
   autostartFailure = '';
   autostartInFlight += 1;
   setError(autostartError, '');
-  setStatus('Применяем настройки…');
+  setStatus(msg('SettingsApplying'));
   void enqueue(() => sendAutostart(draftId, enabled));
 }
 
@@ -1173,14 +1217,15 @@ function onGeneralChange() {
   generalIntent = intent;
   // The chord is not part of this command: an old WebView view must not be able
   // to send a launcher key back, and a general change never touches the keys.
-  // The mute switch, the port and the chosen device live in this section, so
-  // their own current values travel: the change takes effect from the next
-  // dictation, while a new port only after the next restart.
+  // The mute switch, the port, the chosen device and the language live in this
+  // section, so their own current values travel: the change takes effect from
+  // the next dictation, while a new port only after the next restart.
   const settings = {
     mode: selectedMode(),
     mute_during_recording: muteToggle.checked,
     port: desiredPort(),
     input_device: currentInputDevice(),
+    language: generalLanguage(),
   };
   const draftId = view.draftId;
   // Counted until its answer lands: while a general send is outstanding, no
@@ -1188,7 +1233,7 @@ function onGeneralChange() {
   // never rewrite what the user just chose and make the next snapshot wrong.
   generalInFlight += 1;
   setError(generalError, '');
-  setStatus('Применяем настройки…');
+  setStatus(msg('SettingsApplying'));
   void enqueue(() => sendGeneral(intent, settings, draftId));
 }
 
@@ -1203,21 +1248,22 @@ async function sendGeneral(intent, settings, draftId) {
     const revision = view.revision;
     try {
       const result = await invoke(CMD.updateGeneral, { draftId, revision, settings });
+      if (intent === generalIntent && result?.applied !== true) pendingLanguage = null;
       if (result && result.view) applyView(result.view, { repaintGeneral: intent === generalIntent });
       if (intent !== generalIntent) return;
       if (result?.applied !== true) {
-        setError(generalError, FALLBACK_MESSAGES.SAVE_FAILED);
-        setStatus(FALLBACK_MESSAGES.SAVE_FAILED);
+        setError(generalError, msg('SettingsSaveNotApplied'));
+        setStatus(msg('SettingsSaveNotApplied'));
         return;
       }
-      const warning = typeof result?.warning === 'string' ? result.warning : '';
+      const warning = result?.warningUi ? { ui: result.warningUi } : typeof result?.warning === 'string' && result.warning !== '' ? { message: result.warning } : '';
       if (warning !== '') {
         setStatus(warning);
         show(partialWarning);
-        partialWarning.textContent = warning;
+        setText(partialWarning, warning);
         return;
       }
-      setStatus('Настройки применены.');
+      setStatus(msg('SettingsApplied'));
     } catch (cause) {
       const error = errorOf(cause);
       // A stale revision means another answer already moved the draft on; the
@@ -1229,6 +1275,7 @@ async function sendGeneral(intent, settings, draftId) {
       // The draft may have been closed while this answer was on its way: an
       // answer about it must not revive it in a hidden window.
       if (draftLive(draftId)) {
+        if (intent === generalIntent) pendingLanguage = null;
         await resync({ repaintGeneral: () => intent === generalIntent });
         if (error.code !== 'STALE_DRAFT' && intent === generalIntent) {
           setGeneralFailure(error);
@@ -1251,7 +1298,7 @@ async function sendAutostart(draftId, enabled) {
     const revision = view.revision;
     const next = await invoke(CMD.setAutostart, { draftId, revision, enabled });
     applyView(next);
-    setStatus('Настройки применены.');
+    setStatus(msg('SettingsApplied'));
   } catch (cause) {
     const error = errorOf(cause);
     if (error.code === 'STALE_DRAFT') {
@@ -1374,8 +1421,8 @@ function submitHotkey(source) {
   hotkeyChangeBaseline = value;
   hotkeyFailure = '';
   setError(hotkeyError, '');
-  hotkeyState.textContent = '';
-  setStatus('Применяем горячую клавишу…');
+  setText(hotkeyState, '');
+  setStatus(msg('SettingsApplyingHotkey'));
   void enqueue(() => sendHotkey(submit));
 }
 
@@ -1431,8 +1478,8 @@ async function sendHotkey(submit) {
         const applied = result?.applied === true;
         setStatus(
           applied
-            ? 'Горячая клавиша применена; в поле новый текст — нажмите Enter, чтобы применить его.'
-            : 'Ввод изменился во время применения: нажмите Enter, чтобы применить новую строку.',
+            ? msg('SettingsHotkeyAppliedNewText')
+            : msg('SettingsHotkeyTextChanged'),
         );
         return;
       }
@@ -1444,7 +1491,7 @@ async function sendHotkey(submit) {
         // The newest view is read first: it names the chord that really works,
         // and the failure line under the field must not name a stale one.
         await resync();
-        showHotkeyError(FALLBACK_MESSAGES.SAVE_FAILED);
+        showHotkeyError(msg('SettingsSaveNotApplied'));
         return;
       }
       // A draft that is gone (closed, or replaced by a newer one) must not be
@@ -1460,14 +1507,14 @@ async function sendHotkey(submit) {
       appliedHotkey = applied;
       hotkeyFailure = '';
       setError(hotkeyError, '');
-      hotkeyState.textContent = '';
-      const warning = typeof result?.warning === 'string' ? result.warning : '';
+      setText(hotkeyState, '');
+      const warning = result?.warningUi ? { ui: result.warningUi } : typeof result?.warning === 'string' && result.warning !== '' ? { message: result.warning } : '';
       if (warning !== '') {
         setStatus(warning);
         show(partialWarning);
-        partialWarning.textContent = warning;
+        setText(partialWarning, warning);
       } else {
-        setStatus('Горячая клавиша применена.');
+        setStatus(msg('SettingsHotkeyApplied'));
       }
     } catch (cause) {
       const error = errorOf(cause);
@@ -1476,7 +1523,7 @@ async function sendHotkey(submit) {
         if (draftLive(draftId)) {
           await resync();
           if (submit.intent === hotkeyIntent && hotkeyFieldEpoch === submit.fieldEpoch) {
-            setStatus('Черновик изменился: нажмите Enter, чтобы применить строку ещё раз.');
+            setStatus(msg('SettingsHotkeyStale'));
           }
         }
         return;
@@ -1504,7 +1551,7 @@ async function sendHotkey(submit) {
 function showHotkeyError(message) {
   hotkeyFailure = message;
   setError(hotkeyError, message);
-  hotkeyState.textContent = appliedHotkey === '' ? '' : `Сейчас действует: ${appliedHotkey}.`;
+  setText(hotkeyState, appliedHotkey === '' ? '' : msg('SettingsCurrentHotkey', { hotkey: appliedHotkey }));
   setStatus(message);
 }
 
@@ -1523,15 +1570,15 @@ async function revealKeys() {
   // With the key store unavailable there is nothing to reveal: the same control
   // opens an empty editor and the unknown saved list is never loaded into it.
   if (view.secretsStatus === 'unavailable') {
-    if (!(await flushOrHold('Список ключей не удалось отправить: исправьте ошибку и повторите.'))) return;
+    if (!(await flushOrHold(msg('SettingsKeySendRetry')))) return;
     invalidateReveal();
     replaceTouched = false;
     keysText.value = '';
     editEpoch += 1;
-    keysText.placeholder = 'Новый полный список заменит содержимое хранилища после подтверждённого применения';
-    showEditor('replace', 'Новый список ключей', 'Введите полный список ключей: по одному в строке. Для замены недоступного хранилища потребуется подтверждение.');
+    setText(keysText, msg('SettingsConfirmedReplacementPlaceholder'), 'placeholder');
+    showEditor('replace', msg('SettingsNewKeysLabel'), msg('SettingsReplacementHelp'));
     keysText.focus();
-    setStatus('Введите новый список: он заменит недоступное содержимое хранилища только после подтверждения и кнопки «Применить ключи».');
+    setStatus(msg('SettingsReplacementNotice'));
     return;
   }
   // The request is recorded on the click itself, before the first await: a
@@ -1541,7 +1588,7 @@ async function revealKeys() {
   revealIntent = true;
   lockEditor();
   try {
-    if (!(await flushOrHold('Список ключей не удалось отправить: исправьте ошибку и повторите.'))) {
+    if (!(await flushOrHold(msg('SettingsKeySendRetry')))) {
       revealIntent = false;
       return;
     }
@@ -1556,7 +1603,7 @@ async function revealKeys() {
       // overwritten by an answer that was asked for before the change.
       if (editEpoch !== drawnEpoch) {
         revealIntent = false;
-        setStatus('Список изменился, пока готовился показ: нажмите «Показать ключи» снова.');
+        setStatus(msg('SettingsRevealStale'));
         return;
       }
       keysText.value = typeof text === 'string' ? text : '';
@@ -1567,10 +1614,10 @@ async function revealKeys() {
       // simply an empty editable field.
       acceptedEpoch = -1;
       replaceTouched = false;
-      keysText.placeholder = '';
-      showEditor('revealed', 'Список ключей', 'Список виден только в этом окне. Правки сохраняются по кнопке «Применить ключи».');
+      setText(keysText, '', 'placeholder');
+      showEditor('revealed', msg('SettingsKeysListLabel'), msg('SettingsRevealedHelp'));
       keysText.focus();
-      setStatus('Ключи показаны. Переключение раздела, применение или закрытие снова их скрывают.');
+      setStatus(msg('SettingsKeysShown'));
     } catch (cause) {
       if (!revealCurrent(epoch, draftId)) return;
       revealIntent = false;
@@ -1588,19 +1635,19 @@ async function revealKeys() {
  * failure keeps the field on screen instead of hiding the error with it.
  */
 async function hideKeys() {
-  if (!(await flushOrHold('Список ключей не удалось отправить: исправьте ошибку и повторите.'))) return;
+  if (!(await flushOrHold(msg('SettingsKeySendRetry')))) return;
   invalidateReveal();
-  setStatus('Ключи скрыты.');
+  setStatus(msg('SettingsKeysHidden'));
 }
 
 function clearKeys() {
   if (view === null || closed || busy || closePending) return;
   void (async () => {
-    if (!(await flushOrHold('Список ключей не удалось отправить: исправьте ошибку и повторите.'))) return;
+    if (!(await flushOrHold(msg('SettingsKeySendRetry')))) return;
     const agreed = await askConfirm(
-      'Очистить список ключей',
-      'После применения диктовка отключится: приложению нужен хотя бы один ключ. Очистить черновик списка ключей?',
-      'Очистить',
+      msg('SettingsClearKeysTitle'),
+      msg('SettingsClearKeysQuestion'),
+      msg('SettingsClear'),
     );
     if (!agreed) return;
     // A close may have started while the question was up, and its own commands
@@ -1622,7 +1669,7 @@ function clearKeys() {
           applyView(next);
           // The cleared draft is not the list the last report describes.
           resetCheckReport();
-          setStatus('Черновик списка пуст: примените ключи, чтобы очистить сохранённый список.');
+          setStatus(msg('SettingsEmptyDraft'));
         } catch (cause) {
           const error = errorOf(cause);
           if (error.code === 'STALE_DRAFT') {
@@ -1631,7 +1678,7 @@ function clearKeys() {
             if (draftLive(draftId)) {
               await resync();
               resetCheckReport();
-              setStatus('Черновик изменился: очистка не применена, повторите её.');
+              setStatus(msg('SettingsClearStale'));
             }
             return;
           }
@@ -1655,7 +1702,7 @@ function clearKeys() {
 function resetCheckReport() {
   clearChildren(keysResults);
   hide(keysResults);
-  keysCheckSummary.textContent = '';
+  setText(keysCheckSummary, '');
 }
 
 function renderCheckResults(results) {
@@ -1668,22 +1715,22 @@ function renderCheckResults(results) {
     row.className = `settings-result settings-result-${item.status}`;
     const line = document.createElement('span');
     line.className = 'settings-result-line';
-    line.textContent = `Строка ${item.line}`;
+    setText(line, msg('SettingsLine', { line: item.line }));
     const text = document.createElement('span');
     text.className = 'settings-result-text';
-    text.textContent = item.message;
+    setText(text, messageOf(item));
     row.append(line, text);
     keysResults.append(row);
   }
   keysResults.hidden = results.length === 0;
-  keysCheckSummary.textContent = `Проверка завершена: доступ подтверждён — ${counts.ok || 0}, запрещён — ${counts.denied || 0}, не определено — ${counts.indeterminate || 0}. Проверка подтверждает только доступ к API.`;
+  setText(keysCheckSummary, msg('SettingsCheckFinished', counts));
 }
 
 function checkKeys() {
   if (view === null || closed) return;
   void (async () => {
     // Checking a list the shell has not received would report on the old one.
-    if (!(await flushOrHold('Список ключей не удалось отправить: исправьте ошибку и запустите проверку снова.'))) return;
+    if (!(await flushOrHold(msg('SettingsKeySendCheckRetry')))) return;
     // A replacement list is a transient field: it is finished once its text
     // has reached the shell, so it is hidden here; a revealed list stays.
     if (editorMode === 'replace') invalidateReveal();
@@ -1693,7 +1740,7 @@ function checkKeys() {
     // after the user typed again describes text that is no longer on screen.
     const checkEdit = editEpoch;
     resetCheckReport();
-    keysCheckSummary.textContent = 'Проверяем ключи по очереди…';
+    setText(keysCheckSummary, msg('SettingsCheckingKeys'));
     try {
       const report = await invoke(CMD.check, { draftId, revision });
       // The draft may have been closed, reset or replaced while the keys were
@@ -1705,11 +1752,11 @@ function checkKeys() {
         // the text that was sent, so it is dropped instead of being read as a
         // verdict on what is typed now.
         resetCheckReport();
-        keysCheckSummary.textContent = 'Список изменился во время проверки: запустите проверку снова.';
+        setText(keysCheckSummary, msg('SettingsCheckEdited'));
         return;
       }
       if (report.draftId !== draftId || report.stale === true || report.revision !== view.revision) {
-        keysCheckSummary.textContent = 'Черновик изменился во время проверки: запустите проверку снова.';
+        setText(keysCheckSummary, msg('SettingsCheckStale'));
         // Only the same live draft is re-read; a different one is left alone.
         if (report.draftId === draftId) await resync();
         return;
@@ -1719,11 +1766,11 @@ function checkKeys() {
       if (closed || view === null || view.draftId !== draftId) return;
       const error = errorOf(cause);
       if (error.code === 'STALE_DRAFT') {
-        keysCheckSummary.textContent = 'Черновик изменился во время проверки: запустите проверку снова.';
+        setText(keysCheckSummary, msg('SettingsCheckStale'));
         await resync();
         return;
       }
-      keysCheckSummary.textContent = messageOf(error);
+      setText(keysCheckSummary, messageOf(error));
       setStatus(messageOf(error));
     }
   })();
@@ -1749,7 +1796,7 @@ async function applyKeys() {
     if (!flushed) {
       // The list never reached the shell: applying now would write the previous
       // one. The field keeps the text and the error for a retry.
-      setStatus('Список ключей не удалось отправить: исправьте ошибку и примените снова.');
+      setStatus(msg('SettingsKeySendApplyRetry'));
       return false;
     }
     let confirmedReplace = false;
@@ -1761,7 +1808,7 @@ async function applyKeys() {
         const result = await invoke(CMD.applyKeys, { draftId, revision, confirmedReplace });
         if (result && result.view) applyView(result.view);
         const applied = result?.applied === true;
-        const warning = typeof result?.warning === 'string' ? result.warning : '';
+        const warning = result?.warningUi ? { ui: result.warningUi } : typeof result?.warning === 'string' && result.warning !== '' ? { message: result.warning } : '';
         if (applied) {
           partialObligation = false;
           // An applied list leaves nothing transient behind in this page.
@@ -1770,15 +1817,15 @@ async function applyKeys() {
         if (warning !== '') {
           setStatus(warning);
           show(partialWarning);
-          partialWarning.textContent = warning;
+          setText(partialWarning, warning);
         } else {
-          setStatus(applied ? 'Ключи применены.' : 'Ключи не применены.');
+          setStatus(applied ? msg('SettingsKeysApplied') : msg('SettingsKeysNotApplied'));
         }
         return applied;
       } catch (cause) {
         const error = errorOf(cause);
         if (error.code === 'STALE_DRAFT') {
-          setStatus('Черновик изменился: список обновлён, примените ключи снова.');
+          setStatus(msg('SettingsKeysApplyStale'));
           if (draftLive(draftId)) await resync();
           return false;
         }
@@ -1787,15 +1834,15 @@ async function applyKeys() {
           let text;
           if (view.secretsStatus === 'unavailable') {
             text =
-              'Хранилище ключей недоступно: сохранённый список прочитать не удалось, и применение полностью заменит его. Продолжить?';
+              msg('SettingsReplaceStoreQuestion');
           } else if (empty) {
-            text = 'Пустой список отключит диктовку: приложению нужен хотя бы один ключ. Применить пустой список?';
+            text = msg('SettingsApplyEmptyQuestion');
           } else {
             text = messageOf(error);
           }
-          const agreed = await askConfirm('Подтверждение применения', text, 'Применить ключи');
+          const agreed = await askConfirm(msg('SettingsApplyConfirmTitle'), text, msg('SettingsApplyKeys'));
           if (!agreed) {
-            setStatus('Применение ключей отменено.');
+            setStatus(msg('SettingsKeysApplyCanceled'));
             return false;
           }
           confirmedReplace = true;
@@ -1803,7 +1850,7 @@ async function applyKeys() {
         }
         if (error.code === 'SAVE_PARTIAL') {
           partialObligation = true;
-          partialWarning.textContent = messageOf(error);
+          setText(partialWarning, messageOf(error));
           show(partialWarning);
           setStatus(messageOf(error));
           return false;
@@ -1846,7 +1893,7 @@ async function closeDraft({ discard, forQuit = false }) {
       setStatus(messageOf(error));
       if (error.code === 'SAVE_PARTIAL') {
         partialObligation = true;
-        partialWarning.textContent = messageOf(error);
+        setText(partialWarning, messageOf(error));
         show(partialWarning);
       }
       return false;
@@ -1870,6 +1917,7 @@ function forgetDraft() {
   hotkeyFailure = '';
   // The port field belongs to the draft that just went away too.
   pendingPort = null;
+  pendingLanguage = null;
   portDirty = false;
   setError(portError, '');
   setPortNotice('');
@@ -1882,14 +1930,14 @@ function forgetDraft() {
   deviceFailure = '';
   deviceListFailure = '';
   paintDeviceError();
-  deviceNotice.textContent = '';
+  setText(deviceNotice, '');
   clearChildren(deviceSelect);
   invalidateReveal();
   resetCheckReport();
-  keysSummary.textContent = '';
+  setText(keysSummary, '');
   setError(keysError, '');
   setError(hotkeyError, '');
-  hotkeyState.textContent = '';
+  setText(hotkeyState, '');
   hotkeyInput.value = '';
   renderControls();
 }
@@ -1954,7 +2002,7 @@ async function resolveClose() {
     const answer = await askUnsaved(closeReasonNow());
     if (answer === 'return') {
       clearCloseIntent();
-      setStatus(closeReasonNow() === 'quit' ? 'Выход отменён.' : 'Закрытие отменено.');
+      setStatus(closeReasonNow() === 'quit' ? msg('SettingsQuitCanceled') : msg('SettingsCloseCanceled'));
       return false;
     }
     if (answer === 'apply') {
@@ -2017,18 +2065,18 @@ async function acknowledgePartial(reason) {
   const fromView = view !== null && view.partialPersistence !== false && view.partialPersistence !== undefined;
   if (!partialObligation && !fromView) return true;
   if (partialConsentedFor === reason) return true;
-  const own = typeof view?.partialPersistence === 'string' && view.partialPersistence !== '' ? view.partialPersistence : '';
+  const own = view?.partialPersistenceUi ? { ui: view.partialPersistenceUi } : typeof view?.partialPersistence === 'string' && view.partialPersistence !== '' ? { message: view.partialPersistence } : '';
   const base =
     own ||
-    'Предыдущее сохранение завершилось частично: файлы могли измениться не полностью, и при следующем запуске настройки могут отличаться от текущих.';
+    msg('SettingsPartialBase');
   const quitting = reason === 'quit';
   const agreed = await askConfirm(
-    quitting ? 'Выход' : 'Закрытие окна',
-    quitting ? `${base} Завершить работу?` : `${base} Закрыть окно?`,
-    quitting ? 'Завершить работу' : 'Закрыть окно',
+    quitting ? msg('SettingsQuitTitle') : msg('SettingsCloseTitle'),
+    msg(quitting ? 'SettingsPartialQuitQuestion' : 'SettingsPartialCloseQuestion', { message: base }),
+    quitting ? msg('SettingsQuitAction') : msg('SettingsCloseAction'),
   );
   if (!agreed) {
-    setStatus(quitting ? 'Выход отменён.' : 'Закрытие отменено.');
+    setStatus(quitting ? msg('SettingsQuitCanceled') : msg('SettingsCloseCanceled'));
     return false;
   }
   partialConsentedFor = reason;
@@ -2077,7 +2125,7 @@ async function quitThroughPage(acknowledgedPartial, attempt = 0) {
   const reopened = await waitForOpenRequest();
   try {
     await invoke(CMD.action, { action: 'quit', acknowledgedPartial });
-    setStatus('Завершаем работу…');
+    setStatus(msg('SettingsQuitting'));
     reopened.cancel();
     return true;
   } catch (cause) {
@@ -2085,7 +2133,7 @@ async function quitThroughPage(acknowledgedPartial, attempt = 0) {
     if ((error.code === 'SAVE_PARTIAL' || error.code === 'UNSAVED_CHANGES') && attempt < 2) {
       if (error.code === 'SAVE_PARTIAL') {
         partialObligation = true;
-        partialWarning.textContent = messageOf(error);
+        setText(partialWarning, messageOf(error));
         show(partialWarning);
       }
       setStatus(messageOf(error));
@@ -2114,7 +2162,7 @@ async function quitThroughPage(acknowledgedPartial, attempt = 0) {
 async function runLab() {
   try {
     await invoke(CMD.action, { action: 'lab' });
-    setStatus('Открываем сравнение.');
+    setStatus(msg('SettingsOpeningLab'));
     return true;
   } catch (cause) {
     setStatus(messageOf(errorOf(cause)));
@@ -2128,7 +2176,7 @@ async function openLab() {
   if (view === null || dictationActive) return;
   flushHotkey();
   flushPort();
-  if (!(await flushOrHold('Список ключей не удалось отправить: исправьте ошибку и повторите.'))) return;
+  if (!(await flushOrHold(msg('SettingsKeySendRetry')))) return;
   invalidateReveal();
   await runLab();
 }
@@ -2231,7 +2279,7 @@ function onDictationState(event) {
   dictationActive = active;
   // The field is disabled while a dictation runs and the reason is named;
   // native DICTATION_ACTIVE stays the backstop against the race.
-  hotkeyState.textContent = active ? DICTATION_HINT : '';
+  setText(hotkeyState, active ? DICTATION_HINT : '');
   renderControls();
 }
 
@@ -2259,15 +2307,16 @@ function onHotkeyKey(event) {
   hotkeyChangeBaseline = null;
   hotkeyFailure = '';
   setError(hotkeyError, '');
-  hotkeyState.textContent = '';
+  setText(hotkeyState, '');
 }
 
 /* -------------------------------------------------------------------------- */
 /* Wiring                                                                      */
 /* -------------------------------------------------------------------------- */
 function disableForm(message) {
+  formDisabled = true;
   const hotkeyWasHeld = hotkeyFieldHoldsKeyboard();
-  for (const node of [keyReveal, keyApply, keyClear, keyCheck, actionLab, hotkeyInput, portInput, deviceSelect, muteToggle, autostartToggle]) {
+  for (const node of [languageSelect, keyReveal, keyApply, keyClear, keyCheck, actionLab, hotkeyInput, portInput, deviceSelect, muteToggle, autostartToggle]) {
     node.disabled = true;
   }
   if (hotkeyWasHeld) signalHotkeyField(false);
@@ -2387,6 +2436,12 @@ function wireHelp() {
 
 function wire() {
   wireHelp();
+  languageSelect.addEventListener('change', () => {
+    if (view === null || closed || busy) return;
+    if (languageSelect.value !== 'en' && languageSelect.value !== 'ru') return;
+    pendingLanguage = languageSelect.value;
+    onGeneralChange();
+  });
   tabs.general.addEventListener('click', () => void switchSection('general'));
   tabs.keys.addEventListener('click', () => void switchSection('keys'));
   for (const name of SECTIONS) {
@@ -2428,7 +2483,7 @@ function wire() {
     // The user is answering the complaint by typing: it stops being current.
     hotkeyFailure = '';
     setError(hotkeyError, '');
-    hotkeyState.textContent = '';
+    setText(hotkeyState, '');
   });
   hotkeyInput.addEventListener('keydown', (event) => {
     if (event.key !== 'Enter' || event.isComposing) return;
@@ -2498,6 +2553,7 @@ function wire() {
   // registration in the meantime, so both are re-read on every focus — and the
   // chord field may hold the keyboard again, which the shell has to know.
   window.addEventListener('focus', () => {
+    void refreshLanguageSnapshot();
     void refreshDevices();
     void refreshAutostartOnActivation();
     signalHotkeyField(hotkeyFieldHoldsKeyboard());
@@ -2520,14 +2576,23 @@ function wire() {
 /* -------------------------------------------------------------------------- */
 
 async function boot() {
+  const initialized = await initI18n();
+  catalogReady = initialized.catalogReady;
+  if (!catalogReady) {
+    disableForm();
+    return;
+  }
+  applyTranslations();
+  onLanguageChange(translateSettings);
+  translateSettings(initialized.language);
   wire();
   renderSection();
   renderControls();
 
   if (!shell) {
     show(notice);
-    disableForm('Настройки можно изменить только в окне Speechek.');
-    setStatus('Доступна только эта страница-объяснение.');
+    disableForm(msg('SettingsNativeOnly'));
+    setStatus(msg('SettingsBrowserStatus'));
     return;
   }
 
@@ -2545,15 +2610,15 @@ async function boot() {
   } catch (cause) {
     shell = false;
     show(notice);
-    disableForm('Окно не смогло связаться с приложением.');
+    disableForm(msg('SettingsShellUnavailable'));
     console.error('speechek settings: the shell did not accept an event listener', cause);
     return;
   }
 
-  setStatus('Загрузка настроек…');
+  setStatus(msg('SettingsLoading'));
   await openSettings();
-  if (statusLine.textContent === 'Загрузка настроек…') {
-    setStatus('Настройки загружены. Общие настройки применяются сразу, порт — после перезапуска; ключи — кнопкой «Применить ключи».');
+  if (retainedText.get(statusLine)?.textContent?.key === 'SettingsLoading') {
+    setStatus(msg('SettingsLoaded'));
   }
 }
 

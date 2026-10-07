@@ -50,6 +50,22 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+body[data-i18n-pending] { visibility: hidden; }
+
+/* Bootstrap notices fit the existing transparent window, never resize it. */
+.ui-language-notice {
+  position: absolute;
+  inset: 8px;
+  z-index: 1;
+  padding: 4px 12px;
+  overflow: auto;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius);
+  font-size: 11px;
+}
+
 p { margin: 0; }
 
 .visually-hidden {

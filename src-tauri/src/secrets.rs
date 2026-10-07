@@ -47,6 +47,8 @@ use serde::Deserialize;
 
 use crate::settings::{is_ts_whitespace, ts_trim};
 
+use crate::i18n::{self, Language, MessageId, UiMessage};
+
 /// Name of the encrypted container written beside the settings file.
 const SECRETS_FILE_NAME: &str = "secrets.bin";
 
@@ -56,18 +58,6 @@ const CONTAINER_MAGIC: &[u8; 4] = b"SPK1";
 /// Payload version this module writes and the only one it accepts.
 const CONTAINER_VERSION: u64 = 1;
 
-/// Message for a key whose interior holds a whitespace character.
-const KEY_WHITESPACE_MESSAGE: &str =
-    "ключ содержит пробельный символ; разместите один ключ в строке без пробелов";
-
-/// Message for a key holding a NUL byte, which means a UTF-16 file.
-const KEY_NUL_MESSAGE: &str = "ключ содержит нулевой байт; сохраните список как UTF-8, а не UTF-16";
-
-/// Message for an empty entry where a key had to be.
-const KEY_EMPTY_MESSAGE: &str = "строка не содержит ключ";
-
-/// Message for a key that appears twice inside the stored container.
-const KEY_DUPLICATE_MESSAGE: &str = "список ключей содержит повтор";
 
 /* -------------------------------------------------------------------------- */
 /* Secret types                                                               */
@@ -129,17 +119,18 @@ impl NormalizedKeys {
     }
 }
 
-/// A key list that cannot be used, reported by physical line. The message is
-/// fixed text and never contains any part of a key.
+/// A key list that cannot be used, reported by physical line. The reason is a
+/// catalog key rendered in the current language, and neither the reason nor the
+/// line ever contains any part of a key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeyListError {
     line: usize,
-    message: &'static str,
+    reason: MessageId,
 }
 
 impl KeyListError {
-    fn new(line: usize, message: &'static str) -> Self {
-        Self { line, message }
+    fn new(line: usize, reason: MessageId) -> Self {
+        Self { line, reason }
     }
 
     /// The 1-based physical line the offending key was found on.
@@ -147,15 +138,22 @@ impl KeyListError {
         self.line
     }
 
-    /// Fixed message, safe to show in the settings window.
-    pub fn message(&self) -> &'static str {
-        self.message
+    /// The English diagnostic, rendered from the descriptor so the catalog
+    /// stays the only copy of the wording.
+    pub fn message(&self) -> String {
+        i18n::render(Language::En, &self.ui()).into_owned()
+    }
+
+    /// The reason and the line as a semantic descriptor, safe to show in the
+    /// settings window and rendered in the current language.
+    pub fn ui(&self) -> UiMessage {
+        UiMessage::new(self.reason).with_arg("line", (self.line as u64).into())
     }
 }
 
 impl fmt::Display for KeyListError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "строка {}: {}", self.line, self.message)
+        formatter.write_str(&self.message())
     }
 }
 
@@ -197,10 +195,10 @@ pub fn normalize_key_text(text: &str) -> Result<NormalizedKeys, KeyListError> {
             continue;
         }
         if key.chars().any(is_ts_whitespace) {
-            return Err(KeyListError::new(index + 1, KEY_WHITESPACE_MESSAGE));
+            return Err(KeyListError::new(index + 1, MessageId::KeyWhitespace));
         }
         if key.contains('\0') {
-            return Err(KeyListError::new(index + 1, KEY_NUL_MESSAGE));
+            return Err(KeyListError::new(index + 1, MessageId::KeyNul));
         }
         if !keys.iter().any(|existing| existing.as_str() == key) {
             keys.push(Arc::new(SecretKey::new(key.to_owned())));
@@ -299,17 +297,21 @@ pub enum SecretStoreKind {
     Invalid,
 }
 
-/// A secret-store failure whose `Display` text names the path and the problem,
-/// never a key value or any byte read from the file.
+/// A secret-store failure that names the path and the problem, never a key
+/// value or any byte read from the file. The statement is semantic: the shell
+/// renders it in the current language, and the English diagnostic is rendered
+/// from the same descriptor.
 #[derive(Clone, Debug)]
 pub struct SecretStoreError {
     kind: SecretStoreKind,
-    text: String,
+    /// The reason and its raw arguments - the path, a line number, an authored
+    /// nested cause - and nothing read from the file.
+    pub ui: UiMessage,
 }
 
 impl SecretStoreError {
-    fn new(kind: SecretStoreKind, text: String) -> Self {
-        Self { kind, text }
+    fn new(kind: SecretStoreKind, ui: UiMessage) -> Self {
+        Self { kind, ui }
     }
 
     /// Whether no store exists yet, which is not a failure to report as one.
@@ -321,59 +323,80 @@ impl SecretStoreError {
     fn missing(path: &Path) -> Self {
         Self::new(
             SecretStoreKind::Missing,
-            format!("{}: файл ключей ещё не создан.", path.display()),
+            UiMessage::new(MessageId::SecretStoreMissing).with_arg("path", path_arg(path)),
         )
     }
 
     /// The store exists but cannot be read or used by this process.
-    fn unavailable(path: &Path, reason: &str) -> Self {
-        Self::new(
-            SecretStoreKind::Unavailable,
-            format!("{}: {reason}.", path.display()),
-        )
+    fn unavailable(path: &Path, reason: UiMessage) -> Self {
+        Self::problem(SecretStoreKind::Unavailable, path, reason)
     }
 
     /// The store is not a valid Speechek container.
-    fn corrupt(path: &Path, reason: &str) -> Self {
+    fn corrupt(path: &Path, reason: UiMessage) -> Self {
+        Self::problem(SecretStoreKind::Corrupt, path, reason)
+    }
+
+    /// A store problem named by the file it belongs to.
+    fn problem(kind: SecretStoreKind, path: &Path, reason: UiMessage) -> Self {
         Self::new(
-            SecretStoreKind::Corrupt,
-            format!("{}: {reason}.", path.display()),
+            kind,
+            UiMessage::new(MessageId::SecretStoreProblem)
+                .with_arg("path", path_arg(path))
+                .with_arg("reason", message_arg(reason)),
         )
     }
 
     /// The container decrypted, but its key list breaks the format rules.
-    fn invalid(path: &Path, line: usize, reason: &str) -> Self {
+    fn invalid(path: &Path, line: usize, reason: MessageId) -> Self {
         Self::new(
             SecretStoreKind::Invalid,
-            format!("{}: строка {line}: {reason}.", path.display()),
+            UiMessage::new(MessageId::SecretKeysInvalid)
+                .with_arg("path", path_arg(path))
+                .with_arg("reason", message_arg(line_reason(line, reason))),
         )
     }
 
     /// The same list failure for a caller that supplied the list in memory and
     /// has no file to name.
-    fn invalid_at(line: usize, reason: &str) -> Self {
-        Self::new(
-            SecretStoreKind::Invalid,
-            format!("строка {line}: {reason}."),
-        )
+    fn invalid_at(line: usize, reason: MessageId) -> Self {
+        Self::new(SecretStoreKind::Invalid, line_reason(line, reason))
     }
 
     fn from_io(path: &Path, error: &io::Error) -> Self {
         if error.kind() == io::ErrorKind::NotFound {
             Self::missing(path)
         } else {
-            Self::unavailable(path, "файл ключей недоступен для чтения")
+            Self::unavailable(path, UiMessage::new(MessageId::SecretStoreUnreadable))
         }
     }
 }
 
 impl fmt::Display for SecretStoreError {
+    /// The English diagnostic, rendered from the descriptor so the catalog
+    /// stays the only copy of the wording.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.text)
+        formatter.write_str(&i18n::render(Language::En, &self.ui))
     }
 }
 
 impl std::error::Error for SecretStoreError {}
+
+/// A path as a diagnostic argument: raw text, substituted as-is.
+fn path_arg(path: &Path) -> serde_json::Value {
+    serde_json::Value::String(path.display().to_string())
+}
+
+/// An authored reason as the argument of another message: a nested descriptor
+/// renders in the same language as the message that names it.
+fn message_arg(message: UiMessage) -> serde_json::Value {
+    serde_json::to_value(message).unwrap_or(serde_json::Value::Null)
+}
+
+/// A key-list reason at one physical line, as the settings window shows it.
+fn line_reason(line: usize, reason: MessageId) -> UiMessage {
+    UiMessage::new(reason).with_arg("line", (line as u64).into())
+}
 
 /* -------------------------------------------------------------------------- */
 /* Store files                                                                */
@@ -394,7 +417,7 @@ pub fn read_secret_container(path: &Path) -> Result<Vec<u8>, SecretStoreError> {
     if path.is_dir() {
         return Err(SecretStoreError::unavailable(
             path,
-            "это каталог, а не файл",
+            UiMessage::new(MessageId::SecretStoreIsDirectory),
         ));
     }
     fs::read(path).map_err(|error| SecretStoreError::from_io(path, &error))
@@ -419,19 +442,19 @@ pub fn encode_secret_keys(keys: &[Arc<SecretKey>]) -> Result<Vec<u8>, SecretStor
         let line = index + 1;
         let value = key.as_str();
         if value.is_empty() {
-            return Err(SecretStoreError::invalid_at(line, KEY_EMPTY_MESSAGE));
+            return Err(SecretStoreError::invalid_at(line, MessageId::KeyEmpty));
         }
         if value.chars().any(is_ts_whitespace) {
-            return Err(SecretStoreError::invalid_at(line, KEY_WHITESPACE_MESSAGE));
+            return Err(SecretStoreError::invalid_at(line, MessageId::KeyWhitespace));
         }
         if value.contains('\0') {
-            return Err(SecretStoreError::invalid_at(line, KEY_NUL_MESSAGE));
+            return Err(SecretStoreError::invalid_at(line, MessageId::KeyNul));
         }
         if keys[..index]
             .iter()
             .any(|existing| existing.as_str() == value)
         {
-            return Err(SecretStoreError::invalid_at(line, KEY_DUPLICATE_MESSAGE));
+            return Err(SecretStoreError::invalid_at(line, MessageId::KeyDuplicate));
         }
     }
 
@@ -475,12 +498,12 @@ fn decode_container(
     {
         return Err(SecretStoreError::corrupt(
             path,
-            "неизвестный формат контейнера: ожидался заголовок SPK1",
+            UiMessage::new(MessageId::SecretContainerHeader),
         ));
     }
     let plaintext = unprotect(path, &container[CONTAINER_MAGIC.len()..])?;
     let text = str::from_utf8(&plaintext).map_err(|_| {
-        SecretStoreError::corrupt(path, "расшифрованное содержимое не является текстом UTF-8")
+        SecretStoreError::corrupt(path, UiMessage::new(MessageId::SecretContainerNotText))
     })?;
 
     // The repaired document - a copy of the plaintext, cleared on drop - is
@@ -495,7 +518,9 @@ fn decode_container(
         .map_err(|error| SecretStoreError::corrupt(path, describe_json_failure(&error)))?;
     deserializer
         .end()
-        .map_err(|_| SecretStoreError::corrupt(path, "после документа есть лишние байты"))?;
+        .map_err(|_| {
+            SecretStoreError::corrupt(path, UiMessage::new(MessageId::SecretContainerTrailing))
+        })?;
     materialize_keys(path, repaired_values, document)
 }
 
@@ -519,12 +544,15 @@ fn materialize_keys(
             DocumentToken::Repaired(reference) => {
                 match repaired_values.get_mut(reference.wrapping_sub(1)) {
                     Some(slot) => slot.take().ok_or_else(|| {
-                        SecretStoreError::corrupt(path, "ссылка на строку контейнера повторяется")
+                        SecretStoreError::corrupt(
+                            path,
+                            UiMessage::new(MessageId::SecretContainerReferenceRepeat),
+                        )
                     })?,
                     None => {
                         return Err(SecretStoreError::corrupt(
                             path,
-                            "ссылка на строку вне документа",
+                            UiMessage::new(MessageId::SecretContainerReferenceOutside),
                         ))
                     }
                 }
@@ -532,37 +560,52 @@ fn materialize_keys(
         };
         let text = key.as_str();
         if text.is_empty() {
-            return Err(SecretStoreError::invalid(path, line, KEY_EMPTY_MESSAGE));
+            return Err(SecretStoreError::invalid(path, line, MessageId::KeyEmpty));
         }
         if text.chars().any(is_ts_whitespace) {
-            return Err(SecretStoreError::invalid(
-                path,
-                line,
-                KEY_WHITESPACE_MESSAGE,
-            ));
+            return Err(SecretStoreError::invalid(path, line, MessageId::KeyWhitespace));
         }
         if text.contains('\0') {
-            return Err(SecretStoreError::invalid(path, line, KEY_NUL_MESSAGE));
+            return Err(SecretStoreError::invalid(path, line, MessageId::KeyNul));
         }
         if keys.iter().any(|existing| existing.as_str() == text) {
-            return Err(SecretStoreError::invalid(path, line, KEY_DUPLICATE_MESSAGE));
+            return Err(SecretStoreError::invalid(path, line, MessageId::KeyDuplicate));
         }
+
         // `mem::take` moves the value out, leaving a buffer that owns nothing.
         keys.push(Arc::new(SecretKey::new(std::mem::take(&mut *key))));
     }
     Ok(keys)
 }
 
-/// Maps a `serde_json` failure to fixed text. serde's own message can quote the
-/// value it refused - including a key - so only the failure class is used.
-fn describe_json_failure(error: &serde_json::Error) -> &'static str {
-    match error.classify() {
+/// Maps a `serde_json` failure to a catalog reason. serde's own message can
+/// quote the value it refused - including a key - so only the failure class is
+/// used.
+fn describe_json_failure(error: &serde_json::Error) -> UiMessage {
+    let key = match error.classify() {
         serde_json::error::Category::Syntax | serde_json::error::Category::Eof => {
-            "контейнер повреждён"
+            MessageId::SecretContainerDamaged
         }
-        serde_json::error::Category::Data => "содержимое контейнера не соответствует формату",
-        serde_json::error::Category::Io => "контейнер не удалось прочитать",
-    }
+        serde_json::error::Category::Data => MessageId::SecretContainerDocumentFormat,
+        serde_json::error::Category::Io => MessageId::SecretContainerUnreadable,
+    };
+    UiMessage::new(key)
+}
+
+/// A malformed escape sequence inside a container string.
+fn escape_error(path: &Path) -> SecretStoreError {
+    SecretStoreError::corrupt(
+        path,
+        UiMessage::new(MessageId::SecretContainerBadEscape),
+    )
+}
+
+/// An incomplete surrogate pair inside a container string.
+fn surrogate_error(path: &Path) -> SecretStoreError {
+    SecretStoreError::corrupt(
+        path,
+        UiMessage::new(MessageId::SecretContainerSurrogate),
+    )
 }
 
 /* -------------------------------------------------------------------------- */
@@ -610,7 +653,7 @@ fn repair_escaped_strings(
             if decoded.contains('\0') {
                 return Err(SecretStoreError::corrupt(
                     path,
-                    "строка контейнера содержит нулевой байт",
+                    UiMessage::new(MessageId::SecretContainerStringNul),
                 ));
             }
             repaired_values.push(decoded);
@@ -643,7 +686,7 @@ fn string_end(path: &Path, text: &str, start: usize) -> Result<usize, SecretStor
     }
     Err(SecretStoreError::corrupt(
         path,
-        "строка контейнера не закрыта",
+        UiMessage::new(MessageId::SecretContainerStringUnclosed),
     ))
 }
 
@@ -651,10 +694,6 @@ fn string_end(path: &Path, text: &str, start: usize) -> Result<usize, SecretStor
 /// including a failure. The result can never be longer than the body, so the
 /// buffer is allocated once and never grows.
 fn decode_json_string(path: &Path, body: &str) -> Result<Zeroizing<String>, SecretStoreError> {
-    const ESCAPE: &str = "escape-последовательность в строке контейнера не распознана";
-    const CONTROL: &str = "строка контейнера содержит служебный символ";
-    const SURROGATE: &str = "строка контейнера содержит незавершённую суррогатную пару";
-
     let mut decoded = Zeroizing::new(String::with_capacity(body.len()));
     let mut characters = body.chars();
     while let Some(character) = characters.next() {
@@ -662,7 +701,7 @@ fn decode_json_string(path: &Path, body: &str) -> Result<Zeroizing<String>, Secr
             '\\' => {
                 let escape = characters
                     .next()
-                    .ok_or_else(|| SecretStoreError::corrupt(path, ESCAPE))?;
+                    .ok_or_else(|| escape_error(path))?;
                 match escape {
                     '"' => decoded.push('"'),
                     '\\' => decoded.push('\\'),
@@ -676,29 +715,32 @@ fn decode_json_string(path: &Path, body: &str) -> Result<Zeroizing<String>, Secr
                         let unit = read_hex4(path, &mut characters)?;
                         let character = if (0xd800..=0xdbff).contains(&unit) {
                             if characters.next() != Some('\\') || characters.next() != Some('u') {
-                                return Err(SecretStoreError::corrupt(path, SURROGATE));
+                                return Err(surrogate_error(path));
                             }
                             let low = read_hex4(path, &mut characters)?;
                             if !(0xdc00..=0xdfff).contains(&low) {
-                                return Err(SecretStoreError::corrupt(path, SURROGATE));
+                                return Err(surrogate_error(path));
                             }
                             let combined =
                                 0x1_0000 + ((unit as u32 - 0xd800) << 10) + (low as u32 - 0xdc00);
                             char::from_u32(combined)
-                                .ok_or_else(|| SecretStoreError::corrupt(path, SURROGATE))?
+                                .ok_or_else(|| surrogate_error(path))?
                         } else if (0xdc00..=0xdfff).contains(&unit) {
-                            return Err(SecretStoreError::corrupt(path, SURROGATE));
+                            return Err(surrogate_error(path));
                         } else {
                             char::from_u32(unit as u32)
-                                .ok_or_else(|| SecretStoreError::corrupt(path, SURROGATE))?
+                                .ok_or_else(|| surrogate_error(path))?
                         };
                         decoded.push(character);
                     }
-                    _ => return Err(SecretStoreError::corrupt(path, ESCAPE)),
+                    _ => return Err(escape_error(path)),
                 }
             }
             character if (character as u32) < 0x20 => {
-                return Err(SecretStoreError::corrupt(path, CONTROL));
+                return Err(SecretStoreError::corrupt(
+                    path,
+                    UiMessage::new(MessageId::SecretContainerControlCharacter),
+                ));
             }
             character => decoded.push(character),
         }
@@ -713,12 +755,7 @@ fn read_hex4(path: &Path, characters: &mut str::Chars<'_>) -> Result<u16, Secret
         let digit = characters
             .next()
             .and_then(|character| character.to_digit(16))
-            .ok_or_else(|| {
-                SecretStoreError::corrupt(
-                    path,
-                    "escape-последовательность в строке контейнера не распознана",
-                )
-            })?;
+            .ok_or_else(|| escape_error(path))?;
         value = (value << 4) | digit as u16;
     }
     Ok(value)
@@ -932,7 +969,7 @@ fn protect(plaintext: &[u8]) -> Result<Vec<u8>, SecretStoreError> {
     let length = u32::try_from(plaintext.len()).map_err(|_| {
         SecretStoreError::new(
             SecretStoreKind::Invalid,
-            "список ключей слишком велик для контейнера.".to_owned(),
+            UiMessage::new(MessageId::SecretStoreTooLarge),
         )
     })?;
     let input = CRYPT_INTEGER_BLOB {
@@ -957,8 +994,7 @@ fn protect(plaintext: &[u8]) -> Result<Vec<u8>, SecretStoreError> {
         .map_err(|_| {
             SecretStoreError::new(
                 SecretStoreKind::Unavailable,
-                "не удалось зашифровать список ключей для текущего пользователя Windows."
-                    .to_owned(),
+                UiMessage::new(MessageId::SecretStoreEncryptFailed),
             )
         })?;
     }
@@ -971,10 +1007,14 @@ fn protect(plaintext: &[u8]) -> Result<Vec<u8>, SecretStoreError> {
 /// [`Zeroizing`] buffer so it is cleared again when the caller is done with it.
 fn unprotect(path: &Path, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, SecretStoreError> {
     if ciphertext.is_empty() {
-        return Err(SecretStoreError::corrupt(path, "контейнер пуст"));
+        return Err(SecretStoreError::corrupt(
+            path,
+            UiMessage::new(MessageId::SecretContainerEmpty),
+        ));
     }
-    let length = u32::try_from(ciphertext.len())
-        .map_err(|_| SecretStoreError::corrupt(path, "контейнер повреждён"))?;
+    let length = u32::try_from(ciphertext.len()).map_err(|_| {
+        SecretStoreError::corrupt(path, UiMessage::new(MessageId::SecretContainerDamaged))
+    })?;
     let input = CRYPT_INTEGER_BLOB {
         cbData: length,
         pbData: ciphertext.as_ptr() as *mut u8,
@@ -997,7 +1037,7 @@ fn unprotect(path: &Path, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, Secre
         .map_err(|_| {
             SecretStoreError::corrupt(
                 path,
-                "контейнер не расшифрован для текущего пользователя Windows или повреждён",
+                UiMessage::new(MessageId::SecretContainerNotDecrypted),
             )
         })?;
     }

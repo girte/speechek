@@ -32,9 +32,11 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SizedSample, StreamConfig};
 use parking_lot::Mutex;
 use serde::Serialize;
+use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::audio;
+use crate::i18n::{self, Language, MessageId, UiError, UiMessage};
 use crate::{LAB_LABEL, OVERLAY_LABEL};
 
 /// Emitted for every captured frame, to the window of the take it belongs to.
@@ -52,12 +54,35 @@ const RATE_HZ: u32 = 16_000;
 const FRAME_SAMPLES: usize = 512;
 /// A device that has not answered in this long is not going to answer.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
-/// Windows reporting no default microphone at all. There is nothing for the
-/// system fallback to try, so this always fails the take.
-const NO_SYSTEM_DEVICE: &str = "Windows reports no default microphone. Connect one, or set a default input device (and allow speechek to use it in the Windows privacy settings).";
+/// The stable codes capture failures cross the command and event boundary
+/// with. The reason itself is the descriptor's key; these only keep the
+/// categories apart.
+const MICROPHONE_BUSY: &str = "MICROPHONE_BUSY";
+const MICROPHONE_ERROR: &str = "MICROPHONE_ERROR";
+const CAPTURE_ENDED: &str = "CAPTURE_ENDED";
+const CAPTURE_FAILED: &str = "CAPTURE_FAILED";
+
+/// A microphone failure without arguments.
+fn mic_failure(key: MessageId) -> UiError {
+    UiError::new(MICROPHONE_ERROR, UiMessage::new(key))
+}
+
+/// A microphone failure whose one placeholder is the named value. An operating
+/// system or driver string is copied in as data — it is never translated and
+/// never read again as a template.
+fn mic_failure_arg(key: MessageId, name: &'static str, value: Value) -> UiError {
+    UiError::new(MICROPHONE_ERROR, UiMessage::new(key).with_arg(name, value))
+}
+
 /// A take that ended while its device was still opening: its capture must not
 /// start, record or silence anything.
-const ENDED_WHILE_OPENING: &str = "this dictation ended while its microphone was opening.";
+fn ended_while_opening() -> UiError {
+    UiError::new(
+        CAPTURE_ENDED,
+        UiMessage::new(MessageId::CaptureEndedWhileOpening),
+    )
+}
+
 /// The session thread needs far less than this to close down after a stop.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long the session thread waits for the next callback's samples.
@@ -144,7 +169,12 @@ struct Frame {
 #[derive(Clone, Serialize)]
 struct CaptureNotice {
     generation: u64,
+    /// The English diagnostic for logs and for callers that predate the
+    /// catalog; the current language renders `ui`.
     message: String,
+    /// The semantic reason this notice carries; one reason keeps one key in
+    /// every language.
+    ui: UiMessage,
     last: bool,
 }
 
@@ -395,56 +425,61 @@ impl Gone for cpal::StreamError {
 enum OpenError {
     /// The device the settings named is gone: before the first frame, exactly
     /// one retry with the system device may repair this.
-    Fallback(String),
-    /// No other device repairs this: the take fails with this message.
-    Fatal(String),
+    Fallback(UiError),
+    /// No other device repairs this: the take fails with this reason.
+    Fatal(UiError),
 }
 
 impl OpenError {
-    fn fallback(message: impl Into<String>) -> Self {
-        Self::Fallback(message.into())
+    fn fallback(error: UiError) -> Self {
+        Self::Fallback(error)
     }
 
-    fn fatal(message: impl Into<String>) -> Self {
-        Self::Fatal(message.into())
+    fn fatal(error: UiError) -> Self {
+        Self::Fatal(error)
     }
 
-    /// The failure of one device attempt: its message, and whether the system
+    /// The failure of one device attempt: its reason, and whether the system
     /// fallback may repair it.
-    fn device(message: String, gone: bool) -> Self {
+    fn device(error: UiError, gone: bool) -> Self {
         if gone {
-            Self::Fallback(message)
+            Self::Fallback(error)
         } else {
-            Self::Fatal(message)
+            Self::Fatal(error)
         }
     }
 }
 
 /// A failure the session thread has to see, as the stream reports it.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum StreamFailure {
     /// The device is no longer available. Before the first frame this is what
     /// the system fallback may repair; after it, the take ends.
-    Unavailable(String),
-    /// Anything else: the take ends with this message.
-    Fatal(String),
+    Unavailable(UiError),
+    /// Anything else: the take ends with this reason.
+    Fatal(UiError),
 }
 
 impl StreamFailure {
     /// The driver's own words for the failure, classified by what another
     /// device could repair.
     fn of(err: cpal::StreamError) -> Self {
-        let message = format!("Windows stopped the microphone stream: {err}");
+        let error = mic_failure_arg(
+            MessageId::MicStreamStopped,
+            "detail",
+            Value::String(err.to_string()),
+        );
         if err.gone() {
-            Self::Unavailable(message)
+            Self::Unavailable(error)
         } else {
-            Self::Fatal(message)
+            Self::Fatal(error)
         }
     }
 
-    fn message(self) -> String {
+    /// The reason this take ends with, whichever way the stream failed.
+    fn into_error(self) -> UiError {
         match self {
-            Self::Unavailable(message) | Self::Fatal(message) => message,
+            Self::Unavailable(error) | Self::Fatal(error) => error,
         }
     }
 }
@@ -468,9 +503,7 @@ struct Input {
 /// as a device Windows no longer lists, and never a failed take.
 fn parse_selected(id: &str) -> Result<cpal::DeviceId, OpenError> {
     cpal::DeviceId::from_str(id).map_err(|_| {
-        OpenError::fallback(
-            "the chosen microphone is not a device id this shell can read".to_string(),
-        )
+        OpenError::fallback(mic_failure(MessageId::MicSelectedUnreadableId))
     })
 }
 
@@ -488,32 +521,24 @@ fn open(selected: Option<&str>) -> Result<Input, OpenError> {
         Some(id) => {
             let parsed = parse_selected(id)?;
             host.device_by_id(&parsed).ok_or_else(|| {
-                OpenError::fallback(
-                    "the chosen microphone is no longer connected: Windows does not list it"
-                        .to_string(),
-                )
+                OpenError::fallback(mic_failure(MessageId::MicSelectedMissing))
             })?
         }
         None => host
             .default_input_device()
-            .ok_or_else(|| OpenError::fatal(NO_SYSTEM_DEVICE.to_string()))?,
+            .ok_or_else(|| OpenError::fatal(mic_failure(MessageId::MicNoSystemDevice)))?,
     };
     if !device.supports_input() {
         return Err(match selected {
-            Some(_) => OpenError::fallback(
-                "the chosen microphone cannot record: Windows does not offer it as an input device"
-                    .to_string(),
-            ),
-            None => OpenError::fatal(NO_SYSTEM_DEVICE.to_string()),
+            Some(_) => OpenError::fallback(mic_failure(MessageId::MicSelectedNotInput)),
+            None => OpenError::fatal(mic_failure(MessageId::MicNoSystemDevice)),
         });
     }
     let supported = supported_config(&device)?;
     let format = supported.sample_format();
     let rate = supported.sample_rate();
     if rate == 0 {
-        return Err(OpenError::fatal(
-            "the microphone reports a sample rate of zero".to_string(),
-        ));
+        return Err(OpenError::fatal(mic_failure(MessageId::MicZeroSampleRate)));
     }
     let channels = usize::from(supported.channels()).max(1);
     Ok(Input {
@@ -535,7 +560,11 @@ fn open(selected: Option<&str>) -> Result<Input, OpenError> {
 fn supported_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig, OpenError> {
     let default = device.default_input_config().map_err(|err| {
         OpenError::device(
-            format!("Windows did not report a default microphone format: {err}"),
+            mic_failure_arg(
+                MessageId::MicNoDefaultFormat,
+                "detail",
+                Value::String(err.to_string()),
+            ),
             err.gone(),
         )
     })?;
@@ -546,7 +575,7 @@ fn supported_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig
         .supported_input_configs()
         .map_err(|err| {
             OpenError::device(
-                format!("Windows did not report the microphone formats: {err}"),
+                mic_failure_arg(MessageId::MicNoFormats, "detail", Value::String(err.to_string())),
                 err.gone(),
             )
         })?
@@ -556,9 +585,10 @@ fn supported_config(device: &cpal::Device) -> Result<cpal::SupportedStreamConfig
             range.with_sample_rate(rate)
         });
     fallback.ok_or_else(|| {
-        OpenError::fatal(format!(
-            "the microphone only offers {} samples, which the shell cannot read",
-            default.sample_format()
+        OpenError::fatal(mic_failure_arg(
+            MessageId::MicUnreadableSamples,
+            "format",
+            Value::String(default.sample_format().to_string()),
         ))
     })
 }
@@ -576,8 +606,10 @@ fn build(
         SampleFormat::F32 => build_typed::<f32>(input, samples, free, errors),
         SampleFormat::I16 => build_typed::<i16>(input, samples, free, errors),
         SampleFormat::U16 => build_typed::<u16>(input, samples, free, errors),
-        other => Err(OpenError::fatal(format!(
-            "the microphone speaks {other}, which the shell cannot read"
+        other => Err(OpenError::fatal(mic_failure_arg(
+            MessageId::MicUnreadableFormat,
+            "format",
+            Value::String(other.to_string()),
         ))),
     }
 }
@@ -605,7 +637,11 @@ where
         )
         .map_err(|err| {
             OpenError::device(
-                format!("the microphone cannot be opened for capture: {err}"),
+                mic_failure_arg(
+                    MessageId::MicCannotOpen,
+                    "detail",
+                    Value::String(err.to_string()),
+                ),
                 err.gone(),
             )
         })
@@ -627,7 +663,7 @@ struct Session {
     stop: Sender<()>,
     /// The sequence of the last emitted frame, sent once the tail is out, or
     /// the reason the stream failed before it could be read whole.
-    landed: Receiver<Result<u64, String>>,
+    landed: Receiver<Result<u64, UiError>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -641,7 +677,7 @@ impl Session {
     /// renderer cannot trust is never handed over as if it were whole. A
     /// session that does not report itself in time is left detached: a driver
     /// that stopped answering must not be able to hold this thread forever.
-    fn finish(mut self) -> Result<u64, String> {
+    fn finish(mut self) -> Result<u64, UiError> {
         let _ = self.stop.send(());
         let landed = self.landed.recv_timeout(STOP_TIMEOUT);
         if !matches!(landed, Err(RecvTimeoutError::Timeout)) {
@@ -652,10 +688,10 @@ impl Session {
         match landed {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
-                Err("the microphone did not stop within five seconds".to_string())
+                Err(UiError::new(CAPTURE_FAILED, UiMessage::new(MessageId::MicStopTimeout)))
             }
             Err(RecvTimeoutError::Disconnected) => {
-                Err("the capture thread ended before it reported its frames".to_string())
+                Err(UiError::new(CAPTURE_FAILED, UiMessage::new(MessageId::CaptureThreadLost)))
             }
         }
     }
@@ -790,22 +826,22 @@ impl NativeCapture {
     /// a leftover take of the same window so the caller can end it outside this
     /// lock. The other window's capture — and this very take, already claimed —
     /// are refused.
-    fn claim(&self, owner: CaptureOwner) -> Result<Option<Active>, String> {
+    fn claim(&self, owner: CaptureOwner) -> Result<Option<Active>, UiError> {
         let mut slot = self.slot.lock();
         match stop_right(&slot, owner) {
             StopRight::Idle => Ok(None),
-            StopRight::Mine => Err(same_take_message(owner)),
+            StopRight::Mine => Err(same_take_error(owner)),
             StopRight::Stale => Ok(slot.take()),
-            StopRight::Foreign => Err(busy_message(owner)),
+            StopRight::Foreign => Err(busy_error(owner)),
         }
     }
 
     /// Puts the reservation of a take into the slot it claimed, or refuses
     /// because another take claimed the microphone in between.
-    fn reserve(&self, opening: Opening) -> Result<(), String> {
+    fn reserve(&self, opening: Opening) -> Result<(), UiError> {
         let mut slot = self.slot.lock();
         if slot.is_some() {
-            return Err(busy_message(opening.owner));
+            return Err(busy_error(opening.owner));
         }
         *slot = Some(Active::Opening(opening));
         Ok(())
@@ -815,7 +851,7 @@ impl NativeCapture {
     /// not: the other window's capture is refused, a newer take of the same
     /// window leaves nothing behind, and a take that is still opening its device
     /// is handed over to be closed without waiting for its driver.
-    fn take_for_stop(&self, owner: CaptureOwner) -> Result<Option<Active>, String> {
+    fn take_for_stop(&self, owner: CaptureOwner) -> Result<Option<Active>, UiError> {
         let mut slot = self.slot.lock();
         match stop_right(&slot, owner) {
             StopRight::Mine => Ok(slot.take()),
@@ -823,7 +859,7 @@ impl NativeCapture {
             // stop has no stream of its own left, and the newer one is not
             // touched.
             StopRight::Stale => Ok(None),
-            StopRight::Foreign => Err(busy_message(owner)),
+            StopRight::Foreign => Err(busy_error(owner)),
             StopRight::Idle => Ok(None),
         }
     }
@@ -838,7 +874,7 @@ impl NativeCapture {
         ticket: &Arc<()>,
         admission: u64,
         owner: CaptureOwner,
-        landed: Receiver<Result<u64, String>>,
+        landed: Receiver<Result<u64, UiError>>,
     ) -> Result<(), ()> {
         let mut slot = self.slot.lock();
         if !current(&self.closed, admission) {
@@ -946,29 +982,25 @@ impl NativeCapture {
     }
 }
 
-/// The message a start of `owner` gets when the microphone is already capturing
+/// The reason a start of `owner` gets when the microphone is already capturing
 /// that very take.
-fn same_take_message(owner: CaptureOwner) -> String {
-    match owner {
-        CaptureOwner::Dictation(_) => {
-            "the microphone is already capturing this dictation".to_string()
-        }
-        CaptureOwner::Lab(_) => "микрофон уже записывает эту лабораторную запись".to_string(),
-    }
+fn same_take_error(owner: CaptureOwner) -> UiError {
+    let key = match owner {
+        CaptureOwner::Dictation(_) => MessageId::CaptureSameTakeDictation,
+        CaptureOwner::Lab(_) => MessageId::CaptureSameTakeLab,
+    };
+    UiError::new(MICROPHONE_BUSY, UiMessage::new(key))
 }
 
-/// The message a start or a stop of `owner` gets when the microphone is busy
+/// The reason a start or a stop of `owner` gets when the microphone is busy
 /// with the other window's capture: the laboratory and a dictation never share
 /// a take.
-fn busy_message(owner: CaptureOwner) -> String {
-    match owner {
-        CaptureOwner::Dictation(_) => {
-            "the microphone is recording for another window of Speechek".to_string()
-        }
-        CaptureOwner::Lab(_) => {
-            "микрофон занят записью другого окна Speechek".to_string()
-        }
-    }
+fn busy_error(owner: CaptureOwner) -> UiError {
+    let key = match owner {
+        CaptureOwner::Dictation(_) => MessageId::CaptureBusyDictation,
+        CaptureOwner::Lab(_) => MessageId::CaptureBusyLab,
+    };
+    UiError::new(MICROPHONE_BUSY, UiMessage::new(key))
 }
 
 /// The shell's promise that a capture may open its microphone, as it stands at
@@ -1058,34 +1090,34 @@ struct Opened {
 enum AttemptError {
     /// The selected device is gone: one retry with the system device may still
     /// record this take.
-    Fallback(String),
+    Fallback(UiError),
     /// The device answered and refused the take: no other microphone repairs
     /// that.
-    Fatal(String),
+    Fatal(UiError),
     /// The attempt never recorded anything because the take is already over.
     /// No device failed, so no failure is reported for it.
-    Ended(String),
+    Ended(UiError),
 }
 
 impl From<OpenError> for AttemptError {
     fn from(error: OpenError) -> Self {
         match error {
-            OpenError::Fallback(message) => Self::Fallback(message),
-            OpenError::Fatal(message) => Self::Fatal(message),
+            OpenError::Fallback(error) => Self::Fallback(error),
+            OpenError::Fatal(error) => Self::Fatal(error),
         }
     }
 }
 
 /// What a failed attempt leaves to do.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum Retry {
     /// The selected device is gone: the system device is tried once, in its
     /// place. Carries the reason, for the log only.
-    System(String),
-    /// The take ends before its first frame, with this message for its command.
-    End(String),
+    System(UiError),
+    /// The take ends before its first frame, with this reason for its command.
+    End(UiError),
     /// The take was already over: nothing failed, so nothing is reported.
-    Ended(String),
+    Ended(UiError),
 }
 
 /// The fallback policy, decided without a device: the system device replaces
@@ -1094,9 +1126,9 @@ enum Retry {
 /// holding it — ends the take; no other microphone repairs that.
 fn retry(failure: AttemptError, already_fell_back: bool) -> Retry {
     match failure {
-        AttemptError::Fallback(reason) if !already_fell_back => Retry::System(reason),
-        AttemptError::Fallback(message) | AttemptError::Fatal(message) => Retry::End(message),
-        AttemptError::Ended(message) => Retry::Ended(message),
+        AttemptError::Fallback(error) if !already_fell_back => Retry::System(error),
+        AttemptError::Fallback(error) | AttemptError::Fatal(error) => Retry::End(error),
+        AttemptError::Ended(error) => Retry::Ended(error),
     }
 }
 
@@ -1127,12 +1159,12 @@ struct Handshake {
     /// The command's end of this handshake. At most one answer ever travels
     /// through it, and failing to hand it over is the renderer having given the
     /// command up.
-    ready: SyncSender<Result<CaptureStart, String>>,
+    ready: SyncSender<Result<CaptureStart, UiError>>,
     state: HandshakeState,
 }
 
 impl Handshake {
-    fn new(ready: SyncSender<Result<CaptureStart, String>>) -> Self {
+    fn new(ready: SyncSender<Result<CaptureStart, UiError>>) -> Self {
         Self {
             ready,
             state: HandshakeState::Waiting,
@@ -1176,12 +1208,12 @@ impl Handshake {
     /// The capture is over before its answer ever went out: the command learns
     /// that the attempt failed, not that it may record. An answer that already
     /// went out is not taken back — there is nothing to say twice.
-    fn fail(&mut self, message: String) -> Result<(), ()> {
+    fn fail(&mut self, error: UiError) -> Result<(), ()> {
         if !matches!(self.state, HandshakeState::Waiting) {
             return Err(());
         }
         self.state = HandshakeState::Abandoned;
-        self.ready.send(Err(message)).map_err(|_| ())
+        self.ready.send(Err(error)).map_err(|_| ())
     }
 }
 
@@ -1214,13 +1246,13 @@ impl Attempt<'_> {
     /// The retry therefore starts from an empty encoder and sequence zero.
     fn run(self) -> Result<Opened, AttemptError> {
         if self.handshake.over(self.closed, self.admission, self.control) {
-            return Err(AttemptError::Ended(ENDED_WHILE_OPENING.to_string()));
+            return Err(AttemptError::Ended(ended_while_opening()));
         }
         let input = open(self.selected).map_err(AttemptError::from)?;
         if self.handshake.over(self.closed, self.admission, self.control) {
             // The device answered, but the take is over: it is given back
             // without a stream ever running, so nothing of it is recorded.
-            return Err(AttemptError::Ended(ENDED_WHILE_OPENING.to_string()));
+            return Err(AttemptError::Ended(ended_while_opening()));
         }
         let (samples_tx, samples_rx) = mpsc::channel::<Vec<f32>>();
         let (free_tx, free_rx) = mpsc::channel::<Vec<f32>>();
@@ -1233,11 +1265,15 @@ impl Attempt<'_> {
         let mut encoder = Encoder::new(self.app.clone(), self.owner, input.rate);
         let stream = build(&input, samples_tx, free_rx, errors_tx).map_err(AttemptError::from)?;
         if let Err(err) = stream.play() {
-            let message = format!("the microphone stream did not start: {err}");
+            let error = mic_failure_arg(
+                MessageId::MicStreamDidNotStart,
+                "detail",
+                Value::String(err.to_string()),
+            );
             return Err(if err.gone() {
-                AttemptError::Fallback(message)
+                AttemptError::Fallback(error)
             } else {
-                AttemptError::Fatal(message)
+                AttemptError::Fatal(error)
             });
         }
         // The stream runs, but the take has not recorded anything yet: the
@@ -1245,7 +1281,7 @@ impl Attempt<'_> {
         let deadline = Instant::now() + OPEN_TIMEOUT;
         loop {
             if self.handshake.over(self.closed, self.admission, self.control) {
-                return Err(AttemptError::Ended(ENDED_WHILE_OPENING.to_string()));
+                return Err(AttemptError::Ended(ended_while_opening()));
             }
             drain(&samples_rx, &free_tx, &mut encoder);
             if encoder.sequence > 0 {
@@ -1253,14 +1289,15 @@ impl Attempt<'_> {
             }
             if let Ok(failure) = errors_rx.try_recv() {
                 return Err(match failure {
-                    StreamFailure::Unavailable(message) => AttemptError::Fallback(message),
-                    StreamFailure::Fatal(message) => AttemptError::Fatal(message),
+                    StreamFailure::Unavailable(error) => AttemptError::Fallback(error),
+                    StreamFailure::Fatal(error) => AttemptError::Fatal(error),
                 });
             }
             if Instant::now() >= deadline {
-                return Err(AttemptError::Fatal(format!(
-                    "the microphone did not deliver a single frame within {} seconds",
-                    OPEN_TIMEOUT.as_secs()
+                return Err(AttemptError::Fatal(mic_failure_arg(
+                    MessageId::MicNoFrame,
+                    "seconds",
+                    Value::from(OPEN_TIMEOUT.as_secs()),
                 )));
             }
             thread::sleep(IDLE_POLL);
@@ -1339,12 +1376,12 @@ pub fn start(
     input_device: Option<&str>,
     mute_audio: bool,
     admission: u64,
-) -> Result<CaptureStart, String> {
+) -> Result<CaptureStart, UiError> {
     let state = app.state::<NativeCapture>();
     if !current(&state.closed, admission) {
         // The take is over already: no thread is started for it, so no device
         // is opened and no mute can be engaged behind the shell's back.
-        return Err(ended_message(owner));
+        return Err(ended_error(owner));
     }
 
     // A take of this same window left in the slot by an earlier generation is
@@ -1358,9 +1395,9 @@ pub fn start(
     // device is opened is what makes a device that disappeared since the
     // settings were written a fallback instead of a dead take.
     let selected = input_device.map(str::to_owned);
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<CaptureStart, String>>(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<CaptureStart, UiError>>(1);
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let (landed_tx, landed_rx) = mpsc::channel::<Result<u64, String>>();
+    let (landed_tx, landed_rx) = mpsc::channel::<Result<u64, UiError>>();
     let ticket = Arc::new(());
     // The reservation is in the slot before the worker exists: a second start of
     // either owner finds the microphone taken, and a stop can end this take
@@ -1397,7 +1434,11 @@ pub fn start(
             // No worker holds the reservation, so it is taken back here: the
             // microphone must not stay claimed by a thread that never existed.
             state.withdraw(owner, &ticket);
-            return Err(format!("cannot start the capture thread: {err}"));
+            return Err(mic_failure_arg(
+                MessageId::CaptureThreadStart,
+                "detail",
+                Value::String(err.to_string()),
+            ));
         }
     };
     state.attach_worker(owner, &ticket, worker_thread);
@@ -1406,7 +1447,7 @@ pub fn start(
         Ok(Ok(opened)) => Ok(opened),
         // The worker withdrew its own reservation before answering, so there is
         // nothing left to take back here.
-        Ok(Err(message)) => Err(message),
+        Ok(Err(error)) => Err(error),
         Err(RecvTimeoutError::Timeout) => {
             // No frame in time. The reservation is taken back before the stop is
             // queued: a worker whose driver answers late finds its slot entry
@@ -1415,14 +1456,15 @@ pub fn start(
             // A recording that was installed in the very instant the wait
             // expired is closed here through its own take.
             state.abandon(owner, &ticket);
-            Err(format!(
-                "the microphone did not start within {} seconds",
-                OPEN_TIMEOUT.as_secs()
+            Err(mic_failure_arg(
+                MessageId::MicStartTimeout,
+                "seconds",
+                Value::from(OPEN_TIMEOUT.as_secs()),
             ))
         }
         Err(RecvTimeoutError::Disconnected) => {
             state.abandon(owner, &ticket);
-            Err("the capture thread stopped before the device opened".to_string())
+            Err(UiError::new(CAPTURE_FAILED, UiMessage::new(MessageId::CaptureThreadStopped)))
         }
     }
 }
@@ -1437,7 +1479,7 @@ pub fn start(
 /// alone and answers zero. A take whose device is still opening is closed
 /// without waiting for its driver, so a stop can never hang on a device that
 /// does not answer.
-pub fn stop(app: &AppHandle, owner: CaptureOwner) -> Result<u64, String> {
+pub fn stop(app: &AppHandle, owner: CaptureOwner) -> Result<u64, UiError> {
     let state = app.state::<NativeCapture>();
     match state.take_for_stop(owner)? {
         Some(Active::Recording(session)) => session.finish(),
@@ -1511,13 +1553,12 @@ impl Drop for Reservation<'_> {
 
 /// Why a start answered that nothing was opened, for a take that was already
 /// over before its device was touched.
-fn ended_message(owner: CaptureOwner) -> String {
-    match owner {
-        CaptureOwner::Dictation(_) => {
-            "this dictation ended before its microphone could be opened.".to_string()
-        }
-        CaptureOwner::Lab(_) => "эта запись завершилась до того, как микрофон был открыт".to_string(),
-    }
+fn ended_error(owner: CaptureOwner) -> UiError {
+    let key = match owner {
+        CaptureOwner::Dictation(_) => MessageId::CaptureEndedDictation,
+        CaptureOwner::Lab(_) => MessageId::CaptureEndedLab,
+    };
+    UiError::new(CAPTURE_ENDED, UiMessage::new(key))
 }
 
 /// Runs one take's capture on its own thread: the device, the stream and the
@@ -1552,10 +1593,10 @@ fn session_thread(
     selected: Option<String>,
     mute_audio: bool,
     admission: u64,
-    ready: SyncSender<Result<CaptureStart, String>>,
+    ready: SyncSender<Result<CaptureStart, UiError>>,
     control: Receiver<()>,
-    landed: Sender<Result<u64, String>>,
-    answers: Receiver<Result<u64, String>>,
+    landed: Sender<Result<u64, UiError>>,
+    answers: Receiver<Result<u64, UiError>>,
 ) {
     let state = app.state::<NativeCapture>();
     let mut reservation = Reservation {
@@ -1577,7 +1618,7 @@ fn session_thread(
             // The take was given up on before this attempt recorded anything:
             // nobody is waiting for an answer about a capture that must not
             // start, so there is nothing left to report.
-            let _ = handshake.fail(ended_message(owner));
+            let _ = handshake.fail(ended_error(owner));
             return;
         }
         let attempt = Attempt {
@@ -1600,16 +1641,16 @@ fn session_thread(
                     attempt_selected = None;
                     fallback = true;
                 }
-                Retry::End(message) => {
-                    eprintln!("speechek: {message}.");
-                    let _ = handshake.fail(message);
+                Retry::End(error) => {
+                    eprintln!("speechek: {error}.");
+                    let _ = handshake.fail(error);
                     return;
                 }
-                Retry::Ended(message) => {
+                Retry::Ended(error) => {
                     // The take is over, not the device: the command that may
                     // still be waiting learns that nothing started, and no
                     // failure is reported for a take the shell left behind.
-                    let _ = handshake.fail(message);
+                    let _ = handshake.fail(error);
                     return;
                 }
             },
@@ -1626,7 +1667,7 @@ fn session_thread(
         .install(&reservation.ticket, admission, owner, answers)
         .is_err()
     {
-        let _ = handshake.fail(ended_message(owner));
+        let _ = handshake.fail(ended_error(owner));
         return;
     }
     reservation.installed = true;
@@ -1664,7 +1705,7 @@ fn session_thread(
         loop {
             let idle = !drain(&opened.samples, &opened.free, &mut opened.encoder);
             if let Ok(reason) = opened.errors.try_recv() {
-                failure = Some(reason.message());
+                failure = Some(reason.into_error());
                 break;
             }
             match control.try_recv() {
@@ -1685,9 +1726,9 @@ fn session_thread(
     // flushed.
     drain(&opened.samples, &opened.free, &mut opened.encoder);
     opened.encoder.flush();
-    if let Some(message) = &failure {
-        mic_error(&app, owner, message);
-        eprintln!("speechek: {message}.");
+    if let Some(error) = &failure {
+        mic_error(&app, owner, error);
+        eprintln!("speechek: {error}.");
     }
     // The capture of a dictation is over, so the silence ends with it. A release
     // that fails is the same warning as an engage that failed, and changes
@@ -1701,20 +1742,23 @@ fn session_thread(
     // A stream that failed is never reported as a whole tail: the renderer must
     // not transcribe a capture whose end it cannot trust.
     let _ = landed.send(match failure {
-        Some(message) => Err(message),
+        Some(error) => Err(error),
         None => Ok(opened.encoder.sequence),
     });
 }
 
 /// Tells the window of `owner` that its microphone is gone. The renderer
 /// decides what the user reads; this is the reason, never a secret.
-fn mic_error(app: &AppHandle, owner: CaptureOwner, message: &str) {
-    let error = CaptureNotice {
+fn mic_error(app: &AppHandle, owner: CaptureOwner, error: &UiError) {
+    let mut ui = error.ui.clone();
+    crate::redact_capture_ui(app, owner, &mut ui);
+    let notice = CaptureNotice {
         generation: owner.generation(),
-        message: message.to_string(),
+        message: i18n::render(Language::En, &ui).into_owned(),
+        ui,
         last: false,
     };
-    if let Err(err) = app.emit_to(owner.label(), EVENT_MIC_ERROR, error) {
+    if let Err(err) = app.emit_to(owner.label(), EVENT_MIC_ERROR, notice) {
         eprintln!(
             "speechek: cannot hand a microphone error to the {} window: {err}.",
             owner.label()
@@ -1744,9 +1788,12 @@ pub(crate) fn mute_warning_after_take(app: &AppHandle, generation: u64) {
 
 /// Hands one notice to the overlay; a failure only reaches the log.
 fn notice(app: &AppHandle, generation: u64, last: bool) {
+    let mut ui = audio::mute_failed();
+    crate::redact_capture_ui(app, CaptureOwner::Dictation(generation), &mut ui);
     let warning = CaptureNotice {
         generation,
-        message: audio::MUTE_FAILED.to_string(),
+        message: i18n::render(Language::En, &ui).into_owned(),
+        ui,
         last,
     };
     if let Err(err) = app.emit_to(OVERLAY_LABEL, EVENT_MUTE_WARNING, warning) {
@@ -1762,8 +1809,8 @@ fn notice(app: &AppHandle, generation: u64, last: bool) {
 mod tests {
     use super::{
         current, is_stopping, parse_selected, retry, stop_right, Active, AttemptError,
-        CaptureOwner, CaptureStart, Gone, Handshake, NativeCapture, OpenError, Opening,
-        Reservation, Retry, Session, StopRight, StreamFailure,
+        CaptureOwner, CaptureStart, Gone, Handshake, MessageId, NativeCapture, OpenError, Opening,
+        Reservation, Retry, Session, StopRight, StreamFailure, UiError, UiMessage,
     };
     use cpal::{
         BackendSpecificError, BuildStreamError, DefaultStreamConfigError, PlayStreamError,
@@ -1774,6 +1821,23 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    /// A failure whose reason is one catalog key: a test builds errors here
+    /// instead of spelling prose, and never asserts on the reason's text or
+    /// key — only on the behavior the error travels through.
+    fn failure(code: &'static str, key: MessageId) -> UiError {
+        UiError::new(code, UiMessage::new(key))
+    }
+
+    /// Which direction the fallback policy sent a failure: the policy is the
+    /// behavior under test, not the reason's wording.
+    fn retry_kind(outcome: Retry) -> &'static str {
+        match outcome {
+            Retry::System(_) => "system",
+            Retry::End(_) => "end",
+            Retry::Ended(_) => "ended",
+        }
+    }
 
     /// A dictation that was admitted and then cancelled before its capture
     /// started must not be treated as one that may record or silence.
@@ -1824,7 +1888,7 @@ mod tests {
     }
 
     /// One handshake whose answer nobody has read yet.
-    fn new_handshake() -> (Handshake, mpsc::Receiver<Result<CaptureStart, String>>) {
+    fn new_handshake() -> (Handshake, mpsc::Receiver<Result<CaptureStart, UiError>>) {
         let (ready, answers) = mpsc::sync_channel(1);
         (Handshake::new(ready), answers)
     }
@@ -1853,11 +1917,10 @@ mod tests {
             Ok(()),
             "the first frame is what answers"
         );
-        assert_eq!(
-            answers.recv_timeout(Duration::from_millis(50)),
-            Ok(Ok(start.clone())),
-            "the answer carries the device that captured"
-        );
+        let answer = answers.recv_timeout(Duration::from_millis(50))
+            .expect("the capture answers before the deadline")
+            .expect("the first frame starts capture");
+        assert_eq!(answer, start, "the answer carries the device that captured");
         assert_eq!(
             handshake.ready(start.clone()),
             Err(()),
@@ -1904,17 +1967,23 @@ mod tests {
         );
         let (_stop, control) = mpsc::channel::<()>();
         assert!(handshake.over(&closed, 4, &control));
-        assert_eq!(handshake.fail("the microphone is gone".to_string()), Err(()));
+        assert_eq!(
+            handshake.fail(failure("MICROPHONE_ERROR", MessageId::MicNoSystemDevice)),
+            Err(())
+        );
 
-        // A failure before the first frame answers the command with its reason.
+        // A failure before the first frame answers the command.
         let (mut handshake, answers) = new_handshake();
         assert_eq!(
-            handshake.fail("the chosen microphone is gone".to_string()),
+            handshake.fail(failure("MICROPHONE_ERROR", MessageId::MicNoSystemDevice)),
             Ok(())
         );
-        assert_eq!(
-            answers.recv_timeout(Duration::from_millis(50)),
-            Ok(Err("the chosen microphone is gone".to_string()))
+        let answer = answers
+            .recv_timeout(Duration::from_millis(50))
+            .expect("the failure answer arrives");
+        assert!(
+            answer.is_err(),
+            "a failure before the first frame answers the command"
         );
 
         // A take that was given up on while its device was opening never starts.
@@ -1930,29 +1999,31 @@ mod tests {
     /// and a take that is already over reports nothing at all.
     #[test]
     fn the_system_device_only_replaces_a_selected_one_that_is_gone() {
+        let gone = || failure("MICROPHONE_ERROR", MessageId::MicNoSystemDevice);
         assert_eq!(
-            retry(AttemptError::Fallback("gone".to_string()), false),
-            Retry::System("gone".to_string()),
+            retry_kind(retry(AttemptError::Fallback(gone()), false)),
+            "system",
             "a selected device that is gone is replaced by the system one"
         );
         assert_eq!(
-            retry(AttemptError::Fallback("gone too".to_string()), true),
-            Retry::End("gone too".to_string()),
+            retry_kind(retry(AttemptError::Fallback(gone()), true)),
+            "end",
             "the system device is tried exactly once"
         );
         assert_eq!(
-            retry(AttemptError::Fatal("another stream holds it".to_string()), false),
-            Retry::End("another stream holds it".to_string()),
+            retry_kind(retry(AttemptError::Fatal(gone()), false)),
+            "end",
             "a device that exists and refuses the take is not replaced"
         );
         assert_eq!(
-            retry(AttemptError::Fatal("no default microphone".to_string()), true),
-            Retry::End("no default microphone".to_string()),
+            retry_kind(retry(AttemptError::Fatal(gone()), true)),
+            "end",
             "a system device that refused the take ends it"
         );
+        let over = || failure("CAPTURE_ENDED", MessageId::CaptureEndedDictation);
         assert_eq!(
-            retry(AttemptError::Ended("the take is over".to_string()), false),
-            Retry::Ended("the take is over".to_string()),
+            retry_kind(retry(AttemptError::Ended(over()), false)),
+            "ended",
             "a take that is over reports no failure"
         );
     }
@@ -2020,9 +2091,9 @@ mod tests {
 
     /// One running capture of `owner`, as the slot sees it: a real worker that
     /// reports `tail` once its own stop arrives.
-    fn captured(owner: CaptureOwner, tail: Result<u64, String>) -> Session {
+    fn captured(owner: CaptureOwner, tail: Result<u64, UiError>) -> Session {
         let (stop, control) = mpsc::channel::<()>();
-        let (landed_tx, landed) = mpsc::channel::<Result<u64, String>>();
+        let (landed_tx, landed) = mpsc::channel::<Result<u64, UiError>>();
         let worker = thread::spawn(move || {
             let _ = control.recv();
             let _ = landed_tx.send(tail);
@@ -2177,7 +2248,7 @@ mod tests {
                 &ticket,
                 0,
                 CaptureOwner::Dictation(3),
-                mpsc::channel::<Result<u64, String>>().1,
+                mpsc::channel::<Result<u64, UiError>>().1,
             )
             .is_err());
         assert!(state.slot.lock().is_none());
@@ -2187,7 +2258,7 @@ mod tests {
         // lock as the installation itself.
         let (ticket, _control) = reserved(&state, CaptureOwner::Lab(4), 0);
         state.closed.fetch_add(1, Ordering::SeqCst);
-        let (_landed_tx, landed) = mpsc::channel::<Result<u64, String>>();
+        let (_landed_tx, landed) = mpsc::channel::<Result<u64, UiError>>();
         assert!(state.install(&ticket, 0, CaptureOwner::Lab(4), landed).is_err());
         assert!(
             state.slot.lock().is_some(),
@@ -2215,7 +2286,7 @@ mod tests {
         // and the guard must not take it back.
         let admission = state.closed.load(Ordering::SeqCst);
         let (ticket, _control) = reserved(&state, CaptureOwner::Lab(3), admission);
-        let (_landed_tx, landed) = mpsc::channel::<Result<u64, String>>();
+        let (_landed_tx, landed) = mpsc::channel::<Result<u64, UiError>>();
         assert!(state
             .install(&ticket, admission, CaptureOwner::Lab(3), landed)
             .is_ok());
@@ -2242,7 +2313,7 @@ mod tests {
     fn the_bounded_exit_ends_a_capture_without_waiting_for_it() {
         let state = NativeCapture::default();
         let (stop, control) = mpsc::channel::<()>();
-        let (landed_tx, landed) = mpsc::channel::<Result<u64, String>>();
+        let (landed_tx, landed) = mpsc::channel::<Result<u64, UiError>>();
         let dropped = Arc::new(AtomicBool::new(false));
         let observed = Arc::clone(&dropped);
         let worker = thread::spawn(move || {
@@ -2302,7 +2373,7 @@ mod tests {
         let state = NativeCapture::default();
         // A newer take of the same window owns the microphone now.
         let (newer, _control) = reserved(&state, CaptureOwner::Lab(2), 0);
-        let (landed_tx, landed) = mpsc::channel::<Result<u64, String>>();
+        let (landed_tx, landed) = mpsc::channel::<Result<u64, UiError>>();
         // The worker that would report the tail is gone with the command, so
         // the cleanup does not wait on it.
         drop(landed_tx);
@@ -2332,7 +2403,7 @@ mod tests {
     #[test]
     fn a_broken_tail_is_an_error_not_an_empty_capture() {
         let (stop, _control) = mpsc::channel::<()>();
-        let (landed_tx, landed) = mpsc::channel::<Result<u64, String>>();
+        let (landed_tx, landed) = mpsc::channel::<Result<u64, UiError>>();
         drop(landed_tx);
         let session = Session {
             owner: CaptureOwner::Dictation(1),
@@ -2346,16 +2417,17 @@ mod tests {
             "a worker that is gone reports nothing whole"
         );
 
+        let failed = captured(
+            CaptureOwner::Dictation(1),
+            Err(failure("MICROPHONE_ERROR", MessageId::MicStreamStopped)),
+        )
+        .finish();
+        assert!(failed.is_err(), "a stream that failed keeps its reason");
         assert_eq!(
-            captured(CaptureOwner::Dictation(1), Err("the microphone is gone".to_string()))
-                .finish(),
-            Err("the microphone is gone".to_string()),
-            "a stream that failed keeps its reason"
-        );
-        assert_eq!(
-            captured(CaptureOwner::Dictation(1), Ok(12)).finish(),
-            Ok(12),
-            "a capture that ended normally reports its last frame"
+            captured(CaptureOwner::Dictation(1), Ok(12))
+                .finish()
+                .expect("a capture that ended normally reports its last frame"),
+            12,
         );
     }
 
