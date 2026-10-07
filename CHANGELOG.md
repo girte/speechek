@@ -5,7 +5,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 The text of each GitHub Release is generated from the matching version section below plus a fixed install/unsigned/known-limitations/SHA-256 footer.
 
-## [Unreleased]
+## [0.3.0] - 2026-10-07
 
 ### Added
 
@@ -34,7 +34,7 @@ The first public release. Version `0.1.1` was a local build and was never publis
 ### Added
 
 - Free Windows 11 x64 voice input: press a global hotkey, dictate, press it again, and the confirmed text is pasted into the field active at paste time.
-- Three recognition modes using Gemini — **Live Smart** (`gemini-3.5-transcribe-live`), **Smart** and **Дословно** (`gemini-3.5-transcribe`) — with a built-in lab that compares all three on one recording.
+- Three recognition modes using Gemini — **Live Smart** (`gemini-3.5-transcribe-live`), **Smart** and **Verbatim** (shown as **Дословно** in the Russian UI) (`gemini-3.5-transcribe`) — with a built-in lab that compares all three on one recording.
 - Settings window reachable from the tray: mode, hotkey, microphone, mute during recording, start-at-sign-in and the local server port.
 - Multiple Gemini API keys with automatic round-robin, so requests spread across projects that have independent quotas.
 - Windows DPAPI key storage for the current user in `secrets.bin`, with no plaintext keys on disk.

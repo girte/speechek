@@ -1,6 +1,6 @@
 [package]
 name = "speechek"
-version = "0.2.1"
+version = "0.3.0"
 description = "Speechek desktop shell: global dictation hotkey, tray menu and the native overlay."
 license = "MIT"
 edition = "2021"
