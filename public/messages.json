@@ -5,7 +5,7 @@
   "TraySettings": { "en": "Settings", "ru": "Настройка" },
   "TrayExit": { "en": "Exit", "ru": "Выход" },
   "UiLanguageLabel": { "en": "Language", "ru": "Язык интерфейса" },
-  "UiLanguageHelp": { "en": "English or Russian; applied to every window right away and remembered. It does not affect speech recognition or the dictated text.", "ru": "Английский или русский; применяется ко всем окнам сразу и сохраняется. Не влияет на распознавание речи и продиктованный текст." },
+  "UiLanguageHelp": { "en": "Select the application's interface language. The choice applies immediately and is saved. It does not affect speech recognition or the dictated text.", "ru": "Выбор языка интерфейса приложения. Применяется сразу и сохраняется. Не влияет на распознавание речи и продиктованный текст." },
   "OverlayRecording": { "en": "Recording", "ru": "Запись" },
   "OverlayProcessing": { "en": "Processing", "ru": "Обработка" },
   "OverlayCopied": { "en": "Copied — paste manually", "ru": "Скопировано — вставьте вручную" },

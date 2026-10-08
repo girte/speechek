@@ -12,6 +12,7 @@ The text of each GitHub Release is generated from the matching version section b
 - Rewrote the English and Russian user guides for everyday users: task-oriented sections, a troubleshooting list by symptom, and the developer-only profile details moved to `CONTRIBUTING.md`. Bug reports can now note the recognition mode, and both issue forms accept English or Russian.
 - Made GitHub the source of truth for task status, added live bug/improvement/completed-task links to both READMEs, documented type and status labels in `CONTRIBUTING.md`, and set both issue forms to start in the backlog. No product behaviour changed.
 - Updated both user guides to reflect Google's report that the October 7 Transcribe outage was fixed, retaining the Live Smart workaround if the error recurs; Speechek's live API has not been rechecked.
+- Clarified the interface-language help in English and Russian: it describes the setting's purpose without listing languages, while retaining the immediate-apply, saved-choice and speech-independence explanation. ([#2](https://github.com/girte/speechek/issues/2))
 
 ## [0.3.0] - 2026-10-07
 
