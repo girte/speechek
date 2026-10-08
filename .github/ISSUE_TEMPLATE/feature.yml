@@ -3,6 +3,7 @@ description: Suggest an idea or improvement for Speechek
 title: "[Feature]: "
 labels:
   - enhancement
+  - "status:backlog"
 body:
   - type: markdown
     attributes:

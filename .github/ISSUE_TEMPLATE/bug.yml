@@ -3,6 +3,7 @@ description: Report a problem with Speechek
 title: "[Bug]: "
 labels:
   - bug
+  - "status:backlog"
 body:
   - type: markdown
     attributes:

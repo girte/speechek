@@ -93,9 +93,29 @@ For intentional non-translatable data or catalog-failure fallbacks, a narrow `//
 5. Keep the `/api/settings`, `/api/transcribe`, `/api/live` and `createRecorder` contracts; provider errors must not expose keys or turn intermediate Live text into final text.
 6. When you change hotkeys, file locations, user actions or the build, update the documentation in the same change.
 
+## Issue tracking
+
+GitHub issues, not documents, are the source of truth for what is open, planned and finished. The task lists in the READMEs are saved GitHub queries, so no backlog state is copied into the documentation.
+
+Issues use two independent sets of labels:
+
+- **Type** — what the change is: `bug`, `enhancement` or `documentation`. Types combine: a documentation task that also changes behaviour is `enhancement` + `documentation`.
+- **Status** — where the work stands: `status:backlog` (awaiting review or implementation), `status:deferred` (explicitly postponed; do not implement without a new request) or `status:in-progress` (actively being worked on). Both issue forms start with `status:backlog`; it is not a promise of implementation. An open issue carries exactly one status label; closing it removes that label.
+
+Closing an issue:
+
+- Finished → close with reason **completed** and the evidence for the result, plus the release that carries it once such a release exists. A single merged change is not a release, so do not promise users that a fix ships until the version containing it is published. Research is not implementation, and handling an error is not removing its cause — state which one actually happened.
+- Dropped → close as **not planned** and write the reason.
+
+Where each kind of statement belongs: `CHANGELOG.md` says what a shipped release contains, the user guides describe how the app behaves today, and anything not built yet stays an issue rather than a promise in the docs.
+
+Evidence in a report or pull request is what you actually ran and observed — the exact command and its result — not what you expect to happen.
+
+If the problem is already reported, add your version, steps and logs to that issue instead of opening a duplicate, and do not fix the same bug again in a separate change: work continues in the existing issue, whose status label shows whether anyone is on it.
+
 ## Submitting a change
 
-- Open an issue using one of the templates under `.github/ISSUE_TEMPLATE/` first when the change is not trivial.
+- Open an issue using one of the templates under `.github/ISSUE_TEMPLATE/` first when the change is not trivial, and follow [Issue tracking](#issue-tracking) for labels, status and closing rules.
 - Keep changes focused; explain what changed and how you verified it (the command you ran and what you observed).
 - Do not include keys, `secrets.bin`, `settings.json`, audio recordings or personal data anywhere in an issue, pull request or commit.
 - Do not attach build output (`src-tauri/target/`, `node_modules/`) or generate new release files by hand.

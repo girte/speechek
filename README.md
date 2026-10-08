@@ -195,6 +195,7 @@ Download the new `*-setup.exe` from [Releases](https://github.com/girte/speechek
 - [Changelog](CHANGELOG.md) · [Releases](https://github.com/girte/speechek/releases)
 - [Contributing](CONTRIBUTING.md): building from source, portable Development builds, checks and localization.
 - [Releasing](docs/releasing.md): how official builds are made and published.
+- [Open bugs](https://github.com/girte/speechek/issues?q=is%3Aissue+is%3Aopen+label%3Abug) · [Planned improvements](https://github.com/girte/speechek/issues?q=is%3Aissue+is%3Aopen+label%3Aenhancement) · [Completed tasks](https://github.com/girte/speechek/issues?q=is%3Aissue+is%3Aclosed+reason%3Acompleted): these lists are live on GitHub rather than copied here; how issues are typed, labelled and closed is in [Contributing → Issue tracking](CONTRIBUTING.md#issue-tracking).
 
 ## License
 

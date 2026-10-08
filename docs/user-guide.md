@@ -222,7 +222,7 @@ By default your settings and keys stay on the PC, in case you reinstall. To remo
 
 **The pill says "Copied — paste manually".** The text is on the clipboard: click into the field and press Ctrl+V. See [above](#when-the-text-isnt-pasted-automatically) for why.
 
-**The pill says Smart and Verbatim fail on Google's side.** Google is rejecting these modes; Speechek can't fix that from its end. Switch to **Live Smart** in General settings for now. Once Google fixes the problem, Smart and Verbatim work again without an update.
+**The pill says Smart and Verbatim fail on Google's side.** This message appears for a specific Gemini HTTP 400 error. [Google reported the outage fixed on October 7, 2026](https://github.com/googleapis/js-genai/issues/2011#issuecomment-6044792622); Speechek's live API has not been rechecked since that report. If you encounter the error, temporarily switch to **Live Smart** in General settings and report it using the form below. A fix on Google's side does not require a Speechek update.
 
 **An error says the key was rejected by Google.** The key was deleted, restricted or mistyped. Check it in AI Studio, and click **Check keys** after fixing the list.
 

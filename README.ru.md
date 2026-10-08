@@ -195,6 +195,7 @@ Google будет отклонять запросы, пока лимит не о
 - [История изменений](CHANGELOG.md) · [Releases](https://github.com/girte/speechek/releases)
 - [Участие в разработке](CONTRIBUTING.md) (на английском): сборка из исходников, portable-сборки Development, проверки и локализация.
 - [Как выпускаются релизы](docs/releasing.md) (на английском): сборка и публикация официальных версий.
+- [Открытые ошибки](https://github.com/girte/speechek/issues?q=is%3Aissue+is%3Aopen+label%3Abug) · [Планируемые улучшения](https://github.com/girte/speechek/issues?q=is%3Aissue+is%3Aopen+label%3Aenhancement) · [Выполненные задачи](https://github.com/girte/speechek/issues?q=is%3Aissue+is%3Aclosed+reason%3Acompleted): эти списки живут на GitHub, а не копируются сюда; как устроены типы, метки и закрытие задач — в разделе [Участие в разработке → Issue tracking](CONTRIBUTING.md#issue-tracking).
 
 ## Лицензия
 
