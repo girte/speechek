@@ -140,6 +140,7 @@
   "ConfigAclForeignAce": {"en": "{path}: its access list holds an entry that does not simply allow access.", "ru": "{path}: список доступа содержит запись, которая не просто разрешает доступ."},
   "ConfigAclPartial": {"en": "{path}: its access list does not grant full access.", "ru": "{path}: список доступа не предоставляет полный доступ."},
   "ConfigAclForeignAccount": {"en": "{path}: its access list grants access to an account it should not name.", "ru": "{path}: список доступа разрешает доступ учётной записи, которой здесь быть не должно."},
+  "ConfigPathIsLink": {"en": "{path}: it is a link (a reparse point), not a plain file or directory.", "ru": "{path}: это ссылка (точка повторной обработки), а не обычный файл или каталог."},
   "ConfigPrivateDescriptorFailed": {"en": "a container private to the current user could not be described ({reason}).", "ru": "не удалось описать контейнер, доступный только текущему пользователю ({reason})."},
   "ConfigIdentityFailed": {"en": "{action} ({reason}).", "ru": "{action} ({reason})."},
   "ConfigIdentityActionToken": {"en": "the process token is not available", "ru": "маркер доступа процесса недоступен"},

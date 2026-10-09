@@ -16,6 +16,12 @@ src-tauri/gen/
 *.wav
 *.pcm
 *.webm
+*.flac
+*.flac.part
+
+# Development diagnostics journals and their rotated segments.
+*.jsonl
+logs/
 
 # Local noise.
 *.log

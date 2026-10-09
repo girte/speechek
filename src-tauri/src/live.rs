@@ -30,6 +30,10 @@ use tokio_tungstenite::tungstenite::protocol::Message as UpstreamMessage;
 use crate::backend::{redact, redact_ui};
 use crate::i18n::{render, Language, MessageId, UiMessage};
 use crate::provider::Provider;
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+use crate::diagnostics::{
+    DeadlineTimer, Outcome, ReceiveFlags, RequestCause, RequestTrace, SendKind, UpstreamKind,
+};
 use crate::secrets::{KeyRing, SecretKey};
 
 /* -------------------------------------------------------------------------- */
@@ -144,12 +148,37 @@ struct Relay {
     hard_at: Option<Instant>,
     /// Deadline for the next client frame, refreshed on every one that arrives.
     idle_at: Option<Instant>,
+    /// The development diagnostics of this socket, when the wrapper tagged it.
+    /// Everything it is told is a number, a boolean or a fixed enum.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    trace: Option<RequestTrace>,
+    /// The request's terminal, armed for as long as this relay lives: whatever
+    /// path leaves the loop, the request ends exactly once.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    terminal: Option<RequestTerminal>,
+    /// The final deadline actually armed, so its expiry reports the timer that
+    /// fired rather than one inferred from transcript state a final changed
+    /// afterwards.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    armed_final: Option<RequestCause>,
 }
 
 impl Relay {
-    fn new(key: Arc<SecretKey>, ring: Arc<KeyRing>) -> Self {
+    fn new(
+        key: Arc<SecretKey>,
+        ring: Arc<KeyRing>,
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] trace: Option<RequestTrace>,
+    ) -> Self {
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        let terminal = trace.clone().map(RequestTerminal::new);
         Self {
             key,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            trace,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            terminal,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            armed_final: None,
             ring,
             mode: None,
             started: false,
@@ -185,6 +214,10 @@ impl Relay {
     fn clear_timers(&mut self) {
         self.ready_at = None;
         self.final_at = None;
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        {
+            self.armed_final = None;
+        }
         self.settle_at = None;
         self.hard_at = None;
         self.idle_at = None;
@@ -195,6 +228,184 @@ impl Relay {
     fn touch(&mut self) {
         self.idle_at = Some(Instant::now() + IDLE_TIMEOUT);
     }
+}
+
+/// The relay's one request, ended exactly once.
+///
+/// The relay is a loop with several `return`s, so the terminal state is
+/// recorded by the path that reaches it ([`finish`], [`fail`], [`cancel`]) and
+/// this guard is the safety net: a path nobody instrumented - an unwind, or a
+/// `return` added later - still ends the request, and says so honestly with
+/// [`RequestCause::MissingTerminal`] instead of inventing a success.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+struct RequestTerminal {
+    trace: RequestTrace,
+    outcome: Option<Outcome>,
+}
+
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+impl RequestTerminal {
+    fn new(trace: RequestTrace) -> Self {
+        Self {
+            trace,
+            outcome: None,
+        }
+    }
+
+    /// The first terminal a path reached decides; a `fail` that then calls
+    /// [`finish`] keeps its `Error` rather than being rewritten to a success.
+    fn reached(&mut self, outcome: Outcome) {
+        if self.outcome.is_none() {
+            self.outcome = Some(outcome);
+        }
+    }
+}
+
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+impl Drop for RequestTerminal {
+    fn drop(&mut self) {
+        match self.outcome {
+            Some(outcome) => self.trace.finish(outcome),
+            None => {
+                self.trace.cause(RequestCause::MissingTerminal);
+                self.trace.finish(Outcome::Abandoned);
+            }
+        }
+    }
+}
+
+/// The terminal state this relay reached, for the request's own record.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_terminal(state: &mut Relay, outcome: Outcome) {
+    if let Some(terminal) = state.terminal.as_mut() {
+        terminal.reached(outcome);
+    }
+}
+
+/// The real reason this request ended, recorded before the terminal itself.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_cause(state: &Relay, cause: RequestCause) {
+    if let Some(trace) = state.trace.as_ref() {
+        trace.cause(cause);
+    }
+}
+
+/// A deadline that fired, written the moment it did.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_deadline(state: &Relay, timer: DeadlineTimer) {
+    if let Some(trace) = state.trace.as_ref() {
+        trace.deadline(timer);
+    }
+}
+
+/// One upstream message, classified into every class it carried: a composite
+/// `serverContent` sets each of its flags, and a message that is none of the
+/// known shapes is `other` so it still moves the receive counters.
+///
+/// `ping`/`pong` never surface here (the socket layer answers them) and `close`
+/// arrives as a socket frame, so both are counted where they are observed.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn receive_flags(message: &Value) -> ReceiveFlags {
+    let content = message.get("serverContent");
+    let setup_complete = message.get("setupComplete").is_some();
+    let interim = content
+        .and_then(|content| content.get("interimInputTranscription"))
+        .and_then(text_of)
+        .is_some();
+    let r#final = content
+        .and_then(|content| content.get("inputTranscription"))
+        .and_then(text_of)
+        .is_some();
+    let turn_complete = json_truthy(content.and_then(|content| content.get("turnComplete")));
+    let go_away = message.get("goAway").is_some();
+    let voice_activity = content
+        .map(|content| {
+            content.get("voiceActivityDetectionSignal").is_some()
+                || content.get("voiceActivity").is_some()
+        })
+        .unwrap_or(false);
+    let usage_metadata = message.get("usageMetadata").is_some();
+    let error = message.get("error").is_some();
+    let known = setup_complete
+        || interim
+        || r#final
+        || turn_complete
+        || go_away
+        || voice_activity
+        || usage_metadata
+        || error;
+    ReceiveFlags {
+        setup_complete,
+        interim,
+        r#final,
+        turn_complete,
+        go_away,
+        voice_activity,
+        usage_metadata,
+        ping: false,
+        pong: false,
+        close: false,
+        error,
+        other: !known,
+    }
+}
+
+/// The `goAway.timeLeft` the upstream announced, as a duration: the API sends
+/// seconds, as a number or as `"<n>s"`. Anything else is no duration at all -
+/// a string never reaches the sink.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn go_away_time_left(message: &Value) -> Option<Duration> {
+    let value = message.get("goAway")?.get("timeLeft")?;
+    let seconds = match value {
+        Value::Number(number) => number.as_f64()?,
+        Value::String(text) => text.trim().trim_end_matches('s').parse::<f64>().ok()?,
+        _ => return None,
+    };
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    // A finite number can still be out of `Duration`'s range (`1e30`, say):
+    // an unusable announcement is no metadata, never an abort of the relay.
+    Duration::try_from_secs_f64(seconds).ok()
+}
+
+/// Which kind of upstream send one payload is. The payload shape is the relay's
+/// own ([`setup_payload`], [`audio_payload`], the two activity frames), so this
+/// reads the same key the sender wrote.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn send_kind_of(payload: &Value) -> SendKind {
+    let realtime = payload.get("realtimeInput");
+    if realtime
+        .and_then(|input| input.get("activityStart"))
+        .is_some()
+    {
+        SendKind::ActivityStart
+    } else if realtime
+        .and_then(|input| input.get("activityEnd"))
+        .is_some()
+    {
+        SendKind::ActivityEnd
+    } else if realtime.and_then(|input| input.get("audio")).is_some() {
+        SendKind::Audio
+    } else {
+        SendKind::Setup
+    }
+}
+
+/// The PCM16 bytes one upstream send carried, from the base64 length the frame
+/// already announced. A non-audio payload carries none.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn send_pcm_bytes(payload: &Value) -> u64 {
+    if !matches!(send_kind_of(payload), SendKind::Audio) {
+        return 0;
+    }
+    payload
+        .get("realtimeInput")
+        .and_then(|input| input.get("audio"))
+        .and_then(|audio| audio.get("data"))
+        .and_then(Value::as_str)
+        .map(|data| base64_byte_length(data).max(0) as u64)
+        .unwrap_or(0)
 }
 
 /// What woke the loop. The sockets are borrowed by the select's futures only, so the
@@ -220,6 +431,7 @@ pub async fn serve(
     provider: Arc<Provider>,
     key: Arc<SecretKey>,
     ring: Arc<KeyRing>,
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] trace: Option<RequestTrace>,
 ) {
     // Redaction is only ever as complete as the ring: the socket's own key has to
     // be part of it, and it is, because it was selected from it.
@@ -230,7 +442,12 @@ pub async fn serve(
 
     let mut socket = socket;
     let mut upstream: Option<Upstream> = None;
-    let mut state = Relay::new(key, ring);
+    let mut state = Relay::new(
+        key,
+        ring,
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        trace,
+    );
 
     loop {
         let next = state.next_deadline();
@@ -269,6 +486,10 @@ pub async fn serve(
                     // The browser only ever sends text frames; binary frames are still
                     // decoded as UTF-8, and undecodable bytes end the session.
                     Err(_) => {
+                        // A binary frame the browser never should have sent: the
+                        // client ended the request by being unreadable.
+                        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                        note_cause(&state, RequestCause::ClientEnd);
                         cancel(&mut socket, &mut upstream, &mut state).await;
                         return;
                     }
@@ -279,6 +500,8 @@ pub async fn serve(
             Event::Client(Some(Ok(ClientMessage::Close(_))))
             | Event::Client(None)
             | Event::Client(Some(Err(_))) => {
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                note_cause(&state, RequestCause::ClientCancel);
                 cancel(&mut socket, &mut upstream, &mut state).await;
                 return;
             }
@@ -395,12 +618,16 @@ async fn open_upstream(
     {
         Ok(Ok((live, _response))) => live,
         Ok(Err(error)) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_cause(state, RequestCause::SetupFailed);
             let ui = UiMessage::new(MessageId::LiveConnectFailed)
                 .with_arg("detail", json!(error.to_string()));
             fail(socket, upstream, state, ui).await;
             return;
         }
         Err(_) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_cause(state, RequestCause::ReadyTimeout);
             fail(
                 socket,
                 upstream,
@@ -412,14 +639,31 @@ async fn open_upstream(
         }
     };
 
+    // The setup frame is a send like any other: it is marked in flight before
+    // it is awaited, so a setup write that never returns is visible too.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if let Some(trace) = state.trace.as_ref() {
+        trace.send_started(SendKind::Setup);
+    }
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    let sent_at = Instant::now();
     match tokio::time::timeout_at(
         ready_at,
         live.send(UpstreamMessage::text(setup_payload(mode).to_string())),
     )
     .await
     {
-        Ok(Ok(())) => {}
+        Ok(Ok(())) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            if let Some(trace) = state.trace.as_ref() {
+                trace.send_finished_kind(SendKind::Setup, 0, sent_at.elapsed(), true);
+            }
+        }
         Ok(Err(error)) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            if let Some(trace) = state.trace.as_ref() {
+                trace.send_finished_kind(SendKind::Setup, 0, sent_at.elapsed(), false);
+            }
             // A close event or the ready deadline reports a setup that never confirms.
             warn(
                 state.ring.keys(),
@@ -427,6 +671,12 @@ async fn open_upstream(
             );
         }
         Err(_) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            if let Some(trace) = state.trace.as_ref() {
+                trace.send_finished_kind(SendKind::Setup, 0, sent_at.elapsed(), false);
+            }
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_cause(state, RequestCause::ReadyTimeout);
             fail(
                 socket,
                 upstream,
@@ -500,12 +750,22 @@ async fn push_audio(
         return;
     }
     state.bytes += byte_length as u64;
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if let Some(trace) = state.trace.as_ref() {
+        // Counted before the queue decision: every client frame the relay took
+        // in is one, including a frame the pre-ready cap eventually drops.
+        trace.audio_received(byte_length as u64);
+    }
 
     if state.upstream_ready {
         write_upstream(upstream, state, &audio_payload(data)).await;
     } else {
         // Setup is still in flight: hold the frames and replay them in order.
         state.queue.push(data.to_owned());
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        if let Some(trace) = state.trace.as_ref() {
+            trace.pre_ready_queue_depth(state.queue.len() as u64);
+        }
     }
 }
 
@@ -522,6 +782,10 @@ async fn end(socket: &mut WebSocket, upstream: &mut Option<Upstream>, state: &mu
         return;
     }
     state.end_requested = true;
+    // The browser asked for the end of the recording: that is the reason this
+    // request stops taking audio, whatever the upstream does afterwards.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    note_cause(state, RequestCause::ClientEnd);
 
     if state.bytes == 0 && state.queue.is_empty() {
         // Nothing was recorded, so there is nothing to finalize.
@@ -563,6 +827,20 @@ async fn handle_upstream(
                 Some(frame) => (u16::from(frame.code), frame.reason.as_str().to_owned()),
                 None => (1005, String::new()),
             };
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            if let Some(trace) = state.trace.as_ref() {
+                // The close is a received message like any other; only its
+                // numeric code goes to the sink, never the reason text. The
+                // code itself is recorded once, by `upstream_closed`.
+                trace.received_with_details(
+                    ReceiveFlags {
+                        close: true,
+                        ..ReceiveFlags::default()
+                    },
+                    Some(code),
+                    None,
+                );
+            }
             upstream_closed(socket, upstream, state, code, &reason).await;
         }
         Some(Ok(UpstreamMessage::Binary(data))) => {
@@ -573,11 +851,47 @@ async fn handle_upstream(
                 handle_upstream_message(socket, upstream, state, &raw).await;
             }
         }
-        // Ping/Pong are answered by the socket layer; a raw frame never surfaces here.
-        Some(Ok(
-            UpstreamMessage::Ping(_) | UpstreamMessage::Pong(_) | UpstreamMessage::Frame(_),
-        )) => {}
+        // Ping/Pong are answered by the socket layer, but they are still
+        // traffic from the upstream and are counted as such.
+        Some(Ok(UpstreamMessage::Ping(_))) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            if let Some(trace) = state.trace.as_ref() {
+                trace.received(ReceiveFlags {
+                    ping: true,
+                    ..ReceiveFlags::default()
+                });
+            }
+        }
+        Some(Ok(UpstreamMessage::Pong(_))) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            if let Some(trace) = state.trace.as_ref() {
+                trace.received(ReceiveFlags {
+                    pong: true,
+                    ..ReceiveFlags::default()
+                });
+            }
+        }
+        Some(Ok(UpstreamMessage::Frame(_))) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            if let Some(trace) = state.trace.as_ref() {
+                trace.received(ReceiveFlags {
+                    other: true,
+                    ..ReceiveFlags::default()
+                });
+            }
+        }
         Some(Err(error)) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            if let Some(trace) = state.trace.as_ref() {
+                trace.received_with_details(
+                    ReceiveFlags {
+                        error: true,
+                        ..ReceiveFlags::default()
+                    },
+                    None,
+                    None,
+                );
+            }
             // This only warns; the close event (or the ready deadline) reports the
             // failure, and a terminated stream yields `None` next.
             warn(
@@ -586,7 +900,16 @@ async fn handle_upstream(
             );
         }
         // End of stream without a close frame: the browser API reports that as 1006.
-        None => upstream_closed(socket, upstream, state, 1006, "").await,
+        None => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            if let Some(trace) = state.trace.as_ref() {
+                // Nothing arrived here, so this is not a received message and no
+                // receive count moves; the known code and its single close
+                // boundary are still recorded.
+                trace.boundary(UpstreamKind::Close, Some(1006), None);
+            }
+            upstream_closed(socket, upstream, state, 1006, "").await;
+        }
     }
 }
 
@@ -603,6 +926,19 @@ async fn handle_upstream_message(
     let Some(message) = parse_json_object(raw) else {
         return;
     };
+
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if let Some(trace) = state.trace.as_ref() {
+        // One call per message, whatever it turned out to be: every class it
+        // carried is counted once, and a message of none of the known shapes is
+        // counted as `other` instead of vanishing. A `goAway` contributes the
+        // duration it announced, as a number; its text never leaves this file.
+        trace.received_with_details(
+            receive_flags(&message),
+            None,
+            go_away_time_left(&message),
+        );
+    }
 
     if message.get("setupComplete").is_some() {
         state.ready_at = None;
@@ -629,6 +965,8 @@ async fn handle_upstream_message(
     }
 
     if let Some(failure) = upstream_error_message(&message) {
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        note_cause(state, RequestCause::UpstreamError);
         fail(
             socket,
             upstream,
@@ -685,6 +1023,16 @@ async fn upstream_closed(
         return;
     }
     let detail = describe_close(code, reason);
+    // The socket closed on us: whether that is the expected end or a failure
+    // is decided below, and the cause is recorded before the terminal.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    note_cause(state, RequestCause::UpstreamClose);
+    // The numeric code this close carried - a close frame's own, or the 1006 an
+    // end of stream reports. Recorded here for every caller of this handler.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if let Some(trace) = state.trace.as_ref() {
+        trace.close_code(code);
+    }
     if !state.upstream_ready {
         let ui = match detail {
             None => UiMessage::new(MessageId::LiveSetupClosedBeforeReady),
@@ -765,7 +1113,11 @@ async fn handle_deadline(
     match fired.map(|(_, timer)| timer) {
         Some(Timer::Ready) => {
             state.ready_at = None;
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_deadline(state, DeadlineTimer::Ready);
             if !state.upstream_ready {
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                note_cause(state, RequestCause::ReadyTimeout);
                 fail(
                     socket,
                     upstream,
@@ -777,7 +1129,18 @@ async fn handle_deadline(
         }
         Some(Timer::Final) => {
             state.final_at = None;
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_deadline(state, DeadlineTimer::Final);
+            // Whichever deadline this was, labelled where it was armed: a final
+            // that arrived after the arm must not relabel the running timer.
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            {
+                note_cause(state, armed_final_kind(state));
+                state.armed_final = None;
+            }
             if state.final_seen {
+                // A final was seen, so only the tail was outstanding and the
+                // request completes.
                 finish(socket, upstream, state).await;
             } else {
                 fail(
@@ -791,10 +1154,18 @@ async fn handle_deadline(
         }
         Some(Timer::Settle) => {
             state.settle_at = None;
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_deadline(state, DeadlineTimer::Settle);
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_cause(state, RequestCause::SettleTimeout);
             finish(socket, upstream, state).await;
         }
         Some(Timer::Hard) => {
             state.hard_at = None;
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_deadline(state, DeadlineTimer::Hard);
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_cause(state, RequestCause::HardDeadline);
             fail(
                 socket,
                 upstream,
@@ -808,6 +1179,10 @@ async fn handle_deadline(
             // No verdict to report: the socket itself timed out, so the browser sees
             // the close and nothing else.
             state.idle_at = None;
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_deadline(state, DeadlineTimer::Idle);
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_cause(state, RequestCause::IdleTimeout);
             cancel(socket, upstream, state).await;
         }
         // Nothing was actually due: a wake that arrived after the timer was cleared.
@@ -818,12 +1193,31 @@ async fn handle_deadline(
 /// After `activityEnd` only the spoken tail is outstanding, and a session that already
 /// produced a final transcript must not keep the UI hanging for the full timeout.
 fn arm_final_timeout(state: &mut Relay) {
-    let deadline = if state.final_seen {
+    let final_seen = state.final_seen;
+    let deadline = if final_seen {
         TAIL_GRACE
     } else {
         FINAL_TIMEOUT
     };
+    // Which deadline this is, decided where it is armed: a final that arrives
+    // later must not relabel the timer that is already running.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    {
+        state.armed_final = Some(if final_seen {
+            RequestCause::TailGrace
+        } else {
+            RequestCause::FinalTimeout
+        });
+    }
     state.final_at = Some(Instant::now() + deadline);
+}
+
+/// The final deadline the expiry reports: the one that was armed, never one
+/// inferred from transcript state a later final changed. A relay with a final
+/// deadline armed always has this recorded; nothing recorded means the long one.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn armed_final_kind(state: &Relay) -> RequestCause {
+    state.armed_final.unwrap_or(RequestCause::FinalTimeout)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -840,6 +1234,10 @@ async fn fail(
     if state.done {
         return;
     }
+    // The terminal that decides this request's outcome: a failure reports
+    // `Error` even though it still closes with the same `done` as a success.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    note_terminal(state, Outcome::Error);
     redact_ui(&mut ui, state.ring.keys());
     let safe = redact(&render(Language::En, &ui), state.ring.keys());
     write_client(
@@ -856,6 +1254,8 @@ async fn finish(socket: &mut WebSocket, upstream: &mut Option<Upstream>, state: 
     if state.done {
         return;
     }
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    note_terminal(state, Outcome::Success);
     state.done = true;
     state.clear_timers();
     write_client(socket, state.ring.keys(), &json!({ "type": "done" })).await;
@@ -872,6 +1272,8 @@ async fn finish(socket: &mut WebSocket, upstream: &mut Option<Upstream>, state: 
 /// closed so the provider does not hold the upstream open.
 async fn cancel(socket: &mut WebSocket, upstream: &mut Option<Upstream>, state: &mut Relay) {
     state.done = true;
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    note_terminal(state, Outcome::Cancelled);
     state.clear_timers();
     close_upstream(upstream).await;
     let _ = socket.send(ClientMessage::Close(None)).await;
@@ -908,7 +1310,25 @@ async fn write_upstream(upstream: &mut Option<Upstream>, state: &Relay, payload:
     if !state.upstream_ready {
         return;
     }
-    if let Err(error) = live.send(UpstreamMessage::text(payload.to_string())).await {
+    // In flight before the await, duration and result after: an independent
+    // reader of the counters sees a send that never returned.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if let Some(trace) = state.trace.as_ref() {
+        trace.send_started(send_kind_of(payload));
+    }
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    let sent_at = Instant::now();
+    let sent = live.send(UpstreamMessage::text(payload.to_string())).await;
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if let Some(trace) = state.trace.as_ref() {
+        trace.send_finished_kind(
+            send_kind_of(payload),
+            send_pcm_bytes(payload),
+            sent_at.elapsed(),
+            sent.is_ok(),
+        );
+    }
+    if let Err(error) = sent {
         warn(
             state.ring.keys(),
             &format!("Could not write to the Live API socket: {error}"),
@@ -924,6 +1344,11 @@ async fn flush_audio_queue(upstream: &mut Option<Upstream>, state: &mut Relay) {
     let frames = std::mem::take(&mut state.queue);
     for frame in frames {
         write_upstream(upstream, state, &audio_payload(&frame)).await;
+    }
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if let Some(trace) = state.trace.as_ref() {
+        // The queue is empty now, so the last depth a reader sees is zero.
+        trace.pre_ready_queue_depth(0);
     }
 }
 
@@ -1015,4 +1440,912 @@ fn base64_byte_length(data: &str) -> i64 {
     let length = data.len() as i64;
     // Padding never exceeds the four-character quantum the length is counted in.
     length * 3 / 4 - padding
+}
+
+/* -------------------------------------------------------------------------- */
+/* Tests                                                                      */
+/* -------------------------------------------------------------------------- */
+
+/// The relay's own instrumentation, driven through real loopback sockets: a
+/// real `serve` task behind an ephemeral port, a real fake Live socket and the
+/// real writer of the diagnostics sink.
+///
+/// What is asserted is the journal the sink actually wrote - the deadline that
+/// fired, the cause of the terminal, the counters of the stall - and that no
+/// synthetic secret of the upstream ever reaches it. Nothing here reads the
+/// process environment, touches a real API key or changes a production path.
+#[cfg(all(test, debug_assertions, feature = "dev-diagnostics"))]
+mod relay_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::SystemTime;
+
+    use base64::Engine as _;
+    use tokio::sync::mpsc;
+    use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    use crate::diagnostics::{
+        Diagnostics, Mode as DiagMode, Owner, Policy, Route, SessionKey,
+    };
+
+    /// One synthetic key. It is a constant of the test, not a secret of any
+    /// account, and it is exactly what the privacy assertions look for.
+    const SYNTHETIC_KEY: &str = "speechek-synthetic-key-9f3b7c1d";
+    const SYNTHETIC_SECRET: &str = "speechek-synthetic-secret-4e5f6a7b";
+
+    /// A root of this test's own, under the temporary directory.
+    fn scratch(name: &str) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "speechek-live-{name}-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// A sink with its real writer, and one open Live take in it.
+    fn take(root: &Path) -> (Arc<Diagnostics>, RequestTrace) {
+        let diagnostics = Diagnostics::for_test_with_storage(
+            root,
+            Policy {
+                max_age: Duration::from_secs(600),
+                max_bytes: 100_000_000,
+            },
+            SystemTime::now(),
+        );
+        let key = SessionKey {
+            owner: Owner::Dictation,
+            generation: 1,
+        };
+        let handle = diagnostics.begin(key, DiagMode::Live).expect("an open take");
+        let trace = handle.request(Route::Live).expect("a request slot");
+        (diagnostics, trace)
+    }
+
+    /// A fake Live socket on its own ephemeral port. It answers the setup with
+    /// every message in `reply` and then, once the relay has sent its first
+    /// audio frame, sends `after_audio` (an upstream error, say) and closes
+    /// with `close`. Every frame the relay sends is forwarded to the test.
+    ///
+    /// Tying those replies to the audio is what makes the test deterministic:
+    /// what the test wants to observe can never race the frames the relay is
+    /// still receiving.
+    async fn fake_upstream(
+        reply: Vec<Value>,
+        after_audio: Option<Value>,
+        close: Option<(u16, String)>,
+    ) -> (u16, mpsc::Receiver<Value>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            // The setup frame; its shape is pinned by the payload tests.
+            let _ = ws.next().await;
+            for message in reply {
+                if ws.send(WsMessage::text(message.to_string())).await.is_err() {
+                    return;
+                }
+            }
+            if after_audio.is_none() {
+                if let Some((code, reason)) = &close {
+                    let _ = ws
+                        .send(WsMessage::Close(Some(CloseFrame {
+                            code: (*code).into(),
+                            reason: reason.as_str().into(),
+                        })))
+                        .await;
+                }
+            }
+            let mut after_audio = after_audio;
+            while let Some(Ok(message)) = ws.next().await {
+                match message {
+                    WsMessage::Text(text) => {
+                        let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else {
+                            continue;
+                        };
+                        let is_audio = value["realtimeInput"]["audio"].is_object();
+                        if tx.send(value).await.is_err() {
+                            return;
+                        }
+                        if !is_audio {
+                            continue;
+                        }
+                        if let Some(extra) = after_audio.take() {
+                            if ws.send(WsMessage::text(extra.to_string())).await.is_err() {
+                                return;
+                            }
+                        }
+                        if let Some((code, reason)) = &close {
+                            let _ = ws
+                                .send(WsMessage::Close(Some(CloseFrame {
+                                    code: (*code).into(),
+                                    reason: reason.as_str().into(),
+                                })))
+                                .await;
+                        }
+                    }
+                    WsMessage::Close(_) => return,
+                    _ => {}
+                }
+            }
+        });
+        (port, rx)
+    }
+
+    /// A fake Live socket that answers the setup with `reply` and, once the
+    /// relay has sent its first audio frame, drops the TCP connection without a
+    /// close frame - the transport drop the browser reports as 1006.
+    async fn abrupt_upstream(reply: Vec<Value>) -> (u16, mpsc::Receiver<Value>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        let (tx, rx) = mpsc::channel(64);
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let _ = ws.next().await;
+            for message in reply {
+                if ws.send(WsMessage::text(message.to_string())).await.is_err() {
+                    return;
+                }
+            }
+            while let Some(Ok(message)) = ws.next().await {
+                let WsMessage::Text(text) = message else {
+                    continue;
+                };
+                let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else {
+                    continue;
+                };
+                let is_audio = value["realtimeInput"]["audio"].is_object();
+                if tx.send(value).await.is_err() {
+                    return;
+                }
+                if is_audio {
+                    // Drop the socket here: no close frame follows.
+                    return;
+                }
+            }
+        });
+        (port, rx)
+    }
+
+    /// The real `serve` behind an ephemeral port, reached exactly like the
+    /// backend reaches it.
+    async fn relay(
+        upstream_port: u16,
+        trace: Option<RequestTrace>,
+    ) -> (u16, Arc<SecretKey>, Arc<KeyRing>) {
+        let provider = Arc::new(Provider::for_test(
+            "http://127.0.0.1:1",
+            &format!("ws://127.0.0.1:{upstream_port}"),
+        ));
+        let key = Arc::new(SecretKey::new(SYNTHETIC_KEY.to_string()));
+        let ring = Arc::new(KeyRing::new(vec![Arc::clone(&key)]));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        let serve_key = Arc::clone(&key);
+        let serve_ring = Arc::clone(&ring);
+        let app = axum::Router::new().route(
+            "/api/live",
+            axum::routing::any(move |upgrade: axum::extract::ws::WebSocketUpgrade| {
+                let provider = Arc::clone(&provider);
+                let key = Arc::clone(&serve_key);
+                let ring = Arc::clone(&serve_ring);
+                let trace = trace.clone();
+                async move {
+                    upgrade.on_upgrade(move |socket| async move {
+                        serve(socket, provider, key, ring, trace).await;
+                    })
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (port, key, ring)
+    }
+
+    /// A browser socket on the relay, and the first frame it reads.
+    async fn client(port: u16) -> tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    > {
+        let (client, _) = tokio_tungstenite::connect_async(format!(
+            "ws://127.0.0.1:{port}/api/live"
+        ))
+        .await
+        .expect("the relay accepts");
+        client
+    }
+
+    /// Waits for the frame the upstream was sent that satisfies `done`.
+    async fn upstream_until(
+        received: &mut mpsc::Receiver<Value>,
+        mut done: impl FnMut(&Value) -> bool,
+    ) -> Value {
+        loop {
+            let value = received.recv().await.expect("the upstream saw a frame");
+            if done(&value) {
+                return value;
+            }
+        }
+    }
+
+    /// One audio frame of 512 silent samples, base64 as the browser sends it.
+    fn audio_frame() -> Value {
+        let pcm = vec![0u8; 512 * 2];
+        json!({
+            "type": "audio",
+            "data": base64::engine::general_purpose::STANDARD.encode(&pcm),
+        })
+    }
+
+    /// Every journal line of the one take under `root`.
+    fn journal(root: &Path) -> String {
+        let mut text = String::new();
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return text;
+        };
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(entry.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let name = file.file_name().to_string_lossy().to_string();
+                if name.starts_with("events-") && name.ends_with(".jsonl") {
+                    if let Ok(line) = std::fs::read_to_string(file.path()) {
+                        text.push_str(&line);
+                    }
+                }
+            }
+        }
+        text
+    }
+
+    /// The journal, once the writer has written `needle`. The writer wakes
+    /// every 100 ms; the wait is bounded and real, and the longest one here is
+    /// the six-second tail grace.
+    async fn journal_until(root: &Path, needle: &str) -> String {
+        for _ in 0..300 {
+            let text = journal(root);
+            if text.contains(needle) {
+                return text;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        journal(root)
+    }
+
+    /// Every journal record of the one take under `root`, parsed. The segments
+    /// are read in name order, so the records are in the order they were
+    /// written, and a line the writer is still appending is skipped.
+    fn records(root: &Path) -> Vec<Value> {
+        let mut segments: Vec<std::path::PathBuf> = Vec::new();
+        let Ok(entries) = std::fs::read_dir(root) else {
+            return Vec::new();
+        };
+        for entry in entries.flatten() {
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(entry.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let name = file.file_name().to_string_lossy().to_string();
+                if name.starts_with("events-") && name.ends_with(".jsonl") {
+                    segments.push(file.path());
+                }
+            }
+        }
+        segments.sort();
+        let mut rows = Vec::new();
+        for segment in segments {
+            let Ok(text) = std::fs::read_to_string(&segment) else {
+                continue;
+            };
+            for line in text.lines() {
+                if let Ok(record) = serde_json::from_str::<Value>(line) {
+                    rows.push(record);
+                }
+            }
+        }
+        rows
+    }
+
+    /// The journal, once `done` accepts the records written so far. The real
+    /// records are re-read every 100 ms for at most `ticks` reads (the writer's
+    /// own pass interval), so a wait inside a running deadline can be bounded to
+    /// less than that deadline; a condition that never holds returns the records
+    /// as they are instead of hanging.
+    async fn journal_when(
+        root: &Path,
+        ticks: usize,
+        done: impl Fn(&[Value]) -> bool,
+    ) -> Vec<Value> {
+        let mut rows = records(root);
+        for _ in 0..ticks {
+            if done(&rows) {
+                return rows;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            rows = records(root);
+        }
+        rows
+    }
+
+    /// The one terminal record of the request, once it is written.
+    fn terminal(records: &[Value]) -> Option<&Value> {
+        records
+            .iter()
+            .find(|record| record["event"] == "request_end")
+            .map(|record| &record["data"])
+    }
+
+    /// Every boundary of one kind, in the order they were written.
+    fn boundaries<'a>(records: &'a [Value], kind: &str) -> Vec<&'a Value> {
+        records
+            .iter()
+            .filter(|record| record["event"] == "upstream_boundary")
+            .filter(|record| record["data"]["kind"] == kind)
+            .map(|record| &record["data"])
+            .collect()
+    }
+
+    /// Whether the journal names one deadline as the timer that fired.
+    fn has_deadline(records: &[Value], timer: &str) -> bool {
+        records
+            .iter()
+            .any(|record| record["event"] == "deadline" && record["data"]["timer"] == timer)
+    }
+
+    /// The counters of the newest relay snapshot. The writer emits one with
+    /// every request terminal, so once the request ended this is exactly the
+    /// counters it ended with - no periodic snapshot has to be raced for.
+    fn counters(records: &[Value]) -> Option<&Value> {
+        records
+            .iter()
+            .rev()
+            .find(|record| record["event"] == "relay_snapshot")
+            .map(|record| &record["data"])
+    }
+
+    /// One counter of the newest relay snapshot.
+    fn counter(records: &[Value], field: &str) -> Option<u64> {
+        counters(records)?.get(field)?.as_u64()
+    }
+
+    /// One boolean counter of the newest relay snapshot.
+    fn counter_flag(records: &[Value], field: &str) -> Option<bool> {
+        counters(records)?.get(field)?.as_bool()
+    }
+    fn cleanup(diagnostics: Arc<Diagnostics>, root: &Path) {
+        diagnostics.shutdown(Duration::from_millis(500));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The browser going away ends the request as a cancel, and the counters of
+    /// what the relay really did are in the journal with it.
+    #[tokio::test]
+    async fn client_close_records_the_cancel_and_the_relay_counters() {
+        let root = scratch("cancel");
+        let (diagnostics, trace) = take(&root);
+        let (upstream_port, mut received) = fake_upstream(
+            vec![json!({ "setupComplete": {} })],
+            None,
+            None,
+        )
+        .await;
+        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+
+        let mut client = client(port).await;
+        client
+            .send(WsMessage::text(json!({ "type": "start", "mode": "smart" }).to_string()))
+            .await
+            .expect("the start frame");
+        let ready = client.next().await.expect("a frame").expect("text");
+        assert!(ready.to_text().expect("text").contains("ready"));
+
+        for _ in 0..2 {
+            client
+                .send(WsMessage::text(audio_frame().to_string()))
+                .await
+                .expect("an audio frame");
+        }
+        // Both frames really reached the upstream before the socket is dropped,
+        // so the counters below are a handshake and not a race.
+        for _ in 0..2 {
+            upstream_until(&mut received, |value| {
+                value["realtimeInput"]["audio"].is_object()
+            })
+            .await;
+        }
+        drop(client);
+
+        // The journal is snake_case; the terminal record and the snapshot the
+        // writer emits with it are what the test reads, not a rendered line.
+        let records = journal_when(&root, 300, |rows| {
+            terminal(rows).is_some_and(|end| end["cause"] == "client_cancel")
+        })
+        .await;
+        let end = terminal(&records).expect("the cancel is the request's terminal");
+        assert_eq!(end["cause"], "client_cancel", "the cancel is the cause");
+        assert_eq!(
+            end["outcome"], "cancelled",
+            "a browser that went away is a cancelled request"
+        );
+        assert_eq!(
+            counter(&records, "client_audio_frames"),
+            Some(2),
+            "both client frames are counted"
+        );
+        assert_eq!(
+            counter(&records, "client_pcm_bytes"),
+            Some(2_048),
+            "both frames' PCM is counted"
+        );
+        assert_eq!(
+            counter(&records, "upstream_sent_frames"),
+            Some(2),
+            "both frames were sent upstream"
+        );
+        cleanup(diagnostics, &root);
+    }
+
+    /// A controlled silent upstream: the tail grace expires, the journal names
+    /// it as the tail grace (not as a new final), and the stall is visible in
+    /// the counters - the relay sent everything and heard nothing back.
+    #[tokio::test]
+    async fn a_silent_upstream_leaves_the_tail_grace_and_the_stall_in_the_journal() {
+        let root = scratch("tail-grace");
+        let (diagnostics, trace) = take(&root);
+        let (upstream_port, mut received) = fake_upstream(
+            vec![
+                json!({ "setupComplete": {} }),
+                json!({ "serverContent": { "inputTranscription": { "text": "the tail" } } }),
+            ],
+            None,
+            None,
+        )
+        .await;
+        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+
+        let mut client = client(port).await;
+        client
+            .send(WsMessage::text(json!({ "type": "start", "mode": "smart" }).to_string()))
+            .await
+            .expect("the start frame");
+        assert!(client.next().await.expect("a frame").expect("text")
+            .to_text()
+            .expect("text")
+            .contains("ready"));
+
+        for _ in 0..3 {
+            client
+                .send(WsMessage::text(audio_frame().to_string()))
+                .await
+                .expect("an audio frame");
+        }
+        for _ in 0..3 {
+            upstream_until(&mut received, |value| {
+                value["realtimeInput"]["audio"].is_object()
+            })
+            .await;
+        }
+        client
+            .send(WsMessage::text(json!({ "type": "end" }).to_string()))
+            .await
+            .expect("the end frame");
+        upstream_until(&mut received, |value| {
+            value["realtimeInput"]["activityEnd"].is_object()
+        })
+        .await;
+
+        // While the upstream stays silent the writer keeps writing: a snapshot
+        // taken before any terminal - the request has not ended yet - already
+        // carries all three client frames with nothing new from the upstream.
+        // That snapshot is gated on the sink's own clock, and this fixture's
+        // clock is frozen, so advance it past the one-second gate; the wait is
+        // three ticks, 300 ms, far inside the six-second grace still running.
+        diagnostics.advance_clock(Duration::from_secs(2));
+        let stall = journal_when(&root, 30, |rows| {
+            terminal(rows).is_none() && counter(rows, "client_audio_frames") == Some(3)
+        })
+        .await;
+        assert!(
+            terminal(&stall).is_none(),
+            "the tail grace had not expired when the stall was observed"
+        );
+        let stalled_upstream =
+            counter(&stall, "last_upstream_us").expect("a snapshot written in the stall");
+        assert_eq!(
+            counter(&stall, "received_messages"),
+            Some(2),
+            "nothing new arrived from the silent upstream"
+        );
+
+        // The upstream is silent from here on: the six-second tail grace is the
+        // only thing that can end this request, and it must.
+        loop {
+            match client.next().await {
+                Some(Ok(WsMessage::Text(text))) if text.contains("done") => break,
+                Some(Ok(_)) => continue,
+                other => panic!("the relay never finished: {other:?}"),
+            }
+        }
+
+        let records = journal_when(&root, 300, |rows| {
+            terminal(rows).is_some_and(|end| end["cause"] == "tail_grace")
+        })
+        .await;
+        let end = terminal(&records).expect("the tail grace ends the request");
+        assert_eq!(
+            end["cause"], "tail_grace",
+            "the short deadline is the tail grace, not a missing final"
+        );
+        assert_eq!(
+            end["outcome"], "success",
+            "a final was already seen, so the request succeeded"
+        );
+        assert!(
+            has_deadline(&records, "final"),
+            "the final timer is the deadline that fired"
+        );
+        // The stall itself: three frames out, only the two upstream messages
+        // that opened the session and carried the final back.
+        assert_eq!(
+            counter(&records, "client_audio_frames"),
+            Some(3),
+            "every client frame is counted"
+        );
+        assert_eq!(
+            counter(&records, "upstream_sent_frames"),
+            Some(3),
+            "every frame was sent"
+        );
+        assert_eq!(
+            counter(&records, "received_messages"),
+            Some(2),
+            "only the setup and the final came back"
+        );
+        assert_eq!(
+            counter_flag(&records, "in_flight_send"),
+            Some(false),
+            "no send is left in flight"
+        );
+        assert_eq!(
+            counter(&records, "upstream_pcm_bytes"),
+            Some(3_072),
+            "the PCM the relay sent is counted"
+        );
+        assert_eq!(
+            counter(&records, "pending_send_us"),
+            Some(0),
+            "no send is waiting"
+        );
+        assert_eq!(
+            counter(&records, "last_upstream_us"),
+            Some(stalled_upstream),
+            "the last upstream message never moved during the stall"
+        );
+        cleanup(diagnostics, &root);
+    }
+
+    /// The upstream error text is a payload the sink never sees.
+    #[tokio::test]
+    async fn an_upstream_error_message_never_reaches_the_journal() {
+        let root = scratch("upstream-error");
+        let (diagnostics, trace) = take(&root);
+        let (upstream_port, mut received) = fake_upstream(
+            vec![json!({ "setupComplete": {} })],
+            Some(json!({ "error": { "message": format!("rejected: {SYNTHETIC_SECRET}") } })),
+            None,
+        )
+        .await;
+        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+
+        let mut client = client(port).await;
+        client
+            .send(WsMessage::text(json!({ "type": "start", "mode": "smart" }).to_string()))
+            .await
+            .expect("the start frame");
+        assert!(client.next().await.expect("a frame").expect("text")
+            .to_text()
+            .expect("text")
+            .contains("ready"));
+        let audio = audio_frame();
+        let payload = audio["data"].as_str().expect("base64").to_string();
+        client
+            .send(WsMessage::text(audio.to_string()))
+            .await
+            .expect("an audio frame");
+        upstream_until(&mut received, |value| {
+            value["realtimeInput"]["audio"].is_object()
+        })
+        .await;
+
+        let text = journal_until(&root, "\"cause\":\"upstream_error\"").await;
+        assert!(
+            text.contains("\"cause\":\"upstream_error\""),
+            "the upstream error is the request's cause: {text}"
+        );
+        assert!(
+            !text.contains(SYNTHETIC_SECRET),
+            "the upstream error text is not in the journal: {text}"
+        );
+        assert!(
+            !text.contains(&payload),
+            "the PCM payload is not in the journal: {text}"
+        );
+        assert!(
+            !text.contains(SYNTHETIC_KEY),
+            "the key is not in the journal: {text}"
+        );
+        cleanup(diagnostics, &root);
+    }
+
+    /// A close reason is text from the upstream, and it stays out of the sink:
+    /// only its numeric code is recorded.
+    #[tokio::test]
+    async fn an_upstream_close_reason_never_reaches_the_journal() {
+        let root = scratch("close-reason");
+        let (diagnostics, trace) = take(&root);
+        let (upstream_port, _received) = fake_upstream(
+            vec![json!({ "setupComplete": {} })],
+            None,
+            Some((1011, format!("closed because of {SYNTHETIC_SECRET}"))),
+        )
+        .await;
+        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+
+        let mut client = client(port).await;
+        client
+            .send(WsMessage::text(json!({ "type": "start", "mode": "smart" }).to_string()))
+            .await
+            .expect("the start frame");
+        assert!(client.next().await.expect("a frame").expect("text")
+            .to_text()
+            .expect("text")
+            .contains("ready"));
+
+        let text = journal_until(&root, "\"close_code\":1011").await;
+        assert!(
+            text.contains("\"close_code\":1011"),
+            "the numeric close code is recorded: {text}"
+        );
+        assert!(
+            text.contains("\"cause\":\"upstream_close\""),
+            "the close is the request's cause: {text}"
+        );
+        assert_eq!(
+            text.matches("\"kind\":\"close\"").count(),
+            1,
+            "the close frame is one close boundary, not two: {text}"
+        );
+        assert!(
+            !text.contains(SYNTHETIC_SECRET),
+            "the close reason text is not in the journal: {text}"
+        );
+        cleanup(diagnostics, &root);
+    }
+
+    /// An upstream that drops the connection without a close frame is the 1006
+    /// the browser API reports. The drop surfaces twice: once as the failed
+    /// read it really is - a received message, and rightly counted - and then
+    /// as the end of stream, which is not a message and adds no count. The one
+    /// close boundary is the numeric 1006 the transport never framed.
+    #[tokio::test]
+    async fn an_abrupt_upstream_reset_records_the_1006_close_once() {
+        let root = scratch("eof");
+        let (diagnostics, trace) = take(&root);
+        let (upstream_port, mut received) = abrupt_upstream(vec![json!({ "setupComplete": {} })]).await;
+        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+
+        let mut client = client(port).await;
+        client
+            .send(WsMessage::text(json!({ "type": "start", "mode": "smart" }).to_string()))
+            .await
+            .expect("the start frame");
+        assert!(client.next().await.expect("a frame").expect("text")
+            .to_text()
+            .expect("text")
+            .contains("ready"));
+
+        client
+            .send(WsMessage::text(audio_frame().to_string()))
+            .await
+            .expect("an audio frame");
+        // The fixture drops the socket once it has that frame, so the relay runs
+        // into the end of the stream while the test is still reading its close.
+        upstream_until(&mut received, |value| {
+            value["realtimeInput"]["audio"].is_object()
+        })
+        .await;
+        loop {
+            match client.next().await {
+                Some(Ok(WsMessage::Text(text))) if text.contains("done") => break,
+                Some(Ok(_)) => continue,
+                other => panic!("the relay never finished: {other:?}"),
+            }
+        }
+
+        let records = journal_when(&root, 300, |rows| {
+            terminal(rows).is_some_and(|end| end["cause"] == "upstream_close")
+        })
+        .await;
+        let end = terminal(&records).expect("the dropped socket ends the request");
+        assert_eq!(end["cause"], "upstream_close");
+        assert_eq!(
+            end["close_code"], 1006,
+            "the transport's own 1006 is the recorded code"
+        );
+        let close = boundaries(&records, "close");
+        assert_eq!(
+            close.len(),
+            1,
+            "the drop crosses exactly one close boundary: {close:?}"
+        );
+        assert_eq!(close[0]["code"], 1006);
+        // Two received messages: the setup, and the failed read that ended the
+        // stream. The end of stream itself adds nothing to the count.
+        assert_eq!(
+            counter(&records, "received_messages"),
+            Some(2),
+            "the failed read is counted, the end of stream is not"
+        );
+        cleanup(diagnostics, &root);
+    }
+
+    /// The final deadline's expiry reports the timer that was armed, not one
+    /// inferred from transcript state a later final changed: `end` before any
+    /// final arms the long deadline, and a final arriving afterwards must not
+    /// relabel it as the six-second tail grace.
+    #[tokio::test]
+    async fn the_final_deadline_reports_the_timer_that_was_armed() {
+        fn new_relay() -> Relay {
+            let key = Arc::new(SecretKey::new(SYNTHETIC_KEY.to_string()));
+            let ring = Arc::new(KeyRing::new(vec![Arc::clone(&key)]));
+            Relay::new(key, ring, None)
+        }
+
+        let mut state = new_relay();
+        arm_final_timeout(&mut state);
+        assert_eq!(armed_final_kind(&state), RequestCause::FinalTimeout);
+
+        // The late final: it sets `final_seen` and a settle deadline, but the
+        // fifteen-second deadline it did not re-arm is still the one running.
+        state.final_seen = true;
+        state.settle_at = Some(Instant::now() + FINAL_SETTLE);
+        assert_eq!(armed_final_kind(&state), RequestCause::FinalTimeout);
+
+        // A final already seen at arm time is the short deadline.
+        let mut state = new_relay();
+        state.final_seen = true;
+        arm_final_timeout(&mut state);
+        assert_eq!(armed_final_kind(&state), RequestCause::TailGrace);
+    }
+
+    /// `goAway.timeLeft` is a duration or nothing at all: a value outside
+    /// `Duration`'s range is no metadata, never a panic and never the raw text.
+    #[test]
+    fn a_go_away_duration_is_parsed_or_dropped() {
+        assert_eq!(
+            go_away_time_left(&json!({ "goAway": { "timeLeft": 12.5 } })),
+            Some(Duration::from_millis(12_500))
+        );
+        assert_eq!(
+            go_away_time_left(&json!({ "goAway": { "timeLeft": "5s" } })),
+            Some(Duration::from_secs(5))
+        );
+        for value in [
+            json!(1e30),
+            json!(-3),
+            json!("1e30s"),
+            json!("soon"),
+            json!(null),
+            json!(true),
+        ] {
+            assert_eq!(
+                go_away_time_left(&json!({ "goAway": { "timeLeft": value } })),
+                None,
+                "an unusable timeLeft is no duration: {value}"
+            );
+        }
+        assert_eq!(go_away_time_left(&json!({ "setupComplete": {} })), None);
+    }
+
+    /// The absurd announcement is dropped where it belongs - in the metadata -
+    /// and the take keeps recording afterwards.
+    #[tokio::test]
+    async fn an_overflowing_go_away_duration_leaves_the_relay_running() {
+        let root = scratch("go-away-overflow");
+        let (diagnostics, trace) = take(&root);
+        let (upstream_port, mut received) = fake_upstream(
+            vec![
+                json!({ "setupComplete": {} }),
+                json!({ "goAway": { "timeLeft": 1e30 } }),
+            ],
+            None,
+            None,
+        )
+        .await;
+        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+
+        let mut client = client(port).await;
+        client
+            .send(WsMessage::text(json!({ "type": "start", "mode": "smart" }).to_string()))
+            .await
+            .expect("the start frame");
+        assert!(client.next().await.expect("a frame").expect("text")
+            .to_text()
+            .expect("text")
+            .contains("ready"));
+
+        client
+            .send(WsMessage::text(audio_frame().to_string()))
+            .await
+            .expect("an audio frame");
+        // The relay kept relaying: the frame it took after the announcement it
+        // could not read a duration out of did reach the upstream.
+        upstream_until(&mut received, |value| {
+            value["realtimeInput"]["audio"].is_object()
+        })
+        .await;
+
+        // A snapshot of the counters as they are now, and no terminal: an
+        // observer that panicked or aborted would have left neither. The same
+        // frozen-clock gate, advanced the same way, admits it.
+        diagnostics.advance_clock(Duration::from_secs(2));
+        let records = journal_when(&root, 30, |rows| {
+            counter(rows, "upstream_sent_frames") == Some(1)
+        })
+        .await;
+        let go_away = boundaries(&records, "go_away");
+        assert_eq!(
+            go_away.len(),
+            1,
+            "the go-away is a boundary of its own: {go_away:?}"
+        );
+        assert_eq!(
+            go_away[0]["time_left_us"],
+            Value::Null,
+            "an unusable duration is none, never a number and never the text"
+        );
+        assert_eq!(go_away[0]["code"], Value::Null);
+        assert_eq!(
+            counter(&records, "client_audio_frames"),
+            Some(1),
+            "the take kept taking audio"
+        );
+        assert_eq!(
+            counter(&records, "upstream_sent_frames"),
+            Some(1),
+            "the take kept sending it upstream"
+        );
+        assert!(
+            terminal(&records).is_none(),
+            "the relay is still running: {records:?}"
+        );
+        cleanup(diagnostics, &root);
+    }
 }

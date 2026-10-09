@@ -310,6 +310,10 @@ async function beginSession(generation) {
   await waitReleased();
   if (!isLive(active)) return;
 
+  // Development-only diagnostics: name this take's native generation before the
+  // genuine start, so the decorator can bind it. The optional call is absent in
+  // production, where the marker does not exist.
+  globalThis.__speechekDevDiagnostics?.setContext?.('dictation', generation);
   const before = recorderState;
   try {
     // The desktop microphone belongs to the shell, so the recorder must not
@@ -637,11 +641,13 @@ function onPcmFrame(event) {
   if (!Number.isSafeInteger(sequence) || sequence <= running.seen) return;
   if (sequence !== running.seen + 1) {
     running.missing = true;
+    globalThis.__speechekDevDiagnostics?.nativeGap?.('dictation', running.generation, running.seen + 1, sequence, 'sequence');
     return;
   }
   const samples = decodePcm(payload.data);
   if (!samples) {
     running.missing = true;
+    globalThis.__speechekDevDiagnostics?.nativeGap?.('dictation', running.generation, running.seen + 1, sequence, 'decode');
     return;
   }
 
@@ -725,6 +731,16 @@ async function closeNative() {
   // sequence decide what reaches the recorder.
   let whole = Number.isSafeInteger(total) && total >= running.seen && !running.missing;
   if (whole && running.seen < total) whole = await waitTail(running, total);
+
+  // Development-only diagnostics: the tail of the capture this page waited for,
+  // with its own generation. Absent in production.
+  globalThis.__speechekDevDiagnostics?.nativeStop?.(
+    'dictation',
+    running.generation,
+    Number.isSafeInteger(total) ? total : null,
+    running.seen,
+    running.missing,
+  );
   if (capture === running) capture = null;
   return whole;
 }

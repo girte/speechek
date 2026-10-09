@@ -38,6 +38,7 @@
     "docs/user-guide.ru.md",
     "package.json",
     "public/app.js",
+    "public/dev-recorder.js",
     "public/i18n.js",
     "public/index.html",
     "public/messages.json",
@@ -57,6 +58,7 @@
     "scripts/check-localization.ps1",
     "scripts/check-release.ps1",
     "scripts/collect-notices.ps1",
+    "scripts/dev-recorder.test.mjs",
     "scripts/localization-report.mjs",
     "scripts/localization-report.test.mjs",
     "scripts/localization-sources.mjs",
@@ -108,6 +110,12 @@
     "src-tauri/src/autostart.rs",
     "src-tauri/src/backend.rs",
     "src-tauri/src/capture.rs",
+    "src-tauri/src/diagnostics.rs",
+    "src-tauri/src/diagnostics/flac.rs",
+    "src-tauri/src/diagnostics/storage.rs",
+    "src-tauri/src/diagnostics/tests/development_smoke.rs",
+    "src-tauri/src/diagnostics/tests/http_tests.rs",
+    "src-tauri/src/diagnostics/tests/storage_tests.rs",
     "src-tauri/src/i18n.rs",
     "src-tauri/src/installer.rs",
     "src-tauri/src/lib.rs",
@@ -123,6 +131,7 @@
     "src-tauri/tauri.conf.json",
     "src-tauri/tests/catalog_validation.rs",
     "third_party/Handy.LICENSE",
+    "third_party/THIRD-PARTY-NOTICES-DEV.txt",
     "third_party/THIRD-PARTY-NOTICES.txt"
   ]
 }

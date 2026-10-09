@@ -302,9 +302,17 @@ function onPcmFrame(event) {
   if (!take || !payload || payload.generation !== take.generation) return;
   const sequence = payload.sequence;
   if (!Number.isSafeInteger(sequence) || sequence <= take.received) return;
-  if (sequence !== take.received + 1) { take.damaged = true; return; }
+  if (sequence !== take.received + 1) {
+    take.damaged = true;
+    globalThis.__speechekDevDiagnostics?.nativeGap?.('lab', take.generation, take.received + 1, sequence, 'sequence');
+    return;
+  }
   const samples = decodePcm(payload.data);
-  if (!samples) { take.damaged = true; return; }
+  if (!samples) {
+    take.damaged = true;
+    globalThis.__speechekDevDiagnostics?.nativeGap?.('lab', take.generation, take.received + 1, sequence, 'decode');
+    return;
+  }
   take.received = sequence;
   recorder?.acceptPcmChunk(samples);
   take.waiting?.();
@@ -419,6 +427,10 @@ async function beginNative() {
       return;
     }
     take.generation = prepared;
+    // Development-only diagnostics: name this take's native generation before
+    // the genuine start, so the decorator can bind it. The optional call is
+    // absent in production, where the marker does not exist.
+    globalThis.__speechekDevDiagnostics?.setContext?.('lab', take.generation);
     // External first, and awaited: a shell that opened a device before the
     // recorder accepted the frames of it would drop the beginning of the take.
     await ensureRecorder().start({ modes: MODES, external: true });
@@ -465,12 +477,24 @@ async function haltNative() {
     try {
       last = await tauri.core.invoke('lab_stop_capture', { generation: take.generation });
     } catch (cause) {
+      // Development-only diagnostics: the shell never answered, so the tail of
+      // this take is unknown. Absent in production.
+      globalThis.__speechekDevDiagnostics?.nativeStop?.('lab', take.generation, null, take.received, take.damaged);
       if (!take.dropped) dropNativeTake(take, messageOf(cause, TAIL_LOST));
       return;
     }
     if (take.dropped) return;
     let whole = !take.damaged && Number.isSafeInteger(last) && take.received <= last;
     if (whole && take.received < last) whole = await waitLabTail(take, last);
+    // Development-only diagnostics: the tail this take really waited for, with
+    // its own generation. Absent in production.
+    globalThis.__speechekDevDiagnostics?.nativeStop?.(
+      'lab',
+      take.generation,
+      Number.isSafeInteger(last) ? last : null,
+      take.received,
+      take.damaged,
+    );
     if (!whole || take.damaged || take.dropped) {
       dropNativeTake(take, TAIL_LOST);
       return;

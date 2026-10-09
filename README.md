@@ -132,7 +132,7 @@ API keys are different: they take effect only after you click **Apply keys**.
 > Speechek works through the cloud: your speech is sent to Google for recognition. On the Free Tier, Google may use what you send to improve its products, and that includes human review. Don't dictate anything confidential.
 
 - You need an internet connection, a microphone and a country where the [Gemini API is available](https://ai.google.dev/gemini-api/docs/available-regions). There is no offline mode.
-- Your API keys are encrypted with Windows DPAPI for your user account and stored in `%APPDATA%\Speechek\secrets.bin`, never as plain text. Recordings aren't saved to files.
+- Your API keys are encrypted with Windows DPAPI for your user account and stored in `%APPDATA%\Speechek\secrets.bin`, never as plain text. The installed app doesn't save recordings to files; only a separate debug Development build with the explicit `dev-diagnostics` feature can keep a local archive, see [Development diagnostics](#development-diagnostics-debug-builds-only).
 - The Free Tier, quotas and available models are up to Google and can change. On a paid project, requests may be billed.
 - Several keys don't make a failed request succeed: if Gemini rejects a key, Speechek doesn't retry on another one.
 
@@ -196,6 +196,22 @@ Download the new `*-setup.exe` from [Releases](https://github.com/girte/speechek
 - [Contributing](CONTRIBUTING.md): building from source, portable Development builds, checks and localization.
 - [Releasing](docs/releasing.md): how official builds are made and published.
 - [Open bugs](https://github.com/girte/speechek/issues?q=is%3Aissue+is%3Aopen+label%3Abug) · [Planned improvements](https://github.com/girte/speechek/issues?q=is%3Aissue+is%3Aopen+label%3Aenhancement) · [Completed tasks](https://github.com/girte/speechek/issues?q=is%3Aissue+is%3Aclosed+reason%3Acompleted): these lists are live on GitHub rather than copied here; how issues are typed, labelled and closed is in [Contributing → Issue tracking](CONTRIBUTING.md#issue-tracking).
+
+## Development diagnostics (debug builds only)
+
+The portable **Development** debug build can keep a local archive of its own takes for troubleshooting ([issue #6](https://github.com/girte/speechek/issues/6)). This is a developer tool, never part of the shipped app.
+
+- **Off unless asked for.** The `dev-diagnostics` Cargo feature is optional and never a default; the Production release and the isolated **Test** profile never enable it. Enable it explicitly for a local debug build:
+
+  ```bat
+  cargo build --manifest-path src-tauri\Cargo.toml --locked --no-default-features --features dev-diagnostics
+  ```
+
+  `scripts/prepare-preview.ps1` builds the official portable preview this way (the Development build is last, so no Test profile or `test-provider` remains in the executable). A debug build without the feature simply does not archive.
+- **What is written.** One lossless FLAC of the raw PCM (16 kHz, mono, 16-bit) per native take, plus a technical JSONL journal of counters and events. All outcomes are archived — successful, failed and cancelled takes. In the lab comparison, one take links its three Gemini requests to that single audio file. A take with no audio produces metadata only, never an empty FLAC.
+- **Where.** `logs/` next to the Development `settings.json`; for the canonical debug build that is `src-tauri/target/debug/logs/`. Production creates no `logs` directory and writes no audio or journals, and no setting, URL or HTTP route can turn the archive on. The files are never served over HTTP.
+- **Retention.** Files are removed after 10 days or earlier if the archive outgrows a total cap of 100,000,000 bytes (decimal 100 MB) across audio, journals, partial files and staging. Partial files and staging copies count toward the cap, as does the space reserved to finish an active take. Cleanup runs at startup, once a minute while Development runs and when a take closes; with the app closed, the files stay until the next launch.
+- **Privacy.** The FLAC is plaintext personal audio, not encryption. It is readable by your Windows user and SYSTEM (protected DACL), and therefore by any software running as you. Nothing is uploaded, and the archive never carries API keys, transcripts, device names or clipboard text. Use synthetic data only in automated checks; never use real keys or real speech.
 
 ## License
 

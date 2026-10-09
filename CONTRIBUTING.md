@@ -19,6 +19,14 @@ cargo build --manifest-path src-tauri\Cargo.toml --locked --no-default-features
 
 The debug executable appears at `src-tauri\target\debug\speechek.exe`.
 
+Development diagnostics (the optional local FLAC/journal archive, [issue #6](https://github.com/girte/speechek/issues/6)) are **not** in that command: `dev-diagnostics` is a non-default feature, and a debug build without it does not archive. To build the archive-enabled Development profile, pass the feature explicitly:
+
+```bat
+cargo build --manifest-path src-tauri\Cargo.toml --locked --no-default-features --features dev-diagnostics
+```
+
+The official portable preview is built exactly that way by `scripts/prepare-preview.ps1`, which also passes `dev-diagnostics` to `check` and `test` and builds Development last. `test-provider` and `dev-diagnostics` are debug-only and never appear in the Production release command or the Test-profile installer command. See [Development diagnostics](#development-diagnostics) below for what the archive contains.
+
 The debug build is **portable**: double-click `src-tauri\target\debug\speechek.exe` to run it — no installer, shortcuts, uninstall entry or registry write. The Development profile keeps its `settings.json` and `secrets.bin` beside that EXE (inside `src-tauri\target\debug`), separate from the installed production app, which keeps them under `%APPDATA%\Speechek`; the two profiles never read each other's files.
 
 The three build profiles never share files, hotkeys or ports:
@@ -54,6 +62,15 @@ The `test-provider` feature and the `SPEECHEK_TEST_PROVIDER_HTTP` / `SPEECHEK_TE
 
 These checks must stay **GUI-free**: do not launch `cargo run`, a debug or release executable, or any visible-window scenario from an automated run. The visible-window smoke (overlay, tray, microphone, paste) is performed by hand by the owner. Portable previews handed to the owner are built with `scripts/prepare-preview.ps1` — see [docs/releasing.md](docs/releasing.md).
 
+The archive-enabled debug profile additionally runs:
+
+```bat
+cargo check --manifest-path src-tauri\Cargo.toml --locked --no-default-features --features dev-diagnostics
+cargo test --manifest-path src-tauri\Cargo.toml --locked --no-default-features --features test-provider,dev-diagnostics
+```
+
+`scripts/prepare-preview.ps1` runs these plus the Development notices check. The plain Test command above stays valid and unchanged; the Test runtime never enables the archive.
+
 ## Localization
 
 `public/messages.json` is the single catalog for native and web UI. Add new messages in every supported language in the same change as the feature. When an existing message changes meaning, review every translation; do not assume an unchanged translation is still correct. Keep keys for typo/style fixes; use distinct semantic keys for different actions or causes. Speech, transcripts, device names, external diagnostics and legal texts remain data, not translated UI copy.
@@ -82,7 +99,24 @@ For intentional non-translatable data or catalog-failure fallbacks, a narrow `//
 - `src-tauri/src/overlay.rs` — the recording overlay window.
 - `public/` — overlay, lab and settings pages, embedded into the executable via `include_str!`/`include_bytes!`. Rebuild after changing them.
 - `src-tauri/src/settings.rs`, `secrets.rs`, `preferences.rs` — settings document, DPAPI key storage, settings-window behaviour.
+- `src-tauri/src/diagnostics.rs` (with `diagnostics/storage.rs`, `diagnostics/flac.rs`) — the debug-only Development archive; compiled only under `all(debug_assertions, feature = "dev-diagnostics")`.
 - `src-tauri/src/backend.rs`, `provider.rs`, `live.rs` — the embedded server and Gemini calls.
+
+## Development diagnostics
+
+The `dev-diagnostics` feature adds a debug-only local archive used to investigate recognition problems ([issue #6](https://github.com/girte/speechek/issues/6)). It is deliberately narrow:
+
+- **Debug Development only.** The feature is non-default, requires `debug_assertions`, and the writer starts only in the Development profile. Production and the automatically launched Test profile always use a disabled sink: no `logs` directory, no audio, no journals.
+- **Files.** `logs/` beside the Development `settings.json` (canonical: `src-tauri\target\debug\logs\`). Each take gets a directory with `session.json`, rotated `events-*.jsonl` segments and at most one audio basename: `audio.flac` (verified complete), `audio.incomplete.flac` (verified surviving subset with known gaps) or `audio.flac.part` (unverified). Successful, failed and cancelled takes are all archived; a take with no audio is metadata only.
+- **Audio.** Lossless FLAC of the raw PCM (16 kHz, mono, 16-bit), encoded and independently verified lossless before it is published under a final name. It is plaintext personal audio protected by a user/SYSTEM DACL, not encryption. Never serve it over HTTP, never attach it to an issue or a commit, and use synthetic data only in automated checks.
+- **Retention.** 10 days, or earlier when the files exceed 100,000,000 bytes total across audio, journals, partials, staging and the reserve for finishing an active take. The writer sweeps at startup, each minute and on take close.
+- **Never weaken the gates.** `dev-diagnostics` must stay out of the default features, `tauri.conf.json`, the workflows, `scripts/build-release.ps1` and `scripts/build-test-installer.ps1`; `scripts/check-release.ps1` fails if it appears there. Only `scripts/prepare-preview.ps1` may pass it explicitly. The Production notice file `third_party/THIRD-PARTY-NOTICES.txt` stays codec-free; the debug archive's own `third_party/THIRD-PARTY-NOTICES-DEV.txt` is generated, never hand-written:
+
+  ```powershell
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/collect-notices.ps1 -Features dev-diagnostics -OutputPath third_party/THIRD-PARTY-NOTICES-DEV.txt
+  ```
+
+  `scripts/prepare-preview.ps1` verifies it with the same collector before building.
 
 ## Invariants to preserve
 

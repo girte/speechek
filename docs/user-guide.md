@@ -178,7 +178,7 @@ Speechek writes `settings.json` and `secrets.bin` one after the other. If someth
 
 **Your recordings**
 
-- Speechek doesn't save audio files.
+- A normal (Production) Speechek build saves no audio files and keeps no journals. Only a separate debug Development build with the explicit `dev-diagnostics` flag writes a local archive; see [Building from source](#building-from-source).
 - For Smart and Verbatim, the recording is uploaded to Gemini temporarily and deleted after recognition. Speechek also asks Gemini not to store the request.
 - Live Smart streams the audio to Gemini while you speak.
 
@@ -235,3 +235,19 @@ By default your settings and keys stay on the PC, in case you reinstall. To remo
 ## Building from source
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+### Development diagnostics
+
+The portable **Development** debug build can keep a local archive of its own takes for troubleshooting ([issue #6](https://github.com/girte/speechek/issues/6)). It's a developer tool; the shipped app never has it.
+
+- **Off unless asked for.** The `dev-diagnostics` Cargo feature is optional and never a default; Production and the isolated **Test** profile never enable it. Enable it for a local debug build:
+
+  ```bat
+  cargo build --manifest-path src-tauri\Cargo.toml --locked --no-default-features --features dev-diagnostics
+  ```
+
+  `scripts/prepare-preview.ps1` builds the official portable preview this way (the Development build is last, so no Test profile or `test-provider` remains in the executable). A debug build without the feature simply doesn't archive.
+- **What is written.** One lossless FLAC of the raw PCM (16 kHz, mono, 16-bit) per native take, plus a technical JSONL journal of counters and events. All outcomes are archived — successful, failed and cancelled takes. In the lab comparison, one take links its three Gemini requests to that single audio file. A take with no audio produces metadata only, never an empty FLAC.
+- **Where.** `logs/` next to the Development `settings.json`; for the canonical debug build that's `src-tauri\target\debug\logs\`. Production creates no `logs` directory and writes no audio or journals, and no setting, URL or HTTP route can turn the archive on. The files are never served over HTTP.
+- **Retention.** Files are removed after 10 days or earlier if the archive outgrows a total cap of 100,000,000 bytes (decimal 100 MB) across audio, journals, partial files and staging. Partial files and staging copies count toward the cap, as does the space reserved to finish an active take. Cleanup runs at startup, once a minute while Development runs and when a take closes; with the app closed, the files stay until the next launch.
+- **Privacy.** The FLAC is plaintext personal audio, not encryption. It's readable by your Windows user and SYSTEM (protected DACL), and therefore by any software running as you. Nothing is uploaded, and the archive never carries API keys, transcripts, device names or clipboard text. Use synthetic data only in automated checks; never use real keys or real speech.

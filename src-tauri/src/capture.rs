@@ -39,6 +39,12 @@ use crate::audio;
 use crate::i18n::{self, Language, MessageId, UiError, UiMessage};
 use crate::{LAB_LABEL, OVERLAY_LABEL};
 
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+use crate::diagnostics::{
+    CaptureArchive, CaptureAttempt, CaptureStarted, Diagnostics, Event, Outcome, Owner,
+    SessionHandle, SessionKey,
+};
+
 /// Emitted for every captured frame, to the window of the take it belongs to.
 const EVENT_PCM_FRAME: &str = "speechek:pcm-frame";
 /// Emitted when the microphone cannot be opened, or stops while it captures,
@@ -50,8 +56,11 @@ const EVENT_MUTE_WARNING: &str = "speechek:mute-warning";
 
 /// The recorder's own rate. The providers only ever see 16 kHz.
 const RATE_HZ: u32 = 16_000;
-/// One frame is 512 samples, the chunk the recorder passes around.
-const FRAME_SAMPLES: usize = 512;
+/// One frame is 512 samples, the chunk the recorder passes around. Every frame
+/// of a take is this size except the very last one, which the flush may leave
+/// short; the diagnostics use the same number to price a lost frame, so this is
+/// the one place that size is written down.
+pub(crate) const FRAME_SAMPLES: usize = 512;
 /// A device that has not answered in this long is not going to answer.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 /// The stable codes capture failures cross the command and event boundary
@@ -271,14 +280,260 @@ where
     }
 }
 
+/// Where the framed PCM of one take goes.
+///
+/// Every production frame goes to the window of the take; the diagnostics
+/// fixture collects the same frames in memory instead. The emitter is a type
+/// parameter, so a frame is never handed over through a trait object.
+trait FrameEmitter {
+    /// Why a frame could not be handed over. Only the log reads it.
+    type Error: std::fmt::Display;
+
+    fn emit(&mut self, owner: CaptureOwner, frame: Frame) -> Result<(), Self::Error>;
+}
+
+/// The window of the take: what every production capture emits to.
+struct WindowEmitter {
+    app: AppHandle,
+}
+
+impl FrameEmitter for WindowEmitter {
+    type Error = tauri::Error;
+
+    fn emit(&mut self, owner: CaptureOwner, frame: Frame) -> Result<(), Self::Error> {
+        self.app.emit_to(owner.label(), EVENT_PCM_FRAME, frame)
+    }
+}
+
+/// How far one device attempt got, in microseconds since its device was asked
+/// for: zero for a step that never happened.
+///
+/// Only the diagnostics read this. A build without them carries an empty
+/// placeholder, so an attempt costs nothing there.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+#[derive(Clone, Copy)]
+struct AttemptTiming {
+    /// The moment the attempt began.
+    began: Instant,
+    /// The rate and the channel count of the device that answered; zero until
+    /// a device did.
+    source_rate: u32,
+    source_channels: u16,
+    /// How long the device took to answer, to run and to deliver its first
+    /// frame.
+    open_us: u64,
+    play_us: u64,
+    first_frame_us: u64,
+}
+
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+impl AttemptTiming {
+    fn start() -> Self {
+        Self {
+            began: Instant::now(),
+            source_rate: 0,
+            source_channels: 0,
+            open_us: 0,
+            play_us: 0,
+            first_frame_us: 0,
+        }
+    }
+
+    /// The device answered: its rate and its channels are known from here on.
+    fn opened(&mut self, input: &Input) {
+        self.source_rate = input.rate;
+        self.source_channels = input.channels as u16;
+        self.open_us = self.elapsed_us();
+    }
+
+    /// The stream is running.
+    fn played(&mut self) {
+        self.play_us = self.elapsed_us();
+    }
+
+    /// The first frame of the attempt is out.
+    fn framed(&mut self) {
+        self.first_frame_us = self.elapsed_us();
+    }
+
+    fn elapsed_us(&self) -> u64 {
+        self.began.elapsed().as_micros() as u64
+    }
+}
+
+/// The archive of one capture, as its encoder sees it: the handle of the take,
+/// looked up once, and the archive taken lazily on the very first frame.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+struct DiagCapture {
+    /// The registered take, or `None` for a sink that is disabled or does not
+    /// know this capture: nothing is archived then, and nothing is counted.
+    session: Option<SessionHandle>,
+    /// Taken on the first frame, never before: a capture that fails before it
+    /// records has no archive to close, and leaves nothing behind for the
+    /// system fallback of its take to trip over.
+    archive: Option<CaptureArchive>,
+    /// The take's capture is over: no later frame may open an archive behind
+    /// it.
+    closed: bool,
+}
+
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+impl DiagCapture {
+    fn of(session: Option<SessionHandle>) -> Self {
+        Self {
+            session,
+            archive: None,
+            closed: false,
+        }
+    }
+
+    /// A capture with no take to archive: the emitter-only constructor's
+    /// starting point, before the worker attaches the handle it looked up.
+    fn none() -> Self {
+        Self::of(None)
+    }
+
+    /// One produced frame, from the very bytes the frame is built from and
+    /// before its base64 form goes out. The archive is taken on this first
+    /// call: a take that never produced a frame never gets one.
+    fn push(&mut self, sequence: u64, pcm_le: &[u8]) {
+        let Some(session) = &self.session else {
+            return;
+        };
+        if self.closed {
+            // The capture is over: a frame that arrives now is not part of it,
+            // and it must not open an archive the take has already closed.
+            return;
+        }
+        let archive = self.archive.get_or_insert_with(|| session.capture());
+        archive.push(sequence, pcm_le);
+    }
+
+    /// The emit of one frame failed: the frame never reached its window.
+    fn emit_failed(&mut self) {
+        if let Some(session) = &self.session {
+            session.emit_failed();
+        }
+    }
+
+    /// The capture is over: its last sequence is published and the writer is
+    /// told to flush the tail. This never encodes, verifies or joins anything.
+    fn finish(&mut self, last_sequence: u64, outcome: Outcome) {
+        self.closed = true;
+        match &mut self.archive {
+            Some(archive) => archive.finish(last_sequence, outcome),
+            // Nothing was ever captured: the take's capture is over all the
+            // same, and no empty archive is opened for it.
+            None => {
+                if let Some(session) = &self.session {
+                    session.end_capture(outcome);
+                }
+            }
+        }
+    }
+}
+
+/// The take a capture of `owner` archives under, as the worker finds it: the
+/// sink the shell manages, and the key of this very take inside it. `None`
+/// means there is nothing to archive — the sink is disabled, or this take was
+/// never registered.
+///
+/// The lookup happens once, before the first device is opened, and the handle
+/// then lives in the encoder for the whole take: no frame ever touches the
+/// registry.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn diagnostics_session(app: &AppHandle, owner: CaptureOwner) -> Option<SessionHandle> {
+    let key = SessionKey {
+        owner: match owner {
+            CaptureOwner::Dictation(_) => Owner::Dictation,
+            CaptureOwner::Lab(_) => Owner::Lab,
+        },
+        generation: owner.generation(),
+    };
+    app.try_state::<Arc<Diagnostics>>()?.lookup(key)
+}
+
+/// A start command that failed before any worker existed: the take's capture
+/// never began, so it is over at once, with no audio and no archive. It is
+/// closed as the lowest outcome there is, so the terminal the shell really gave
+/// this take — a cancel, an error, a window closing — is the one that stands.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_start_failed(session: &Option<SessionHandle>) {
+    if let Some(session) = session {
+        session.end_capture(Outcome::Abandoned);
+    }
+}
+
+/// What a refused start does to the take's capture.
+///
+/// A refusal that names another take — the other window's capture holding the
+/// microphone — leaves this start's take with a capture that never began, and
+/// that capture is closed here. A refusal of *this very* take is not that: the
+/// take it names is already arming or recording, and its capture, its frames
+/// and its later end all stay its own.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_refused_start(refusal: &ClaimError, session: &Option<SessionHandle>) {
+    if !matches!(refusal, ClaimError::SameTake(_)) {
+        note_start_failed(session);
+    }
+}
+
+/// One device attempt, as the journal records it: the numbers of the attempt
+/// and, for one that failed, the catalog key of its reason. Never the device's
+/// name or its driver's words.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn attempt_event(
+    attempt_index: u32,
+    fallback: bool,
+    timing: &AttemptTiming,
+    ui_key: Option<MessageId>,
+) -> Event {
+    Event::CaptureAttempt(CaptureAttempt {
+        attempt_index,
+        source_rate: timing.source_rate,
+        source_channels: timing.source_channels,
+        fallback,
+        ui_key,
+        open_us: timing.open_us,
+        play_us: timing.play_us,
+        first_frame_us: timing.first_frame_us,
+    })
+}
+
+/// The catalog key of a failed attempt: what the renderer would have shown for
+/// it. An attempt that ended because the take was over has no reason of its
+/// own.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn failure_key(failure: &AttemptError) -> Option<MessageId> {
+    match failure {
+        AttemptError::Fallback(error) | AttemptError::Fatal(error) => Some(error.ui.key),
+        AttemptError::Ended(_) => None,
+    }
+}
+
+/// The attempt that recorded, as the journal records it: the rate and the
+/// channels of the device that really captured, and how long it took to open,
+/// to run and to deliver its first frame.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn started_event(timing: &AttemptTiming) -> Event {
+    Event::CaptureStarted(CaptureStarted {
+        source_rate: timing.source_rate,
+        source_channels: timing.source_channels,
+        open_us: timing.open_us,
+        play_us: timing.play_us,
+        first_frame_us: timing.first_frame_us,
+    })
+}
+
 /// Turns the device's mono frames into the recorder's frames: 16 kHz mono
 /// PCM16, in 512-sample chunks, emitted as they fill up.
 ///
 /// The resampler is a linear interpolator and it keeps its read position across
 /// callbacks, so where a callback happens to end never moves a frame boundary.
-struct Encoder {
-    app: AppHandle,
-    /// The take this encoder frames and the window its frames go to.
+struct Encoder<E: FrameEmitter = WindowEmitter> {
+    /// Where the frames of this take go.
+    emitter: E,
+    /// The take this encoder frames.
     owner: CaptureOwner,
     /// Sequence of the last emitted frame; zero before the first one.
     sequence: u64,
@@ -295,12 +550,16 @@ struct Encoder {
     /// Whether the window of this take has already been reported as
     /// unreachable, so a take cannot fill the console with one line per frame.
     complained: bool,
+    /// The archive of this take, for the builds that keep one.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    diagnostics: DiagCapture,
 }
 
-impl Encoder {
-    fn new(app: AppHandle, owner: CaptureOwner, source_rate: u32) -> Self {
+impl<E: FrameEmitter> Encoder<E> {
+    /// The encoder of one take, framing into `emitter`.
+    fn with_emitter(emitter: E, owner: CaptureOwner, source_rate: u32) -> Self {
         Self {
-            app,
+            emitter,
             owner,
             sequence: 0,
             pending: VecDeque::new(),
@@ -309,6 +568,8 @@ impl Encoder {
             chunk: Vec::with_capacity(FRAME_SAMPLES),
             bytes: Vec::with_capacity(FRAME_SAMPLES * 2),
             complained: false,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            diagnostics: DiagCapture::none(),
         }
     }
 
@@ -358,13 +619,20 @@ impl Encoder {
         for sample in &self.chunk {
             self.bytes.extend_from_slice(&sample.to_le_bytes());
         }
+        // The archive sees the very bytes this frame is built from, before the
+        // window does: a frame the window never gets is still a frame of the
+        // take, and a gap the archive can account for.
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        self.diagnostics.push(sequence, &self.bytes);
         let data = BASE64.encode(&self.bytes);
         let frame = Frame {
             generation: self.owner.generation(),
             sequence,
             data,
         };
-        if let Err(err) = self.app.emit_to(self.owner.label(), EVENT_PCM_FRAME, frame) {
+        if let Err(err) = self.emitter.emit(self.owner, frame) {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            self.diagnostics.emit_failed();
             if !self.complained {
                 self.complained = true;
                 eprintln!(
@@ -374,6 +642,130 @@ impl Encoder {
             }
         }
         self.chunk.clear();
+    }
+}
+
+impl Encoder<WindowEmitter> {
+    /// The production encoder of one take: its frames go to the window of the
+    /// take. The take's diagnostics handle is attached by the worker, from the
+    /// one lookup it made before the device was opened.
+    fn new(app: &AppHandle, owner: CaptureOwner, source_rate: u32) -> Self {
+        Self::with_emitter(WindowEmitter { app: app.clone() }, owner, source_rate)
+    }
+}
+
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+impl<E: FrameEmitter> Encoder<E> {
+    /// Attaches the registered take this capture archives under. A sink that is
+    /// disabled, or one that does not know the key, leaves it unattached and
+    /// archives nothing.
+    fn with_session(&mut self, session: Option<SessionHandle>) {
+        self.diagnostics = DiagCapture::of(session);
+    }
+    fn finish_diagnostics(&mut self, outcome: Outcome) {
+        let last = self.sequence;
+        self.diagnostics.finish(last, outcome);
+    }
+}
+
+/* -------------------------------------------------------------------------- */
+/* Diagnostics fixture                                                         */
+/* -------------------------------------------------------------------------- */
+
+/// One persistent encoder whose frames are collected instead of emitted: the
+/// headless seam a real capture is driven through, with no `AppHandle` and no
+/// microphone.
+///
+/// The encoder is created once and kept across every batch, so its sequence
+/// and its resampler position are the ones a live capture would have.
+#[cfg(all(test, debug_assertions, feature = "dev-diagnostics"))]
+pub(crate) struct DiagnosticsFramingFixture {
+    encoder: Encoder<CollectEmitter>,
+    session: SessionHandle,
+    finished: bool,
+}
+
+/// Collects the frames of one take, base64 and all, exactly as they would have
+/// been emitted to its window. An emitter the fixture switched to failing keeps
+/// nothing: it is the window that can no longer be reached.
+#[cfg(all(test, debug_assertions, feature = "dev-diagnostics"))]
+#[derive(Default)]
+struct CollectEmitter {
+    /// The frames handed over so far.
+    frames: Vec<(u64, Vec<u8>)>,
+    /// Whether the window refuses them, as an unreachable window does.
+    failing: bool,
+}
+
+#[cfg(all(test, debug_assertions, feature = "dev-diagnostics"))]
+impl FrameEmitter for CollectEmitter {
+    type Error = &'static str;
+
+    fn emit(&mut self, _owner: CaptureOwner, frame: Frame) -> Result<(), Self::Error> {
+        if self.failing {
+            return Err("the window of this take cannot be reached");
+        }
+        let bytes = BASE64
+            .decode(frame.data.as_bytes())
+            .expect("an emitted frame carries base64 PCM");
+        self.frames.push((frame.sequence, bytes));
+        Ok(())
+    }
+}
+
+#[cfg(all(test, debug_assertions, feature = "dev-diagnostics"))]
+impl DiagnosticsFramingFixture {
+    /// A take of `session`, fed source frames at `source_rate`.
+    pub(crate) fn new(key: SessionKey, source_rate: u32, session: SessionHandle) -> Self {
+        let owner = match key.owner {
+            Owner::Dictation => CaptureOwner::Dictation(key.generation),
+            Owner::Lab => CaptureOwner::Lab(key.generation),
+        };
+        let mut encoder = Encoder::with_emitter(CollectEmitter::default(), owner, source_rate);
+        encoder.with_session(Some(session.clone()));
+        Self {
+            encoder,
+            session,
+            finished: false,
+        }
+    }
+
+    /// One batch of mono source frames, at the fixture's source rate.
+    pub(crate) fn push(&mut self, source: &[f32]) {
+        self.encoder.push(source);
+    }
+
+    /// The frames emitted since the last call: their 1-based sequence and the
+    /// PCM16 little-endian samples the window would have received.
+    pub(crate) fn take_frames(&mut self) -> Vec<(u64, Vec<u8>)> {
+        std::mem::take(&mut self.encoder.emitter.frames)
+    }
+
+    /// The frames the writer has taken out of this take's queue: the watermark
+    /// a driver waits for between batches, so a push never outruns the pool.
+    pub(crate) fn consumed_watermark(&self) -> u64 {
+        self.session.audio_consumed()
+    }
+
+    /// The window of the take becomes unreachable: every frame from here on is
+    /// produced and archived, but never handed over.
+    pub(crate) fn fail_emits(&mut self) {
+        self.encoder.emitter.failing = true;
+    }
+
+    /// The installation of this capture was refused: the worker drops it
+    /// exactly as it stands. Whatever the archive already holds goes with it —
+    /// the first frame of an attempt that recorded, but a take that never
+    /// framed leaves nothing behind at all.
+    pub(crate) fn abandon_take(self) {}
+
+    /// Ends the take exactly once: the tail the capture was still holding goes
+    /// out, and the archive publishes its last sequence.
+    pub(crate) fn finish(&mut self, outcome: Outcome) {
+        assert!(!self.finished, "the fixture ends one take exactly once");
+        self.finished = true;
+        self.encoder.flush();
+        self.encoder.finish_diagnostics(outcome);
     }
 }
 
@@ -664,6 +1056,11 @@ struct Session {
     /// The sequence of the last emitted frame, sent once the tail is out, or
     /// the reason the stream failed before it could be read whole.
     landed: Receiver<Result<u64, UiError>>,
+    /// The take's diagnostics handle, cached when the recording was installed:
+    /// a command that gives up on a stalled worker publishes the capture end
+    /// from here, without reaching for the registry again.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    diagnostics: Option<SessionHandle>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -676,7 +1073,11 @@ impl Session {
     /// the tail. A stream that failed on its own keeps that failure: a tail a
     /// renderer cannot trust is never handed over as if it were whole. A
     /// session that does not report itself in time is left detached: a driver
-    /// that stopped answering must not be able to hold this thread forever.
+    /// that stopped answering must not be able to hold this thread forever. A
+    /// worker that never came back never published this take's capture end
+    /// either, so the command publishes it here instead — the take is closed as
+    /// its own error, and a frame the stalled worker later produces is a hole
+    /// of a capture that is already over.
     fn finish(mut self) -> Result<u64, UiError> {
         let _ = self.stop.send(());
         let landed = self.landed.recv_timeout(STOP_TIMEOUT);
@@ -688,9 +1089,22 @@ impl Session {
         match landed {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => {
+                // The worker never reached its tail, so the take's capture end
+                // is published here — as the take's own error — and a frame the
+                // stalled worker finally produces is a hole of a capture that
+                // is already over. Nothing about the driver, the renderer or
+                // this wait changes.
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                if let Some(session) = &self.diagnostics {
+                    session.abandon_capture(Outcome::Error);
+                }
                 Err(UiError::new(CAPTURE_FAILED, UiMessage::new(MessageId::MicStopTimeout)))
             }
             Err(RecvTimeoutError::Disconnected) => {
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                if let Some(session) = &self.diagnostics {
+                    session.abandon_capture(Outcome::Error);
+                }
                 Err(UiError::new(CAPTURE_FAILED, UiMessage::new(MessageId::CaptureThreadLost)))
             }
         }
@@ -730,6 +1144,11 @@ struct Opening {
     /// end is what tells a worker whose reservation vanished to close instead
     /// of recording.
     stop: Sender<()>,
+    /// The take's diagnostics handle, cached from before the worker existed, so
+    /// the recording keeps it and a stop that has to give up on a stalled
+    /// worker can still publish this take's capture end.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    diagnostics: Option<SessionHandle>,
     /// Filled in right after the worker is spawned, while the reservation is
     /// still held.
     thread: Option<JoinHandle<()>>,
@@ -788,6 +1207,31 @@ fn stop_right(slot: &Option<Active>, owner: CaptureOwner) -> StopRight {
     }
 }
 
+/// Why a start could not claim the slot, and whether the take it found there is
+/// this very one — already capturing — or another take holding the microphone.
+///
+/// The distinction is what keeps a repeated start harmless: the take it names
+/// is already running, and nothing about its capture may be closed just because
+/// the start was refused. Only a refusal of a take that never began hands the
+/// caller a take whose capture is really over.
+#[derive(Debug)]
+enum ClaimError {
+    /// This very take already claims the slot: it is arming or recording, and
+    /// its capture is its own to finish.
+    SameTake(UiError),
+    /// Another take — of the other window — holds the microphone.
+    Busy(UiError),
+}
+
+impl ClaimError {
+    /// The reason the start command is answered with.
+    fn into_error(self) -> UiError {
+        match self {
+            Self::SameTake(error) | Self::Busy(error) => error,
+        }
+    }
+}
+
 /// Ends a take that was left in the slot by an earlier generation of the same
 /// window, outside the lock that held it. A leftover is a bug somewhere else —
 /// every end path of a take closes its capture — but the microphone must be
@@ -826,13 +1270,13 @@ impl NativeCapture {
     /// a leftover take of the same window so the caller can end it outside this
     /// lock. The other window's capture — and this very take, already claimed —
     /// are refused.
-    fn claim(&self, owner: CaptureOwner) -> Result<Option<Active>, UiError> {
+    fn claim(&self, owner: CaptureOwner) -> Result<Option<Active>, ClaimError> {
         let mut slot = self.slot.lock();
         match stop_right(&slot, owner) {
             StopRight::Idle => Ok(None),
-            StopRight::Mine => Err(same_take_error(owner)),
+            StopRight::Mine => Err(ClaimError::SameTake(same_take_error(owner))),
             StopRight::Stale => Ok(slot.take()),
-            StopRight::Foreign => Err(busy_error(owner)),
+            StopRight::Foreign => Err(ClaimError::Busy(busy_error(owner))),
         }
     }
 
@@ -869,6 +1313,10 @@ impl NativeCapture {
     /// no other take can slip in. The take's own admission is compared here as
     /// well: a shell that closed its capture while the driver was answering
     /// never gets a recording installed behind it.
+    ///
+    /// `diagnostics` is the take's own handle, cached beside the recording so a
+    /// stop that has to give up on a stalled worker can still publish this
+    /// take's capture end.
     fn install(
         &self,
         ticket: &Arc<()>,
@@ -891,13 +1339,17 @@ impl NativeCapture {
                 return Err(());
             }
         };
-        let Opening { stop, thread, .. } = opening;
+        // The recording takes the reservation's parts over one by one, so the
+        // take's own handle travels with it and nothing has to carry a gate
+        // inside a pattern.
         *slot = Some(Active::Recording(Session {
             owner,
             ticket: Arc::clone(ticket),
-            stop,
+            stop: opening.stop,
             landed,
-            thread,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            diagnostics: opening.diagnostics,
+            thread: opening.thread,
         }));
         Ok(())
     }
@@ -1078,6 +1530,10 @@ struct Opened {
     /// slot. A capture that never gets there — its reservation was withdrawn
     /// while its driver was answering — is never answered at all.
     start: CaptureStart,
+    /// How far this attempt got, in microseconds: what the take's start record
+    /// carries.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    timing: AttemptTiming,
     encoder: Encoder,
     stream: cpal::Stream,
     samples: Receiver<Vec<f32>>,
@@ -1229,6 +1685,14 @@ struct Attempt<'a> {
     /// Whether this attempt is the system device standing in for a selected one
     /// that was gone: the renderer is told which device really captured.
     fallback: bool,
+    /// Which device attempt this is, counting from one: the device the take
+    /// asked for is the first, the system device standing in for it the second.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    attempt_index: u32,
+    /// The take's diagnostics handle, looked up once by the worker. Nothing is
+    /// recorded about this attempt without it.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    session: Option<&'a SessionHandle>,
     closed: &'a AtomicU64,
     admission: u64,
     control: &'a Receiver<()>,
@@ -1245,10 +1709,22 @@ impl Attempt<'_> {
     /// queued buffers, its resampler position and its frame sequence with it.
     /// The retry therefore starts from an empty encoder and sequence zero.
     fn run(self) -> Result<Opened, AttemptError> {
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        let mut timing = AttemptTiming::start();
         if self.handshake.over(self.closed, self.admission, self.control) {
             return Err(AttemptError::Ended(ended_while_opening()));
         }
-        let input = open(self.selected).map_err(AttemptError::from)?;
+        let input = match open(self.selected) {
+            Ok(input) => input,
+            Err(error) => {
+                let failure = AttemptError::from(error);
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                self.note_attempt(&timing, Some(&failure));
+                return Err(failure);
+            }
+        };
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        timing.opened(&input);
         if self.handshake.over(self.closed, self.admission, self.control) {
             // The device answered, but the take is over: it is given back
             // without a stream ever running, so nothing of it is recorded.
@@ -1262,20 +1738,38 @@ impl Attempt<'_> {
         for _ in 0..2 {
             let _ = free_tx.send(Vec::with_capacity(input.channels * BUFFER_FRAMES));
         }
-        let mut encoder = Encoder::new(self.app.clone(), self.owner, input.rate);
-        let stream = build(&input, samples_tx, free_rx, errors_tx).map_err(AttemptError::from)?;
+        let mut encoder = Encoder::new(self.app, self.owner, input.rate);
+        // The handle was looked up once, before this device was touched: the
+        // encoder keeps it for the whole take, so no frame ever asks the
+        // registry anything.
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        encoder.with_session(self.session.cloned());
+        let stream = match build(&input, samples_tx, free_rx, errors_tx) {
+            Ok(stream) => stream,
+            Err(error) => {
+                let failure = AttemptError::from(error);
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                self.note_attempt(&timing, Some(&failure));
+                return Err(failure);
+            }
+        };
         if let Err(err) = stream.play() {
             let error = mic_failure_arg(
                 MessageId::MicStreamDidNotStart,
                 "detail",
                 Value::String(err.to_string()),
             );
-            return Err(if err.gone() {
+            let failure = if err.gone() {
                 AttemptError::Fallback(error)
             } else {
                 AttemptError::Fatal(error)
-            });
+            };
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            self.note_attempt(&timing, Some(&failure));
+            return Err(failure);
         }
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        timing.played();
         // The stream runs, but the take has not recorded anything yet: the
         // handshake only answers once a frame of it has really been emitted.
         let deadline = Instant::now() + OPEN_TIMEOUT;
@@ -1288,20 +1782,30 @@ impl Attempt<'_> {
                 break;
             }
             if let Ok(failure) = errors_rx.try_recv() {
-                return Err(match failure {
+                let failure = match failure {
                     StreamFailure::Unavailable(error) => AttemptError::Fallback(error),
                     StreamFailure::Fatal(error) => AttemptError::Fatal(error),
-                });
+                };
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                self.note_attempt(&timing, Some(&failure));
+                return Err(failure);
             }
             if Instant::now() >= deadline {
-                return Err(AttemptError::Fatal(mic_failure_arg(
+                let failure = AttemptError::Fatal(mic_failure_arg(
                     MessageId::MicNoFrame,
                     "seconds",
                     Value::from(OPEN_TIMEOUT.as_secs()),
-                )));
+                ));
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                self.note_attempt(&timing, Some(&failure));
+                return Err(failure);
             }
             thread::sleep(IDLE_POLL);
         }
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        timing.framed();
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        self.note_attempt(&timing, None);
         // The first frame is out: this attempt may be installed, and only the
         // worker that holds the reservation may answer the command from here on.
         // Only a system device standing in for a selected one is named: a take
@@ -1313,11 +1817,28 @@ impl Attempt<'_> {
                 used_device_id: input.used_device_id,
             },
             encoder,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            timing,
             stream,
             samples: samples_rx,
             free: free_tx,
             errors: errors_rx,
         })
+    }
+
+    /// One device attempt, as the take's journal records it: the numbers of the
+    /// attempt and, for one that failed, the catalog key of its reason. The
+    /// device's own name and its driver's words never travel through here.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn note_attempt(&self, timing: &AttemptTiming, failure: Option<&AttemptError>) {
+        if let Some(session) = self.session {
+            session.event(attempt_event(
+                self.attempt_index,
+                self.fallback,
+                timing,
+                failure.and_then(failure_key),
+            ));
+        }
     }
 }
 
@@ -1378,16 +1899,38 @@ pub fn start(
     admission: u64,
 ) -> Result<CaptureStart, UiError> {
     let state = app.state::<NativeCapture>();
+    // The take's diagnostics handle, looked up once, here, so a start that
+    // fails before any device is opened still closes the take's capture instead
+    // of leaving it open for a capture that never began. A build without the
+    // diagnostics looks nothing up.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    let session = diagnostics_session(app, owner);
     if !current(&state.closed, admission) {
         // The take is over already: no thread is started for it, so no device
         // is opened and no mute can be engaged behind the shell's back.
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        note_start_failed(&session);
         return Err(ended_error(owner));
     }
 
     // A take of this same window left in the slot by an earlier generation is
     // ended before this reservation is claimed; the other window's capture
     // refuses this start outright.
-    if let Some(leftover) = state.claim(owner)? {
+    //
+    // A refusal of this very take is not a failure of the take's capture: the
+    // take that holds the slot is already arming or recording — a repeated
+    // start — and its capture, its frames and its later end all belong to it.
+    // Only a refusal that names another take leaves this start's take without a
+    // capture of its own, and only that one is closed here.
+    let leftover = match state.claim(owner) {
+        Ok(leftover) => leftover,
+        Err(refusal) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_refused_start(&refusal, &session);
+            return Err(refusal.into_error());
+        }
+    };
+    if let Some(leftover) = leftover {
         end_leftover(leftover);
     }
 
@@ -1402,13 +1945,19 @@ pub fn start(
     // The reservation is in the slot before the worker exists: a second start of
     // either owner finds the microphone taken, and a stop can end this take
     // without waiting for a driver.
-    state.reserve(Opening {
+    if let Err(error) = state.reserve(Opening {
         owner,
         admission,
         ticket: Arc::clone(&ticket),
         stop: stop_tx,
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        diagnostics: session.clone(),
         thread: None,
-    })?;
+    }) {
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        note_start_failed(&session);
+        return Err(error);
+    }
 
     let worker_ticket = Arc::clone(&ticket);
     let worker = app.clone();
@@ -1434,6 +1983,8 @@ pub fn start(
             // No worker holds the reservation, so it is taken back here: the
             // microphone must not stay claimed by a thread that never existed.
             state.withdraw(owner, &ticket);
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_start_failed(&session);
             return Err(mic_failure_arg(
                 MessageId::CaptureThreadStart,
                 "detail",
@@ -1482,6 +2033,9 @@ pub fn start(
 pub fn stop(app: &AppHandle, owner: CaptureOwner) -> Result<u64, UiError> {
     let state = app.state::<NativeCapture>();
     match state.take_for_stop(owner)? {
+        // The recording publishes its own capture end: its tail on the way out,
+        // or — a worker that stopped answering — the abandon its own finish
+        // writes when the tail never comes.
         Some(Active::Recording(session)) => session.finish(),
         // A take whose device has not answered yet is ended without waiting for
         // it: the worker reads the stop, closes whatever it opened and never
@@ -1599,6 +2153,12 @@ fn session_thread(
     answers: Receiver<Result<u64, UiError>>,
 ) {
     let state = app.state::<NativeCapture>();
+    // The take's diagnostics handle, looked up once, before the first device is
+    // asked for anything: every attempt, the start record and the archive of
+    // this capture read it from here. A build without the diagnostics never
+    // looks anything up.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    let session = diagnostics_session(&app, owner);
     let mut reservation = Reservation {
         state: &state,
         owner,
@@ -1613,19 +2173,36 @@ fn session_thread(
     // record from another microphone.
     let mut attempt_selected = selected;
     let mut fallback = false;
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    let mut attempt_index = 0u32;
     let mut opened = loop {
         if handshake.over(&state.closed, admission, &control) {
             // The take was given up on before this attempt recorded anything:
             // nobody is waiting for an answer about a capture that must not
-            // start, so there is nothing left to report.
+            // start, so there is nothing left to report. No archive was ever
+            // opened for it, so its capture is closed here instead — as the
+            // lowest outcome there is, so the terminal the shell really gave
+            // this take is the one that stands.
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            if let Some(session) = &session {
+                session.end_capture(Outcome::Abandoned);
+            }
             let _ = handshake.fail(ended_error(owner));
             return;
+        }
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        {
+            attempt_index += 1;
         }
         let attempt = Attempt {
             app: &app,
             owner,
             selected: attempt_selected.as_deref(),
             fallback,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            attempt_index,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            session: session.as_ref(),
             closed: &state.closed,
             admission,
             control: &control,
@@ -1643,13 +2220,27 @@ fn session_thread(
                 }
                 Retry::End(error) => {
                     eprintln!("speechek: {error}.");
+                    // The take never recorded a frame, so it has no archive:
+                    // its capture is closed here, and a failure of the device
+                    // is the take's own error.
+                    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                    if let Some(session) = &session {
+                        session.end_capture(Outcome::Error);
+                    }
                     let _ = handshake.fail(error);
                     return;
                 }
                 Retry::Ended(error) => {
                     // The take is over, not the device: the command that may
                     // still be waiting learns that nothing started, and no
-                    // failure is reported for a take the shell left behind.
+                    // failure is reported for a take the shell left behind. A
+                    // stop that arrived while the device was answering is this
+                    // case too, so nothing but the shell's own terminal is
+                    // recorded for such a take.
+                    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                    if let Some(session) = &session {
+                        session.end_capture(Outcome::Abandoned);
+                    }
                     let _ = handshake.fail(error);
                     return;
                 }
@@ -1667,10 +2258,23 @@ fn session_thread(
         .install(&reservation.ticket, admission, owner, answers)
         .is_err()
     {
+        // The take was stopped — or the shell closed its capture — while the
+        // driver was answering. The first frame of this attempt was already
+        // archived, and the archive of an installation that never happened is
+        // dropped here: it publishes that frame as an abandoned capture of a
+        // take that never started.
         let _ = handshake.fail(ended_error(owner));
         return;
     }
     reservation.installed = true;
+
+    // The take recorded: its start record carries the rate and the channels of
+    // the device that really captured, and how long it took to open, to run
+    // and to deliver the frame the command was answered with.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if let Some(session) = &session {
+        session.event(started_event(&opened.timing));
+    }
 
     // The answer may only go out for an installed recording: a renderer that
     // gave the command up — it timed out, or the take was stopped in the same
@@ -1726,6 +2330,28 @@ fn session_thread(
     // flushed.
     drain(&opened.samples, &opened.free, &mut opened.encoder);
     opened.encoder.flush();
+    // The capture is over, and this is the last thing the take's archive hears
+    // from this thread: the last sequence is published and the writer is told
+    // to flush the tail, *before* the stop command is answered below, so a stop
+    // that returns the last sequence is already followed by this take's capture
+    // end. The publish is atomic and never encodes, verifies or joins anything,
+    // so the stop deadline above is the one it always was.
+    //
+    // The outcome here is deliberately neutral. A take's terminal belongs to
+    // the shell — a cancelled dictation, a laboratory window closing, the shell
+    // leaving — and a capture that simply ran to its own stop claims nothing:
+    // it is published as the lowest outcome there is, so only a real terminal
+    // can ever rise above it. A stream that failed on its own is the one thing
+    // this thread knows for certain, and that is an error.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    {
+        let outcome = if failure.is_some() {
+            Outcome::Error
+        } else {
+            Outcome::Abandoned
+        };
+        opened.encoder.finish_diagnostics(outcome);
+    }
     if let Some(error) = &failure {
         mic_error(&app, owner, error);
         eprintln!("speechek: {error}.");
@@ -2103,6 +2729,8 @@ mod tests {
             ticket: Arc::new(()),
             stop,
             landed,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            diagnostics: None,
             thread: Some(worker),
         }
     }
@@ -2123,6 +2751,8 @@ mod tests {
                 admission,
                 ticket: Arc::clone(&ticket),
                 stop,
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                diagnostics: None,
                 thread: None,
             })
             .expect("the slot is free");
@@ -2201,6 +2831,8 @@ mod tests {
                     admission: 0,
                     ticket: Arc::new(()),
                     stop: mpsc::channel().0,
+                    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                    diagnostics: None,
                     thread: None,
                 })
                 .is_err(),
@@ -2330,6 +2962,8 @@ mod tests {
             stop,
             landed,
             thread: Some(worker),
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            diagnostics: None,
         }));
 
         state.end_for_exit();
@@ -2410,6 +3044,8 @@ mod tests {
             ticket: Arc::new(()),
             stop,
             landed,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            diagnostics: None,
             thread: None,
         };
         assert!(
@@ -2447,4 +3083,427 @@ mod tests {
         assert_ne!(CaptureOwner::Dictation(3), CaptureOwner::Lab(3));
     }
 
+    /* ---------------------------------------------------------------------- */
+    /* The diagnostics framing seam                                            */
+    /* ---------------------------------------------------------------------- */
+
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    use super::{note_refused_start, pcm16, ClaimError, CollectEmitter, DiagnosticsFramingFixture, Encoder};
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    use crate::diagnostics::{
+        AudioStatus, Diagnostics, Mode, Outcome, Owner, Policy, SessionHandle, SessionKey,
+    };
+
+    /// A registered take of a sink that keeps no files: the framing seams need
+    /// a handle, not a disk.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn scratch_session() -> (Arc<Diagnostics>, SessionHandle) {
+        let sink = Diagnostics::for_test(
+            &std::env::temp_dir().join("speechek-capture-framing"),
+            Policy {
+                max_age: Duration::from_secs(600),
+                max_bytes: 1_000_000,
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let handle = scratch_take(&sink, Owner::Dictation, 1);
+        (sink, handle)
+    }
+
+    /// Another registered take of the same sink, named by its own owner and
+    /// generation: the key a refusal of *another* take is answered with, so a
+    /// test can tell the take it names from the one that is already running.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn scratch_take(sink: &Arc<Diagnostics>, owner: Owner, generation: u64) -> SessionHandle {
+        sink.begin(SessionKey { owner, generation }, Mode::Live)
+            .expect("a take of this sink")
+    }
+
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn framing(handle: &SessionHandle, source_rate: u32) -> DiagnosticsFramingFixture {
+        DiagnosticsFramingFixture::new(handle.key(), source_rate, handle.clone())
+    }
+
+    /// A deterministic source signal: no randomness, and no silence that a
+    /// resampler could hide a mistake in.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn signal(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|index| ((index % 64) as f32 - 32.0) / 32.0)
+            .collect()
+    }
+
+    /// The PCM16 little-endian bytes of `source`, as a frame carries them.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn pcm_bytes(source: &[f32]) -> Vec<u8> {
+        source
+            .iter()
+            .flat_map(|level| pcm16(*level).to_le_bytes())
+            .collect()
+    }
+
+    /// At the recorder's own rate the resampler is the identity: one batch of
+    /// source frames becomes the frames of the same samples, byte for byte,
+    /// with nothing padded, trimmed or normalised.
+    #[test]
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn the_encoder_frames_the_exact_samples_it_is_given() {
+        let (_sink, handle) = scratch_session();
+        let mut fixture = framing(&handle, 16_000);
+        let source = signal(513);
+        fixture.push(&source);
+
+        let frames = fixture.take_frames();
+        assert_eq!(frames.len(), 1, "one full frame; the rest still waits");
+        assert_eq!(frames[0].0, 1, "frames are numbered from one");
+        assert_eq!(frames[0].1, pcm_bytes(&source[..512]));
+    }
+
+    /// The encoder is created once and kept: where a batch happens to end never
+    /// moves a frame boundary, and the sequence never restarts.
+    #[test]
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn one_encoder_keeps_its_resampler_across_batches() {
+        let source = signal(8_000);
+
+        let (_sink, handle) = scratch_session();
+        let mut whole = framing(&handle, 48_000);
+        whole.push(&source);
+        let in_one = whole.take_frames();
+
+        let (_sink, handle) = scratch_session();
+        let mut split = framing(&handle, 48_000);
+        for chunk in source.chunks(97) {
+            split.push(chunk);
+        }
+        let in_batches = split.take_frames();
+
+        assert!(!in_one.is_empty(), "the source really does frame");
+        assert_eq!(in_one, in_batches, "the batch edges moved no frame");
+        let sequences: Vec<u64> = in_one.iter().map(|(sequence, _)| *sequence).collect();
+        assert_eq!(
+            sequences,
+            (1..=in_one.len() as u64).collect::<Vec<_>>(),
+            "one encoder numbers its frames straight through"
+        );
+    }
+
+    /// The tail a stop leaves behind goes out exactly once, and it carries the
+    /// samples that were really captured: the last source frame waited for a
+    /// neighbour that never came, and went with the stream.
+    #[test]
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn the_tail_goes_out_once_and_keeps_the_captured_samples() {
+        let (_sink, handle) = scratch_session();
+        let mut fixture = framing(&handle, 16_000);
+        let source = signal(600);
+        fixture.push(&source);
+        let mut frames = fixture.take_frames();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].1, pcm_bytes(&source[..512]));
+
+        fixture.finish(Outcome::Success);
+        let tail = fixture.take_frames();
+        assert_eq!(tail.len(), 1, "the tail is the only frame left");
+        assert_eq!(tail[0].0, 2, "the tail keeps the sequence it follows");
+        assert_eq!(
+            tail[0].1,
+            pcm_bytes(&source[512..599]),
+            "the tail is what was captured, with no padding and no repeat"
+        );
+        frames.extend(tail);
+
+        let emitted: Vec<u8> = frames.iter().flat_map(|(_, bytes)| bytes.clone()).collect();
+        assert_eq!(
+            emitted,
+            pcm_bytes(&source[..599]),
+            "one source frame — the one that waited for its neighbour — is all that is lost"
+        );
+    }
+
+
+    /// An installation that is refused drops the encoder with the frame it
+    /// already emitted: that frame is kept, and the capture of a take that
+    /// never started is over all the same.
+    #[test]
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn a_refused_installation_keeps_the_frame_it_archived() {
+        let (_sink, handle) = scratch_session();
+        let mut fixture = framing(&handle, 16_000);
+        fixture.push(&signal(513));
+        assert_eq!(fixture.take_frames().len(), 1);
+
+        fixture.abandon_take();
+
+        let counters = handle.capture_counters();
+        assert_eq!(counters.produced_frames, 1, "the first frame is kept");
+        assert_eq!(counters.last_sequence, Some(1));
+        assert!(
+            handle.capture_finished(),
+            "the capture of a take that was never installed is over"
+        );
+    }
+
+    /// A take whose device never delivered a frame has no archive at all: its
+    /// drop closes nothing, so the system fallback of the attempt is free to
+    /// try the next device.
+    #[test]
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn an_attempt_that_never_framed_leaves_no_archive_behind() {
+        let (_sink, handle) = scratch_session();
+        let fixture = framing(&handle, 16_000);
+        fixture.abandon_take();
+
+        assert_eq!(handle.capture_counters().produced_frames, 0);
+        assert!(
+            !handle.capture_finished(),
+            "no frame was ever captured, so there is no capture to close"
+        );
+    }
+
+    /// Once the shell has closed the capture, a frame the encoder still
+    /// produces is a hole: it is counted, it never reaches the archive, and it
+    /// does not open one behind the take's back.
+    #[test]
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn a_late_frame_after_the_capture_closed_is_a_gap() {
+        let (_sink, handle) = scratch_session();
+        let mut encoder = Encoder::with_emitter(
+            CollectEmitter::default(),
+            CaptureOwner::Dictation(1),
+            16_000,
+        );
+        encoder.with_session(Some(handle.clone()));
+        encoder.push(&signal(513));
+        assert_eq!(handle.capture_counters().produced_frames, 1);
+
+        // The shell cancelled the take while this encoder was still running.
+        handle.end_capture(Outcome::Cancelled);
+        encoder.push(&signal(513));
+
+        let counters = handle.capture_counters();
+        assert_eq!(counters.produced_frames, 2, "the frame was still produced");
+        assert_eq!(
+            counters.dropped_frames, 1,
+            "but it never reached the archive"
+        );
+        assert!(counters.has_gaps());
+        assert_eq!(counters.last_sequence, Some(2));
+        assert_eq!(
+            handle.audio_status(),
+            AudioStatus::Recording,
+            "the take keeps the one archive it took"
+        );
+    }
+
+    /// Once the capture has published its last sequence, nothing may open an
+    /// archive behind it: a frame that arrives later is not part of the take.
+    #[test]
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn a_frame_after_the_capture_finished_is_ignored() {
+        let (_sink, handle) = scratch_session();
+        let mut fixture = framing(&handle, 16_000);
+        fixture.push(&signal(513));
+        fixture.finish(Outcome::Success);
+        let counters = handle.capture_counters();
+
+        fixture.push(&signal(513));
+
+        assert_eq!(handle.capture_counters(), counters, "nothing moved");
+    }
+
+    /// A window that cannot be reached loses nothing of the take: the frame is
+    /// still produced and still archived, and the sequence goes on.
+    #[test]
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn the_archive_takes_a_frame_the_window_never_got() {
+        let (_sink, handle) = scratch_session();
+        let mut fixture = framing(&handle, 16_000);
+        fixture.fail_emits();
+        fixture.push(&signal(513));
+
+        assert!(fixture.take_frames().is_empty(), "the window kept nothing");
+        let counters = handle.capture_counters();
+        assert_eq!(counters.produced_frames, 1);
+        assert_eq!(counters.emit_failed_frames, 1);
+        assert_eq!(counters.last_sequence, Some(1));
+        assert!(!counters.has_gaps(), "the archive really took the frame");
+    }
+
+    /// A writer that never catches up costs frames, never the capture: the
+    /// sequence keeps running through the holes.
+    #[test]
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn dropped_frames_never_move_the_capture_watermark() {
+        let (_sink, handle) = scratch_session();
+        let mut fixture = framing(&handle, 16_000);
+        fixture.push(&signal(512 * 600));
+
+        let counters = handle.capture_counters();
+        assert!(
+            counters.produced_frames > 256,
+            "far more frames than the pool holds"
+        );
+        assert!(counters.dropped_frames > 0, "the queue really ran dry");
+        assert_eq!(
+            counters.last_sequence,
+            Some(counters.produced_frames),
+            "the capture keeps its own watermark through the holes"
+        );
+    }
+
+    /* ---------------------------------------------------------------------- */
+    /* A refused start and a stalled stop                                       */
+    /* ---------------------------------------------------------------------- */
+
+    /// A repeated start of a take that is already capturing is refused, and the
+    /// running capture is left exactly as it was: its frames keep arriving, its
+    /// archive is never closed behind it, and its own tail still publishes.
+    ///
+    /// This is the bug this test guards: the refusal of this very take is not a
+    /// failure of *its* capture, so nothing may be closed for it.
+    #[test]
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn a_duplicate_start_never_closes_the_running_capture() {
+        let (sink, handle) = scratch_session();
+        let state = NativeCapture::default();
+        let (_ticket, _control) = reserved(&state, CaptureOwner::Dictation(1), 0);
+
+        let mut fixture = framing(&handle, 16_000);
+        fixture.push(&signal(513));
+        assert_eq!(fixture.take_frames().len(), 1);
+
+        // The same take starts again while its capture is still running. The
+        // start runs the very decision the command path runs on a refusal: the
+        // running capture must survive it untouched.
+        let refusal = state
+            .claim(CaptureOwner::Dictation(1))
+            .err()
+            .expect("a repeated start of the same take is refused");
+        assert!(
+            matches!(refusal, ClaimError::SameTake(_)),
+            "the slot holds this very take, not another one"
+        );
+        note_refused_start(&refusal, &Some(handle.clone()));
+        assert!(
+            state.slot.lock().is_some(),
+            "the recording is still the shell's"
+        );
+        assert!(
+            !handle.capture_finished(),
+            "the duplicate start closed a capture that was already running"
+        );
+        // A start of the other window is refused as well, and that refusal is
+        // the one that really ends a take's capture: the take it names never
+        // began. Its owner and its number both differ from the dictation that
+        // holds the slot, so this refusal is not the same-take verdict however
+        // the two number spaces are read. The take a caller hands to the
+        // decision is its own — the lab take — so only that one's capture ends
+        // and the running dictation is left exactly as it was.
+        let lab = scratch_take(&sink, Owner::Lab, 7);
+        let foreign = state
+            .claim(CaptureOwner::Lab(7))
+            .err()
+            .expect("the other window's start is refused");
+        assert!(!matches!(foreign, ClaimError::SameTake(_)));
+        note_refused_start(&foreign, &Some(lab.clone()));
+        assert!(
+            lab.capture_finished(),
+            "the refused start ends the capture of its own take"
+        );
+        assert!(
+            !handle.capture_finished(),
+            "the other window's refusal names another take"
+        );
+
+        // The real capture went on: its next frame is archived, not a hole, and
+        // its sequence kept running through the refusals.
+        let source = signal(513);
+        fixture.push(&source);
+        let second = fixture.take_frames();
+        assert_eq!(second.len(), 1, "the refusal left the framing alone");
+        assert_eq!(
+            second[0].1.len(),
+            1_024,
+            "a whole frame of the take's own samples"
+        );
+        assert_eq!(second[0].0, 2, "the sequence went straight on");
+
+        // The take's own end still publishes, and the short tail the capture
+        // was still holding goes out with it: the tail is exactly the one
+        // captured sample that did not complete a frame, so every captured
+        // sample reached the archive and none of them became a hole.
+        fixture.finish(Outcome::Success);
+        let tail = fixture.take_frames();
+        assert_eq!(tail.len(), 1, "the stopped capture sends its short tail");
+        assert_eq!(
+            tail[0].1,
+            pcm_bytes(&source[511..512]),
+            "the tail is the captured sample a full frame could not hold"
+        );
+        let counters = handle.capture_counters();
+        assert!(
+            handle.capture_finished(),
+            "the take's own capture end stands"
+        );
+        assert_eq!(
+            counters.last_sequence,
+            Some(tail[0].0),
+            "the published watermark is the tail's own frame"
+        );
+        assert_eq!(
+            counters.produced_samples,
+            512 + 512 + 1,
+            "two whole frames and the one captured tail sample"
+        );
+        assert_eq!(counters.dropped_frames, 0, "the whole capture is archived");
+    }
+
+    /// A stop that gives up on a worker which never sends its tail publishes the
+    /// take's capture end itself: the take is no longer open for frames that
+    /// cannot belong to it, while its observed counters and watermark stay the
+    /// ones it really produced.
+    #[test]
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn a_stalled_stop_publishes_the_capture_end() {
+        let (_sink, handle) = scratch_session();
+        let mut fixture = framing(&handle, 16_000);
+        fixture.push(&signal(513));
+        let produced = handle.capture_counters();
+
+        // One running capture whose worker holds the tail back: the stop is
+        // sent and the command waits out its whole deadline.
+        let (stop, _control) = mpsc::channel::<()>();
+        let (landed_tx, landed) = mpsc::channel::<Result<u64, UiError>>();
+        let session = Session {
+            owner: CaptureOwner::Dictation(1),
+            ticket: Arc::new(()),
+            stop,
+            landed,
+            diagnostics: Some(handle.clone()),
+            thread: None,
+        };
+        // The sender is kept alive, so the wait ends on its deadline and not on
+        // a dropped channel: exactly the stall the deadline exists for.
+        assert!(session.finish().is_err(), "the tail never came");
+        drop(landed_tx);
+
+        assert!(
+            handle.capture_finished(),
+            "the capture is over even though the worker never reported"
+        );
+        let after = handle.capture_counters();
+        assert_eq!(
+            after.produced_frames, produced.produced_frames,
+            "the observed frames are the ones really produced"
+        );
+        assert_eq!(after.last_sequence, produced.last_sequence);
+
+        // A frame the stalled worker finally hands over is a hole of a capture
+        // that is already over — it never reopens one.
+        fixture.push(&signal(513));
+        let late = handle.capture_counters();
+        assert_eq!(late.dropped_frames, 1, "the late frame is a gap");
+        assert_eq!(late.produced_frames, produced.produced_frames + 1);
+    }
 }

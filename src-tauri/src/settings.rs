@@ -63,6 +63,17 @@ use windows::Win32::Storage::FileSystem::{
     FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     OPEN_EXISTING,
 };
+
+/// The Windows pieces only the private archive uses: the directory creation
+/// that applies its own descriptor, and the attribute call that tells a
+/// directory from a file and a link from a plain entry. Gated with their only
+/// callers, so a build without `dev-diagnostics` has no unused import.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+use windows::Win32::Storage::FileSystem::{
+    CreateDirectoryW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT,
+};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// The settings file every flavor resolves: inside the flavor's `%APPDATA%`
@@ -100,6 +111,17 @@ const ACCESS_FULL: u32 = 0x001F_01FF;
 /// does not compile, so their documented values are used directly.
 const ACCESS_GENERIC_WRITE: u32 = 0x4000_0000;
 const ACCESS_READ_CONTROL: u32 = 0x0002_0000;
+
+/// The two rights the archive's own checks add to [`ACCESS_READ_CONTROL`]:
+/// `GENERIC_READ`, so the handle a manifest is created through can be read and
+/// patched as well as written, and `FILE_READ_ATTRIBUTES`, which is what the
+/// call that recognizes a link needs. Both are the documented values of rights
+/// whose typed constants this build does not compile, and both are gated with
+/// their only callers.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+const ACCESS_GENERIC_READ: u32 = 0x8000_0000;
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+const ACCESS_READ_ATTRIBUTES: u32 = 0x0000_0080;
 
 /// Windows error codes translated into this module's own wording; the system's
 /// localized text is never quoted, because it is not a settings value but is
@@ -1636,6 +1658,22 @@ impl StagedDescriptor {
             None => Ok(()),
         }
     }
+
+    /// The same check through a handle that is already open. The private archive
+    /// inspects the entry under a name once and verifies exactly that entry, so
+    /// nothing can be swapped in between the two calls.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn verify_handle(&self, path: &Path, handle: HANDLE) -> Result<(), ConfigError> {
+        match &self.private {
+            Some(private) => verify_private_descriptor_handle(
+                path,
+                handle,
+                private.user_sid.sid(),
+                private.system_sid.sid(),
+            ),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Reads the security descriptor of the file a replacement is about to write
@@ -1695,22 +1733,37 @@ fn read_file_descriptor(path: &Path) -> Result<Option<OwnedDescriptor>, ConfigEr
     Ok(Some(OwnedDescriptor(descriptor)))
 }
 
-/// Checks that a file is reachable only by `user_sid` and `system_sid`: its
-/// DACL is protected from the directory holding it, is not empty, and holds
-/// nothing but full-access entries for those two accounts.
+/// Checks that the entry `path` names is reachable only by `user_sid` and
+/// `system_sid`: the entry is opened for the check, and the access list of that
+/// very entry is read.
 fn verify_private_descriptor(
     path: &Path,
     user_sid: PSID,
     system_sid: PSID,
 ) -> Result<(), ConfigError> {
     let file = open_for_read_control(path)?;
+    verify_private_descriptor_handle(path, HANDLE(file.as_raw_handle()), user_sid, system_sid)
+}
+
+/// Checks that an entry that is already open is reachable only by `user_sid`
+/// and `system_sid`: its DACL is protected from the directory holding it, is not
+/// empty, and holds nothing but full-access entries for those two accounts.
+///
+/// The caller keeps the handle, so the check is about the entry it opened and
+/// never about whatever that name points at by the time the check runs.
+fn verify_private_descriptor_handle(
+    path: &Path,
+    handle: HANDLE,
+    user_sid: PSID,
+    system_sid: PSID,
+) -> Result<(), ConfigError> {
     let mut dacl: *mut ACL = ptr::null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR(ptr::null_mut());
     // SAFETY: the handle stays open for the whole check, and the descriptor the
     // call allocates is released as soon as it is read out.
     let status = unsafe {
         GetSecurityInfo(
-            HANDLE(file.as_raw_handle()),
+            handle,
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             None,
@@ -1913,6 +1966,233 @@ fn create_failure(path: &Path, code: impl Into<Option<u32>>) -> ConfigError {
             .with_arg("path", path_arg(path))
             .with_arg("reason", message_arg(create_reason(code.into()))),
     )
+}
+
+/* -------------------------------------------------------------------------- */
+/* Private archive files                                                      */
+/* -------------------------------------------------------------------------- */
+
+/// The private archive of a development build: the session directories and
+/// files the diagnostics writer keeps under `logs/` beside the development
+/// `settings.json`. Everything here is gated with the feature and the profile,
+/// so a production or test build has no writer, no directory and no way to
+/// reach an archive - and these four functions are the only way in, so the
+/// descriptor and the checks that make a container private have one home.
+///
+/// The four functions share one rule: an entry under a name this module builds
+/// must be a plain file or directory of the current user with the private
+/// access list, and never a link, because the archive reads and writes through
+/// names of its own making and a link is a name whose target somebody else
+/// chose. Nothing here follows a link, replaces an existing entry or repairs a
+/// wider access list: a path that is not exactly what the archive writes is a
+/// refusal, and the caller decides what to do about it.
+
+/// Creates `path` as a directory only the current user and `SYSTEM` can reach,
+/// or checks the one that is already there.
+///
+/// `CreateDirectoryW` applies the descriptor itself, so the directory never
+/// exists for a moment with the access its parent would have handed down. A
+/// directory that is already there is only checked - never repaired, replaced
+/// or removed - because a container that is not private is something the caller
+/// has to decide about. A missing parent is an error: nothing outside `path` is
+/// created, and nothing is ever created over a name that is in use.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+pub(crate) fn create_private_directory(path: &Path) -> Result<(), ConfigError> {
+    let descriptor = StagedDescriptor::private_to_current_user()?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => verify_private_directory(path, &descriptor),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let wide = wide_path(path);
+            let attributes = descriptor.attributes();
+            // SAFETY: the path is NUL-terminated and lives for the call, and
+            // the descriptor the attributes point at is owned by `descriptor`,
+            // which outlives them.
+            let created = unsafe {
+                CreateDirectoryW(
+                    PCWSTR(wide.as_ptr()),
+                    Some(&attributes as *const SECURITY_ATTRIBUTES),
+                )
+            };
+            match created {
+                Ok(()) => verify_private_directory(path, &descriptor),
+                // Somebody created the name between the check and the call:
+                // what is there now still has to pass, exactly as if the first
+                // check had found it.
+                Err(found)
+                    if matches!(
+                        windows_code(&found),
+                        ERROR_FILE_EXISTS | ERROR_ALREADY_EXISTS
+                    ) =>
+                {
+                    verify_private_directory(path, &descriptor)
+                }
+                Err(found) => Err(create_failure(path, windows_code(&found))),
+            }
+        }
+        Err(error) => Err(create_failure(path, io_code(&error))),
+    }
+}
+
+/// Creates `path` as a brand-new file the current user and `SYSTEM` alone can
+/// reach, open for reading, writing and patching.
+///
+/// `CREATE_NEW` refuses a name that is in use, so the call never touches a file
+/// that is already there, and the checks run on the handle this call itself
+/// created: what comes back is the entry that was checked, not whatever the
+/// name points at a moment later. The handle shares only reads, so a second
+/// writer is refused by the system rather than interleaving with this one.
+///
+/// A file whose own checks fail is left under its name - the caller owns the
+/// name it asked for, and a staging name this module cannot vouch for is
+/// reconciled by the caller rather than deleted here.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+pub(crate) fn create_private_file(path: &Path) -> Result<File, ConfigError> {
+    let descriptor = StagedDescriptor::private_to_current_user()?;
+    let wide = wide_path(path);
+    let attributes = descriptor.attributes();
+    // SAFETY: the path is NUL-terminated and lives for the call, the descriptor
+    // the attributes point at is owned by `descriptor`, and the handle that
+    // comes back is taken over below, so it is never closed by hand.
+    let created = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            ACCESS_GENERIC_READ | ACCESS_GENERIC_WRITE,
+            FILE_SHARE_READ,
+            Some(&attributes as *const SECURITY_ATTRIBUTES),
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    };
+    let created = match created {
+        Ok(handle) => handle,
+        Err(error) => return Err(create_failure(path, windows_code(&error))),
+    };
+
+    // SAFETY: `CreateFileW` has just returned this handle and nothing else owns
+    // it; the standard library closes it when the file is dropped.
+    let file = unsafe { File::from_raw_handle(created.0) };
+    let attributes = entry_attributes(path, &file)?;
+    reject_link(path, attributes)?;
+    descriptor.verify_handle(path, HANDLE(file.as_raw_handle()))?;
+    Ok(file)
+}
+
+/// Checks the entry `path` names: it is not a link, and its access list is the
+/// private one. Both a file and a directory are accepted, because the caller
+/// knows which of the two it is publishing.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+pub(crate) fn verify_private_path(path: &Path) -> Result<(), ConfigError> {
+    let descriptor = StagedDescriptor::private_to_current_user()?;
+    let entry = open_for_inspection(path)?;
+    let attributes = entry_attributes(path, &entry)?;
+    reject_link(path, attributes)?;
+    descriptor.verify_handle(path, HANDLE(entry.as_raw_handle()))
+}
+
+/// Publishes `source` under the name `destination`: the move itself is the
+/// publish, it never replaces anything, and the destination is checked before
+/// this call claims success.
+///
+/// `MOVEFILE_WRITE_THROUGH` waits for the move to reach the disk, so a crash
+/// right after leaves either nothing under the new name or the complete file.
+/// A destination that already holds something - a file, a directory or a link -
+/// is reported and left exactly as it is, and `source` stays where it was.
+///
+/// The source is closed before this call: the move needs the name, and a handle
+/// that shares writes keeps the system from renaming the file it holds.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+pub(crate) fn publish_private_file(source: &Path, destination: &Path) -> Result<(), ConfigError> {
+    let source_wide = wide_path(source);
+    let destination_wide = wide_path(destination);
+    // SAFETY: both paths are NUL-terminated and live for the call. The move
+    // asks to replace nothing, so a name in use is a failure rather than
+    // something to overwrite, and no link is followed.
+    let moved = unsafe {
+        MoveFileExW(
+            PCWSTR(source_wide.as_ptr()),
+            PCWSTR(destination_wide.as_ptr()),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if let Err(error) = moved {
+        let code = windows_code(&error);
+        if matches!(code, ERROR_FILE_EXISTS | ERROR_ALREADY_EXISTS) {
+            return Err(create_failure(destination, code));
+        }
+        return Err(ConfigError::new(
+            UiMessage::new(MessageId::ConfigReplaceProblem)
+                .with_arg("path", path_arg(destination))
+                .with_arg("reason", message_arg(replace_reason(code))),
+        ));
+    }
+    verify_private_path(destination)
+}
+
+/// Checks the directory the archive keeps its takes in: a plain directory with
+/// the private access list. A file or a link under that name is refused, and
+/// nothing about a directory that is already there is changed.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn verify_private_directory(path: &Path, descriptor: &StagedDescriptor) -> Result<(), ConfigError> {
+    let directory = open_for_inspection(path)?;
+    let attributes = entry_attributes(path, &directory)?;
+    reject_link(path, attributes)?;
+    if attributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
+        return Err(path_problem(
+            path,
+            UiMessage::new(MessageId::ConfigCreateReasonExists),
+        ));
+    }
+    descriptor.verify_handle(path, HANDLE(directory.as_raw_handle()))
+}
+
+/// Opens an existing file or directory for the read-only checks the archive
+/// makes. `FILE_FLAG_BACKUP_SEMANTICS` is what lets a directory be opened at
+/// all, and `FILE_FLAG_OPEN_REPARSE_POINT` keeps a link from being followed, so
+/// every check is about the entry under this name and never about its target.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn open_for_inspection(path: &Path) -> Result<File, ConfigError> {
+    let wide = wide_path(path);
+    let opened = unsafe {
+        CreateFileW(
+            PCWSTR(wide.as_ptr()),
+            ACCESS_READ_CONTROL | ACCESS_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .map_err(|error| path_problem(path, read_reason(Some(windows_code(&error)))))?;
+
+    // SAFETY: the handle was just returned and belongs to this function; the
+    // standard library closes it when the file is dropped.
+    Ok(unsafe { File::from_raw_handle(opened.0) })
+}
+
+/// The attributes of an entry that is already open. They are what tells a
+/// directory from a file and a link from a plain entry, and reading them from
+/// the handle is what keeps both answers about the entry itself.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn entry_attributes(path: &Path, entry: &File) -> Result<u32, ConfigError> {
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle is open for the length of the call, and the structure
+    // is a live local the call fills in.
+    unsafe { GetFileInformationByHandle(HANDLE(entry.as_raw_handle()), &mut information) }
+        .map_err(|error| path_problem(path, read_reason(Some(windows_code(&error)))))?;
+    Ok(information.dwFileAttributes)
+}
+
+/// Refuses an entry that is a link.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn reject_link(path: &Path, attributes: u32) -> Result<(), ConfigError> {
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0 {
+        return Ok(());
+    }
+    Err(ConfigError::new(
+        UiMessage::new(MessageId::ConfigPathIsLink).with_arg("path", path_arg(path)),
+    ))
 }
 
 /* -------------------------------------------------------------------------- */
@@ -3713,4 +3993,295 @@ mod tests {
         fs::write(&path, "{ not json }\r\n").expect("a damaged document");
         assert_eq!(startup_language(Some(path.as_path())), default);
     }
+
+/// Regression matrix for the private archive of a development build: a scratch
+/// tree under the system temporary directory, the real descriptor the checks
+/// compare against, and the link a refusal is proved with. Every fixture is its
+/// own tree, so the checks never share a name.
+#[cfg(all(test, debug_assertions, feature = "dev-diagnostics"))]
+mod private_archive_tests {
+    use super::*;
+    use std::io::{Read as _, Seek as _};
+    use windows::Win32::Foundation::GetLastError;
+    use windows::Win32::Storage::FileSystem::{
+        CreateSymbolicLinkW, SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+        SYMBOLIC_LINK_FLAG_DIRECTORY,
+    };
+
+    /// The system code a symbolic link creation fails with when the process is
+    /// neither elevated nor allowed to create links.
+    const ERROR_PRIVILEGE_NOT_HELD: u32 = 1314;
+
+    /// A directory of one fixture, removed when the fixture ends.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let path = env::temp_dir().join(format!(
+                "speechek-archive-{name}-{}-{}",
+                process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&path).expect("a scratch directory");
+            Self(path)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The access list of an entry as the system reports it: one `(type, mask,
+    /// SID)` per entry, read through the same handle the checks use, but with
+    /// nothing of this module's own wording in the way.
+    fn reported_dacl(path: &Path) -> Vec<(u8, u32, Vec<u8>)> {
+        let entry = open_for_inspection(path).expect("an entry to inspect");
+        let mut dacl: *mut ACL = ptr::null_mut();
+        let mut descriptor = PSECURITY_DESCRIPTOR(ptr::null_mut());
+        // SAFETY: the handle is open for the call and the descriptor it hands
+        // back is released through `OwnedDescriptor`.
+        let status = unsafe {
+            GetSecurityInfo(
+                HANDLE(entry.as_raw_handle()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&mut dacl),
+                None,
+                Some(&mut descriptor),
+            )
+        };
+        assert!(status == ERROR_SUCCESS, "the access list of the entry");
+        let descriptor = OwnedDescriptor(descriptor);
+
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        // SAFETY: the descriptor is the allocation the system just handed over.
+        unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) }
+            .expect("the control of the access list");
+        assert_ne!(control & SE_DACL_PROTECTED.0, 0, "the access list is protected");
+
+        // SAFETY: the DACL and the ACEs inside it belong to the descriptor that
+        // is alive here, and `GetAce` points into that same allocation.
+        let entries = unsafe { (*dacl).AceCount } as u32;
+        assert!(entries > 0, "the access list names somebody");
+        let mut reported = Vec::new();
+        for index in 0..entries {
+            let mut ace: *mut core::ffi::c_void = ptr::null_mut();
+            // SAFETY: the index is inside the DACL.
+            unsafe { GetAce(dacl, index, &mut ace) }.expect("an access entry");
+            // SAFETY: an ACE starts with its header and, for an access-allowed
+            // entry, carries the mask and then the SID.
+            let (ace_type, mask, sid) = unsafe {
+                let header = &*(ace as *const ACE_HEADER);
+                let mask_offset = (ace as *const u8).add(core::mem::size_of::<ACE_HEADER>());
+                let sid_offset = mask_offset.add(core::mem::size_of::<u32>());
+                (
+                    header.AceType,
+                    ptr::read_unaligned(mask_offset as *const u32),
+                    PSID(sid_offset as *mut _),
+                )
+            };
+            // SAFETY: the SID is valid for the length the system reports.
+            let length = unsafe { GetLengthSid(sid) } as usize;
+            let bytes = unsafe { core::slice::from_raw_parts(sid.0 as *const u8, length) };
+            reported.push((ace_type, mask, bytes.to_vec()));
+        }
+        reported
+    }
+
+    /// Whether the SID read out of an entry is exactly `sid`.
+    fn is_sid(bytes: &[u8], sid: PSID) -> bool {
+        // SAFETY: the SID is valid for the length the system reports.
+        let length = unsafe { GetLengthSid(sid) } as usize;
+        let expected = unsafe { core::slice::from_raw_parts(sid.0 as *const u8, length) };
+        expected == bytes
+    }
+
+    /// Creates `link` as a directory symbolic link to `target`. `false` means
+    /// Windows refused for the one reason this fixture tolerates: the process
+    /// may not create links at all.
+    fn directory_link(link: &Path, target: &Path) -> bool {
+        let link = wide_path(link);
+        let target = wide_path(target);
+        // SAFETY: both paths are NUL-terminated buffers that outlive the call.
+        let created = unsafe {
+            CreateSymbolicLinkW(
+                PCWSTR(link.as_ptr()),
+                PCWSTR(target.as_ptr()),
+                SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE,
+            )
+        };
+        if created {
+            return true;
+        }
+        // SAFETY: the failing call sets the last error.
+        let code = unsafe { GetLastError() }.0;
+        assert_eq!(
+            code, ERROR_PRIVILEGE_NOT_HELD,
+            "creating the link failed for another reason than the missing privilege"
+        );
+        false
+    }
+
+    /// A directory this module creates is reachable by the current user and
+    /// `SYSTEM` and by nobody else, is checked rather than recreated when it is
+    /// already there, and is refused when what is there is a foreign directory
+    /// or a file.
+    #[test]
+    fn a_created_directory_is_private_and_anything_else_is_refused() {
+        let scratch = Scratch::new("directory");
+        let logs = scratch.join("logs");
+
+        create_private_directory(&logs).expect("an archive directory");
+        verify_private_path(&logs).expect("the directory just created");
+        // The second call finds the directory and checks it: nothing is
+        // recreated, replaced or removed.
+        create_private_directory(&logs).expect("the directory that is already there");
+
+        let entries = reported_dacl(&logs);
+        assert_eq!(entries.len(), 2, "a private directory names exactly two accounts");
+        assert!(
+            entries
+                .iter()
+                .all(|(ace_type, mask, _)| *ace_type == ACCESS_ALLOWED_ACE_TYPE && *mask == ACCESS_FULL),
+            "every entry grants full access and nothing else"
+        );
+        let mut user = SidBuffer::new();
+        read_current_user_sid(&mut user).expect("the current user");
+        let mut system = SidBuffer::new();
+        read_local_system_sid(&mut system).expect("SYSTEM");
+        assert!(
+            entries
+                .iter()
+                .all(|(_, _, sid)| is_sid(sid, user.sid()) || is_sid(sid, system.sid())),
+            "the two accounts are the current user and SYSTEM"
+        );
+
+        // A directory the system made carries the access of the directory that
+        // holds it, which is not private: it is refused and left alone.
+        let foreign = scratch.join("foreign");
+        fs::create_dir(&foreign).expect("a directory with the inherited access list");
+        assert!(verify_private_path(&foreign).is_err(), "a foreign directory is refused");
+        assert!(create_private_directory(&foreign).is_err(), "and not repaired into place");
+        assert!(fs::symlink_metadata(&foreign).is_ok(), "the foreign directory stays");
+
+        // A file under the directory's name, and a parent that is not there.
+        let occupied = scratch.join("occupied");
+        let _file = create_private_file(&occupied).expect("a private file in the way");
+        create_private_directory(&occupied).expect_err("a file is not a directory");
+        assert!(
+            create_private_directory(&scratch.join("missing").join("logs")).is_err(),
+            "a directory is never created together with its parent"
+        );
+    }
+
+    /// A file this module creates is brand new, private, and open for the
+    /// header patch the journal needs: a name in use is refused with every byte
+    /// of the file that holds it intact.
+    #[test]
+    fn a_created_file_is_private_brand_new_and_patchable() {
+        let scratch = Scratch::new("file");
+        let manifest = scratch.join("session.json.1.1.tmp");
+
+        let mut file = create_private_file(&manifest).expect("a private staging file");
+        io::Write::write_all(&mut file, b"{}").expect("the first bytes");
+        file.sync_all().expect("the bytes on disk");
+        drop(file);
+
+        verify_private_path(&manifest).expect("the file just written");
+        assert_eq!(fs::read(&manifest).expect("the bytes"), b"{}");
+        let entries = reported_dacl(&manifest);
+        assert_eq!(entries.len(), 2, "a private file names exactly two accounts");
+        assert!(
+            entries
+                .iter()
+                .all(|(ace_type, mask, _)| *ace_type == ACCESS_ALLOWED_ACE_TYPE && *mask == ACCESS_FULL),
+            "every entry grants full access and nothing else"
+        );
+
+        assert!(create_private_file(&manifest).is_err(), "an existing name is never reused");
+        assert_eq!(fs::read(&manifest).expect("the untouched bytes"), b"{}");
+        assert!(verify_private_path(&scratch.join("absent.json.tmp")).is_err());
+
+        // The handle reads back and patches a header in place, which is what
+        // the FLAC STREAMINFO patch needs.
+        let second = scratch.join("second.json.tmp");
+        let mut file = create_private_file(&second).expect("a second staging file");
+        io::Write::write_all(&mut file, b"aaaaaa").expect("six bytes");
+        file.seek(io::SeekFrom::Start(0)).expect("back to the start");
+        io::Write::write_all(&mut file, b"bb").expect("the patched header");
+        file.sync_all().expect("the bytes on disk");
+        let mut patched = Vec::new();
+        let read_back = {
+            file.seek(io::SeekFrom::Start(0)).expect("back to the start");
+            file.read_to_end(&mut patched).expect("the bytes back")
+        };
+        drop(file);
+        assert_eq!(read_back, 6);
+        assert_eq!(patched, b"bbaaaa");
+    }
+
+    /// Publishing is a move that replaces nothing: the new name holds the
+    /// bytes and passes the checks, and a destination that already exists is
+    /// reported with both files exactly as they were.
+    #[test]
+    fn a_published_file_is_verified_and_never_replaces_anything() {
+        let scratch = Scratch::new("publish");
+        let part = scratch.join("audio.flac.part");
+        let mut file = create_private_file(&part).expect("the staging file");
+        io::Write::write_all(&mut file, b"fLaC").expect("the bytes");
+        file.sync_all().expect("the bytes on disk");
+        drop(file);
+
+        let published = scratch.join("audio.flac");
+        publish_private_file(&part, &published).expect("the published file");
+        assert!(!part.exists(), "the staging name is gone");
+        assert_eq!(fs::read(&published).expect("the published bytes"), b"fLaC");
+        verify_private_path(&published).expect("the published file");
+
+        let other = scratch.join("other.flac");
+        let mut file = create_private_file(&other).expect("a second staging file");
+        io::Write::write_all(&mut file, b"OggS").expect("the bytes");
+        file.sync_all().expect("the bytes on disk");
+        drop(file);
+
+        assert!(
+            publish_private_file(&other, &published).is_err(),
+            "a name in use is never replaced"
+        );
+        assert_eq!(fs::read(&published).expect("the destination"), b"fLaC");
+        assert_eq!(fs::read(&other).expect("the source"), b"OggS");
+    }
+
+    /// A link is refused wherever it can be made: it is not a plain file or
+    /// directory, and the archive never writes through a name whose target
+    /// somebody else chose. Where Windows will not let this process create a
+    /// link, the refusal is not what is being checked, so the check is skipped
+    /// rather than passed.
+    #[test]
+    fn a_link_is_refused_where_it_can_be_made() {
+        let scratch = Scratch::new("link");
+        let target = scratch.join("target");
+        create_private_directory(&target).expect("the link target");
+
+        let link = scratch.join("link");
+        if directory_link(&link, &target) {
+            let error = verify_private_path(&link).expect_err("a link is not a plain directory");
+            assert_eq!(error.ui.key, MessageId::ConfigPathIsLink);
+            assert!(
+                create_private_directory(&link).is_err(),
+                "a link under the directory name is refused"
+            );
+        }
+    }
+}
 }

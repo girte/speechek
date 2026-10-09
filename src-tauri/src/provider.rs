@@ -45,6 +45,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use crate::backend::{redact, ApiError};
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+use crate::diagnostics::{ErrorClass, RequestCause, RequestTrace, Stage, StagePhase};
 use crate::i18n::{MessageId, UiMessage};
 use crate::secrets::SecretKey;
 
@@ -150,6 +152,19 @@ impl Provider {
         }
     }
 
+    /// The tests' own transport: the same `reqwest` client and the same wire
+    /// behavior as [`Provider::new`], with both loopback bases given
+    /// explicitly. It reads no process environment, so a fixture never has to
+    /// mutate one and two fixtures can never race on it.
+    #[cfg(all(test, debug_assertions, feature = "dev-diagnostics"))]
+    pub fn for_test(http_base: &str, wss_base: &str) -> Self {
+        Provider {
+            http: reqwest::Client::new(),
+            http_base: http_base.trim_end_matches('/').to_string(),
+            wss_base: wss_base.trim_end_matches('/').to_string(),
+        }
+    }
+
     /// Full Live WebSocket URL for one socket. The key is percent-encoded as
     /// ECMAScript's `encodeURIComponent` does, so the URL is wire-identical.
     /// The key arrives borrowed, straight from the
@@ -212,12 +227,16 @@ impl Provider {
     ///
     /// `mode` is `"smart"` or `"verbatim"`; anything else is the route's 400,
     /// checked here so an invalid mode never costs an upload.
+    /// The development diagnostics may observe this request; the transport
+    /// behavior, the payloads and the deadlines never depend on it.
     pub async fn transcribe(
         &self,
         key: &Arc<SecretKey>,
         keys: &[Arc<SecretKey>],
         mode: &str,
         wav: Vec<u8>,
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        traced: Option<RequestTrace>,
     ) -> Result<String, ApiError> {
         let mode_payload: Value = match mode {
             "smart" => Value::String("smart".to_string()),
@@ -235,13 +254,37 @@ impl Provider {
         // borrows the entire request-selected ring before any truncation, so a
         // Google body cannot expose a prefix of another key in that revision.
 
-        let uploaded = self.upload_audio_file(key, keys, wav).await?;
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        let traced = traced.as_ref();
+        let uploaded = self
+            .upload_audio_file(
+                key,
+                keys,
+                wav,
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                traced,
+            )
+            .await?;
         let result = self
-            .transcribe_uploaded_file(key, keys, &uploaded.uri, mode_payload)
+            .transcribe_uploaded_file(
+                key,
+                keys,
+                &uploaded.uri,
+                mode_payload,
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                traced,
+            )
             .await;
         // Finally: the upload must not outlive the request that created it,
         // even when the transcription failed.
-        self.delete_uploaded_file(key, keys, &uploaded.name).await;
+        self.delete_uploaded_file(
+            key,
+            keys,
+            &uploaded.name,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            traced,
+        )
+        .await;
         result
     }
 
@@ -252,6 +295,7 @@ impl Provider {
         key: &Arc<SecretKey>,
         keys: &[Arc<SecretKey>],
         bytes: Vec<u8>,
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] traced: Option<&RequestTrace>,
     ) -> Result<UploadedFile, ApiError> {
         let byte_length = bytes.len();
         let start = self
@@ -272,6 +316,10 @@ impl Provider {
             MessageId::GoogleUploadStartFailed,
             keys,
             UPLOAD_START_TIMEOUT,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            traced,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            Stage::UploadStart,
         )
         .await?;
 
@@ -304,10 +352,22 @@ impl Provider {
             MessageId::GoogleUploadFailed,
             keys,
             UPLOAD_FINALIZE_TIMEOUT,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            traced,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            Stage::UploadFinalize,
         )
         .await?;
 
-        let payload: Option<Value> = uploaded.json::<Value>().await.ok().filter(Value::is_object);
+        let payload: Option<Value> = read_stage_body(
+            uploaded,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            traced,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            Stage::UploadFinalize,
+        )
+        .await
+        .filter(Value::is_object);
         let file = payload
             .as_ref()
             .and_then(|payload| payload.get("file"))
@@ -352,6 +412,7 @@ impl Provider {
         keys: &[Arc<SecretKey>],
         file_uri: &str,
         mode_payload: Value,
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] traced: Option<&RequestTrace>,
     ) -> Result<String, ApiError> {
         let request = self
             .http
@@ -359,10 +420,27 @@ impl Provider {
             .header("x-goog-api-key", key.as_str())
             .header("content-type", "application/json")
             .body(interaction_payload(file_uri, mode_payload).to_string());
-        let response =
-            send_checked(request, MessageId::GoogleTranscriptionFailed, keys, INTERACTION_TIMEOUT).await?;
+        let response = send_checked(
+            request,
+            MessageId::GoogleTranscriptionFailed,
+            keys,
+            INTERACTION_TIMEOUT,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            traced,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            Stage::Interaction,
+        )
+        .await?;
 
-        let payload: Option<Value> = response.json::<Value>().await.ok().filter(Value::is_object);
+        let payload: Option<Value> = read_stage_body(
+            response,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            traced,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            Stage::Interaction,
+        )
+        .await
+        .filter(Value::is_object);
         let Some(payload) = payload else {
             return Err(ApiError::new(
                 502,
@@ -390,6 +468,12 @@ impl Provider {
                     .with_arg("status", status),
             ));
         }
+        // The interaction returned a transcript: this request really did end
+        // with its final result, whatever the caller does with it.
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        if let Some(traced) = traced {
+            traced.cause(RequestCause::FinalReceived);
+        }
         Ok(text)
     }
 
@@ -400,24 +484,54 @@ impl Provider {
         key: &Arc<SecretKey>,
         keys: &[Arc<SecretKey>],
         name: &str,
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] traced: Option<&RequestTrace>,
     ) {
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        note_stage(traced, Stage::Delete, StagePhase::Begin, None, false);
         let request = self
             .http
             .delete(format!("{}/v1beta/{}", self.http_base, name))
             .header("x-goog-api-key", key.as_str());
         match request.timeout(DELETE_TIMEOUT).send().await {
-            Ok(response) if response.status().is_success() => {}
-            Ok(response) => eprintln!(
-                "speechek: provider: Gemini upload deletion failed (HTTP {}); Google may retain the file until expiry.",
-                response.status().as_u16()
-            ),
-            Err(error) => eprintln!(
-                "speechek: provider: {}",
-                redact(
-                    &format!("Could not delete the temporary Gemini upload: {error}"),
-                    keys
-                )
-            ),
+            Ok(response) if response.status().is_success() => {
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                note_stage(
+                    traced,
+                    Stage::Delete,
+                    StagePhase::End,
+                    Some(response.status().as_u16()),
+                    false,
+                );
+            }
+            Ok(response) => {
+                let status = response.status().as_u16();
+                eprintln!(
+                    "speechek: provider: Gemini upload deletion failed (HTTP {}); Google may retain the file until expiry.",
+                    status
+                );
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                note_stage(traced, Stage::Delete, StagePhase::Error, Some(status), false);
+            }
+            Err(error) => {
+                eprintln!(
+                    "speechek: provider: {}",
+                    redact(
+                        &format!("Could not delete the temporary Gemini upload: {error}"),
+                        keys
+                    )
+                );
+                // A delete failure is best effort: it reports its own stage and
+                // never overwrites the cause, the class or the status of the
+                // request it followed.
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                note_stage(
+                    traced,
+                    Stage::Delete,
+                    StagePhase::Error,
+                    None,
+                    error.is_timeout(),
+                );
+            }
         }
     }
 }
@@ -451,19 +565,122 @@ async fn send_checked(
     action: MessageId,
     keys: &[Arc<SecretKey>],
     timeout: Duration,
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] traced: Option<&RequestTrace>,
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] stage: Stage,
 ) -> Result<reqwest::Response, ApiError> {
-    let response = request.timeout(timeout).send().await.map_err(|error| {
-        ApiError::new(
-            502,
-            "UPSTREAM_UNREACHABLE",
-            UiMessage::new(MessageId::UpstreamUnreachable)
-                .with_arg("detail", json!(redact(&error.to_string(), keys))),
-        )
-    })?;
-    if response.status().is_success() {
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    note_stage(traced, stage, StagePhase::Begin, None, false);
+    let response = match request.timeout(timeout).send().await {
+        Ok(response) => response,
+        // The transport never produced an HTTP status, so the failure is
+        // classified from the `reqwest::Error` alone - timeout, connect, body
+        // or decode - before its rendered text is redacted into the authored
+        // detail. Neither that text nor the URL ever reaches the sink.
+        Err(error) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            {
+                note_stage(traced, stage, StagePhase::Error, None, error.is_timeout());
+                if let Some(traced) = traced {
+                    traced.error_class(classify_transport_error(&error));
+                }
+            }
+            return Err(ApiError::new(
+                502,
+                "UPSTREAM_UNREACHABLE",
+                UiMessage::new(MessageId::UpstreamUnreachable)
+                    .with_arg("detail", json!(redact(&error.to_string(), keys))),
+            ));
+        }
+    };
+    let status = response.status();
+    if status.is_success() {
+        // `UploadStart` really is complete once its headers arrive: the upload
+        // URL header is all it is read for. The body-bearing stages end where
+        // their body has been consumed, so a stall or a truncated body is not
+        // reported as a fast success.
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        if matches!(stage, Stage::UploadStart) {
+            note_stage(traced, stage, StagePhase::End, Some(status.as_u16()), false);
+        }
         Ok(response)
     } else {
-        Err(google_failure(response, action, keys).await)
+        let failure = google_failure(response, action, keys).await;
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        note_stage(
+            traced,
+            stage,
+            StagePhase::Error,
+            // The upstream's own status, captured before the response was
+            // consumed for the browser-facing mapping: that mapping is a 502,
+            // and this is what actually came back.
+            Some(status.as_u16()),
+            false,
+        );
+        Err(failure)
+    }
+}
+
+/// Consumes one body-bearing stage's JSON response and records where that stage
+/// really ended: at the body, not at its headers. A body that times out and a
+/// payload that will not decode are classified from the actual `reqwest::Error`
+/// and still yield `None`, exactly like the previous `.ok()`.
+async fn read_stage_body(
+    response: reqwest::Response,
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] traced: Option<&RequestTrace>,
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] stage: Stage,
+) -> Option<Value> {
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    let status = response.status().as_u16();
+    match response.json::<Value>().await {
+        Ok(payload) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_stage(traced, stage, StagePhase::End, Some(status), false);
+            Some(payload)
+        }
+        Err(_error) => {
+            // The headers did arrive, so the status they carried is still the
+            // one to record; what failed is the body, and the class names it.
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            {
+                note_stage(traced, stage, StagePhase::Error, Some(status), _error.is_timeout());
+                if let Some(traced) = traced {
+                    traced.error_class(classify_transport_error(&_error));
+                }
+            }
+            None
+        }
+    }
+}
+
+/// One request stage observation: a request without a trace instruments
+/// nothing, and a stage call is the only thing that goes to the sink.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_stage(
+    traced: Option<&RequestTrace>,
+    stage: Stage,
+    phase: StagePhase,
+    status: Option<u16>,
+    timeout: bool,
+) {
+    if let Some(traced) = traced {
+        traced.stage(stage, phase, status, timeout);
+    }
+}
+
+/// Which way a transport that never reached a status failed. The rendered
+/// `reqwest::Error` is never read for this.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn classify_transport_error(error: &reqwest::Error) -> ErrorClass {
+    if error.is_timeout() {
+        ErrorClass::Timeout
+    } else if error.is_connect() {
+        ErrorClass::Connect
+    } else if error.is_body() {
+        ErrorClass::Body
+    } else if error.is_decode() {
+        ErrorClass::Decode
+    } else {
+        ErrorClass::Other
     }
 }
 
@@ -835,5 +1052,282 @@ mod tests {
         assert!(!is_thinking_gate_error(400, "Thinking budget is out of range."));
         assert!(!is_thinking_gate_error(400, ""));
         assert!(!is_thinking_gate_error(429, "Thinking level is not supported for this model."));
+    }
+
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    use crate::diagnostics::{
+        BatchStage, Diagnostics, Event, Meta, Mode as DiagMode, Outcome, Owner, Policy, Route,
+        SessionKey,
+    };
+
+    /// One open take of this test's own, with the trace its request records
+    /// into. No writer, no directory, no environment: the events stay in the
+    /// sink's queue for the test to read.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn sink() -> (Arc<Diagnostics>, RequestTrace) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "speechek-provider-stages-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let diagnostics = Diagnostics::for_test(
+            &root,
+            Policy {
+                max_age: Duration::from_secs(600),
+                max_bytes: 1_000_000,
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+        );
+        let key = SessionKey {
+            owner: Owner::Dictation,
+            generation: 1,
+        };
+        let handle = diagnostics.begin(key, DiagMode::Live).expect("an open take");
+        let trace = handle.request(Route::Live).expect("a request slot");
+        (diagnostics, trace)
+    }
+
+    /// A one-shot loopback HTTP server: it reads one request, answers with the
+    /// fixed `head`, then writes `body` after `body_delay`. Splitting the head
+    /// from the body is what makes a stage's header/body boundary observable.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn head_then_body_server(head: String, body: String, body_delay: Duration) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            // Read the request head and its declared body before answering, so
+            // the answer is not discarded by an abortive close.
+            let mut received = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let mut wanted = None;
+            while received.len() < wanted.unwrap_or(usize::MAX) {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received.extend_from_slice(&chunk[..n]),
+                }
+                if wanted.is_none() {
+                    if let Some(end) = received.windows(4).position(|w| w == b"\r\n\r\n") {
+                        wanted = Some(end + 4 + declared_body_length(&received[..end]));
+                    }
+                }
+            }
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.flush();
+            std::thread::sleep(body_delay);
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+        });
+        port
+    }
+
+    /// The `content-length` of one request head: 0 when it declares none.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn declared_body_length(head: &[u8]) -> usize {
+        String::from_utf8_lossy(head)
+            .to_ascii_lowercase()
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length:"))
+            .and_then(|value| value.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Every stage record the sink has queued, drained.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn stages(diagnostics: &Diagnostics) -> Vec<BatchStage> {
+        diagnostics
+            .take_meta(64)
+            .into_iter()
+            .filter_map(|pending| match pending.meta {
+                Meta::Event(Event::BatchStage(stage)) => Some(stage),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The request's one terminal record, drained.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn request_end(diagnostics: &Diagnostics) -> Option<crate::diagnostics::RequestEnd> {
+        diagnostics
+            .take_meta(64)
+            .into_iter()
+            .find_map(|pending| match pending.meta {
+                Meta::Event(Event::RequestEnd(end)) => Some(end),
+                _ => None,
+            })
+    }
+
+    /// A 200 whose body then fails is not a fast, header-only success: the
+    /// stage stays open through the body, and the actual `reqwest::Error` is
+    /// classified instead of being discarded.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    #[tokio::test]
+    async fn a_body_failure_ends_the_stage_at_the_body_not_at_its_headers() {
+        let port = head_then_body_server(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 4\r\n\r\n"
+                .to_string(),
+            "{\"a\"".to_string(),
+            Duration::from_millis(200),
+        );
+        let provider = Provider::for_test("http://127.0.0.1:1", "ws://127.0.0.1:1");
+        let (diagnostics, trace) = sink();
+        let request = provider
+            .http
+            .post(format!("http://127.0.0.1:{port}/v1beta/interactions"));
+        let response = send_checked(
+            request,
+            MessageId::GoogleTranscriptionFailed,
+            &[],
+            Duration::from_secs(5),
+            Some(&trace),
+            Stage::Interaction,
+        )
+        .await
+        .expect("the headers arrive");
+
+        // The headers are in and the stage is still open.
+        let open = stages(&diagnostics);
+        assert_eq!(open.len(), 1, "the stage is open at its headers: {open:?}");
+        assert!(matches!(open[0].phase, StagePhase::Begin));
+
+        // The body lands 200 ms later: consuming it is what ends the stage.
+        let began = std::time::Instant::now();
+        let payload = read_stage_body(response, Some(&trace), Stage::Interaction).await;
+        assert!(payload.is_none(), "a broken body is no payload");
+        assert!(
+            began.elapsed() >= Duration::from_millis(150),
+            "the body really was awaited"
+        );
+
+        let ended = stages(&diagnostics);
+        let interaction = ended
+            .iter()
+            .find(|stage| {
+                matches!(stage.stage, Stage::Interaction)
+                    && !matches!(stage.phase, StagePhase::Begin)
+            })
+            .expect("the consumed stage ends");
+        assert!(matches!(interaction.phase, StagePhase::Error));
+        assert_eq!(interaction.status, Some(200));
+        assert!(!interaction.timeout);
+        assert!(interaction.elapsed_us.is_some());
+
+        trace.finish(Outcome::Error);
+        let end = request_end(&diagnostics).expect("the request end");
+        assert_eq!(end.error_class, Some(ErrorClass::Decode));
+        assert_eq!(end.status, Some(200), "the headers' status still reaches the request end");
+        assert_eq!(end.outcome, Outcome::Error);
+    }
+
+    /// A rejected upload records the status Google really sent; the browser's
+    /// own mapping stays the 502 it always was.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    #[tokio::test]
+    async fn a_failed_google_status_is_recorded_before_the_browser_mapping() {
+        let port = head_then_body_server(
+            "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: 0\r\n\r\n"
+                .to_string(),
+            String::new(),
+            Duration::ZERO,
+        );
+        let provider = Provider::for_test("http://127.0.0.1:1", "ws://127.0.0.1:1");
+        let (diagnostics, trace) = sink();
+        let request = provider
+            .http
+            .post(format!("http://127.0.0.1:{port}/upload/v1beta/files"));
+        let failure = send_checked(
+            request,
+            MessageId::GoogleUploadFailed,
+            &[],
+            Duration::from_secs(5),
+            Some(&trace),
+            Stage::UploadFinalize,
+        )
+        .await
+        .expect_err("a 503 is a failure");
+
+        // The browser mapping is exactly what it was.
+        assert_eq!(failure.status, 502);
+        assert_eq!(failure.code, "UPSTREAM_ERROR");
+
+        let ended = stages(&diagnostics);
+        let finalize = ended
+            .iter()
+            .find(|stage| {
+                matches!(stage.stage, Stage::UploadFinalize)
+                    && !matches!(stage.phase, StagePhase::Begin)
+            })
+            .expect("the failed stage");
+        assert!(matches!(finalize.phase, StagePhase::Error));
+        assert_eq!(
+            finalize.status,
+            Some(503),
+            "the upstream's own status, not the mapped 502"
+        );
+        assert!(!finalize.timeout);
+
+        trace.finish(Outcome::Error);
+        let end = request_end(&diagnostics).expect("the request end");
+        assert_eq!(end.status, Some(503));
+        assert_eq!(end.outcome, Outcome::Error);
+    }
+
+    /// A successful body-bearing stage ends once its body has been read, and
+    /// the payload is the one the previous `.ok()` returned.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    #[tokio::test]
+    async fn a_successful_finalize_stage_ends_when_its_body_is_read() {
+        let body = "{\"file\":{\"name\":\"files/abc\",\"uri\":\"files/abc\",\"state\":\"ACTIVE\"}}";
+        let port = head_then_body_server(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            ),
+            body.to_string(),
+            Duration::ZERO,
+        );
+        let provider = Provider::for_test("http://127.0.0.1:1", "ws://127.0.0.1:1");
+        let (diagnostics, trace) = sink();
+        let request = provider
+            .http
+            .post(format!("http://127.0.0.1:{port}/upload/v1beta/files"));
+        let response = send_checked(
+            request,
+            MessageId::GoogleUploadFailed,
+            &[],
+            Duration::from_secs(5),
+            Some(&trace),
+            Stage::UploadFinalize,
+        )
+        .await
+        .expect("a 200");
+
+        let open = stages(&diagnostics);
+        assert_eq!(open.len(), 1, "the stage is still open at the headers: {open:?}");
+        assert!(matches!(open[0].phase, StagePhase::Begin));
+
+        let payload = read_stage_body(response, Some(&trace), Stage::UploadFinalize)
+            .await
+            .expect("the payload");
+        assert_eq!(payload["file"]["name"], "files/abc");
+
+        let ended = stages(&diagnostics);
+        let end = ended
+            .iter()
+            .find(|stage| {
+                matches!(stage.stage, Stage::UploadFinalize)
+                    && matches!(stage.phase, StagePhase::End)
+            })
+            .expect("the stage ends at its body");
+        assert_eq!(end.status, Some(200));
+        assert!(end.elapsed_us.is_some());
     }
 }

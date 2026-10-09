@@ -48,6 +48,8 @@ use crate::live;
 use crate::provider::Provider;
 use crate::secrets::SecretKey;
 use crate::settings::{RuntimeSnapshot, SharedRuntime};
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+use crate::diagnostics::{Diagnostics, Owner, Outcome, RendererReport, ReportAdmission, RequestTrace, Route, SessionKey, RENDERER_REPORT_MAX_BYTES};
 
 /* -------------------------------------------------------------------------- */
 /* Constants                                                                  */
@@ -247,6 +249,8 @@ fn mode_mismatch_error() -> ApiError {
 struct AppState {
     runtime: Arc<SharedRuntime>,
     provider: Arc<Provider>,
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    diagnostics: Arc<Diagnostics>,
     /// Two concurrent batch transcriptions, mirroring `MAX_CONCURRENT_BATCH`.
     batches: Arc<Semaphore>,
     /// The loopback origins allowed to drive the audio endpoints, derived once
@@ -278,6 +282,8 @@ impl Backend {
         reservation: ReservedListener,
         runtime: Arc<SharedRuntime>,
         provider: Arc<Provider>,
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        diagnostics: Arc<Diagnostics>,
     ) -> Result<Self, UiError> {
         let ReservedListener {
             listener,
@@ -288,6 +294,8 @@ impl Backend {
         let state = Arc::new(AppState {
             runtime,
             provider,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            diagnostics,
             batches: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH)),
             allowed_origins: loopback_origins(actual_port),
         });
@@ -594,6 +602,47 @@ fn router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+#[cfg(all(test, debug_assertions, feature = "dev-diagnostics"))]
+pub(crate) fn diagnostic_test_router(
+    runtime: Arc<SharedRuntime>,
+    provider: Arc<Provider>,
+    diagnostics: Arc<Diagnostics>,
+    actual_port: u16,
+) -> Router {
+    router(Arc::new(AppState {
+        runtime,
+        provider,
+        diagnostics,
+        batches: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH)),
+        allowed_origins: loopback_origins(actual_port),
+    }))
+}
+
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn diagnostic_trace(
+    state: &AppState,
+    uri: &Uri,
+    session: Option<u64>,
+    route: Route,
+) -> Option<RequestTrace> {
+    let mut key = None;
+    for pair in uri.query()?.split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if percent_decode(name, false).as_deref() != Some("diagnostics") {
+            continue;
+        }
+        if key.is_some() {
+            return None;
+        }
+        key = Some(SessionKey::parse_tag(&percent_decode(value, false)?)?);
+    }
+    let key = key?;
+    if key.owner == Owner::Dictation && session != Some(key.generation) {
+        return None;
+    }
+    state.diagnostics.lookup(key)?.request(route)
+}
+
 /// Which audio route is asking; decides what a session tag has to match.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AudioRoute {
@@ -707,6 +756,11 @@ async fn handle(
     upgrade: Option<WebSocketUpgrade>,
     body: Body,
 ) -> Result<Response, ApiError> {
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if path == "/api/dev-diagnostics" && state.diagnostics.is_enabled() {
+        return Ok(handle_diagnostic_report(state, method, headers, body).await);
+    }
+
     if path == "/api/health" {
         if *method != Method::GET {
             return Err(ApiError::new(
@@ -792,10 +846,16 @@ async fn handle(
         };
         let provider = Arc::clone(&state.provider);
         let ring = Arc::clone(&request.snapshot.keys);
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        let trace = diagnostic_trace(state, uri, request.session, Route::Live);
         return Ok(upgrade
             .max_message_size(MAX_WS_PAYLOAD)
             .on_upgrade(move |socket| async move {
-                live::serve(socket, provider, key, ring).await;
+                live::serve(
+                    socket, provider, key, ring,
+                    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                    trace,
+                ).await;
             }));
     }
 
@@ -818,7 +878,76 @@ async fn handle(
         ));
     }
 
-    handle_static(method, uri.path(), path)
+    handle_static(
+        method, uri.path(), path,
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        state.diagnostics.is_enabled(),
+    )
+}
+
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+async fn handle_diagnostic_report(
+    state: &AppState,
+    method: &Method,
+    headers: &HeaderMap,
+    body: Body,
+) -> Response {
+    let rejected = |status, code| {
+        json_response(status, json!({ "accepted": false, "code": code }))
+    };
+    if *method != Method::POST {
+        let mut response = rejected(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed");
+        response.headers_mut().insert(header::ALLOW, HeaderValue::from_static("POST"));
+        return response;
+    }
+    if headers.get_all(header::ORIGIN).iter().count() != 1
+        || !headers.get(header::ORIGIN)
+            .and_then(|origin| origin.to_str().ok())
+            .is_some_and(|origin| !origin.trim().is_empty())
+        || !origin_allowed(headers, &state.allowed_origins)
+    {
+        return rejected(StatusCode::FORBIDDEN, "cross_origin");
+    }
+    if !headers.get(header::CONTENT_TYPE)
+        .and_then(|kind| kind.to_str().ok())
+        .and_then(|kind| kind.split(';').next())
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("application/json"))
+    {
+        return rejected(StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_type");
+    }
+    if let Some(length) = headers.get(header::CONTENT_LENGTH) {
+        match length.to_str().ok().and_then(|value| value.parse::<u64>().ok()) {
+            Some(length) if length > RENDERER_REPORT_MAX_BYTES as u64 => {
+                return rejected(StatusCode::PAYLOAD_TOO_LARGE, "report_too_large");
+            }
+            None => return rejected(StatusCode::BAD_REQUEST, "invalid_report"),
+            _ => {}
+        }
+    }
+    let mut bytes = [0_u8; RENDERER_REPORT_MAX_BYTES];
+    let mut used = 0;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            return rejected(StatusCode::BAD_REQUEST, "invalid_report");
+        };
+        if chunk.len() > bytes.len() - used {
+            return rejected(StatusCode::PAYLOAD_TOO_LARGE, "report_too_large");
+        }
+        bytes[used..used + chunk.len()].copy_from_slice(&chunk);
+        used += chunk.len();
+    }
+    let Ok(report) = serde_json::from_slice::<RendererReport>(&bytes[..used]) else {
+        return rejected(StatusCode::BAD_REQUEST, "invalid_report");
+    };
+    match state.diagnostics.admit_renderer_report(report) {
+        ReportAdmission::Accepted => json_response(StatusCode::ACCEPTED, json!({ "accepted": true })),
+        ReportAdmission::StaleReport => rejected(StatusCode::OK, "stale_report"),
+        ReportAdmission::StaleSession => rejected(StatusCode::GONE, "stale_session"),
+        ReportAdmission::QueueFull => rejected(StatusCode::TOO_MANY_REQUESTS, "queue_full"),
+        ReportAdmission::Unavailable => rejected(StatusCode::SERVICE_UNAVAILABLE, "diagnostics_unavailable"),
+        ReportAdmission::InvalidReport => rejected(StatusCode::BAD_REQUEST, "invalid_report"),
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -922,7 +1051,25 @@ async fn handle_transcribe(
             .next_key()
             .ok_or_else(missing_key_error)?,
     };
-    let text = state.provider.transcribe(&key, request.keys(), &mode, bytes).await?;
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    let trace = diagnostic_trace(
+        state, uri, request.session,
+        if mode == "smart" { Route::Smart } else { Route::Verbatim },
+    );
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if let Some(trace) = &trace {
+        trace.batch_audio(bytes.len() as u64, Duration::from_secs_f64(duration));
+    }
+    let result = state.provider.transcribe(
+        &key, request.keys(), &mode, bytes,
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        trace.clone(),
+    ).await;
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if let Some(trace) = &trace {
+        trace.finish(if result.is_ok() { Outcome::Success } else { Outcome::Error });
+    }
+    let text = result?;
     Ok(json_response(StatusCode::OK, json!({ "text": text })))
 }
 
@@ -1074,6 +1221,25 @@ struct StaticAsset {
     content_type: &'static str,
 }
 
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+const DEV_ASSETS: [StaticAsset; 3] = [
+    StaticAsset {
+        path: "/recorder.js",
+        body: include_bytes!("../../public/dev-recorder.js"),
+        content_type: MIME_JS,
+    },
+    StaticAsset {
+        path: "/recorder-core.js",
+        body: include_bytes!("../../public/recorder.js"),
+        content_type: MIME_JS,
+    },
+    StaticAsset {
+        path: "/licenses/THIRD-PARTY-NOTICES.txt",
+        body: include_bytes!("../../third_party/THIRD-PARTY-NOTICES-DEV.txt"),
+        content_type: MIME_TEXT,
+    },
+];
+
 const ASSETS: [StaticAsset; 15] = [
     StaticAsset {
         path: "/index.html",
@@ -1161,11 +1327,27 @@ const ASSETS: [StaticAsset; 15] = [
     },
 ];
 
-fn find_asset(path: &str) -> Option<&'static StaticAsset> {
+fn find_asset(
+    path: &str,
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    development: bool,
+) -> Option<&'static StaticAsset> {
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if development {
+        if let Some(asset) = DEV_ASSETS.iter().find(|asset| asset.path == path) {
+            return Some(asset);
+        }
+    }
     ASSETS.iter().find(|asset| asset.path == path)
 }
 
-fn handle_static(method: &Method, raw_path: &str, normalized: &str) -> Result<Response, ApiError> {
+fn handle_static(
+    method: &Method,
+    raw_path: &str,
+    normalized: &str,
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    development: bool,
+) -> Result<Response, ApiError> {
     if *method != Method::GET && *method != Method::HEAD {
         return Err(ApiError::new(
             405,
@@ -1188,7 +1370,11 @@ fn handle_static(method: &Method, raw_path: &str, normalized: &str) -> Result<Re
         lookup.push_str("index.html");
     }
 
-    let Some(asset) = find_asset(&lookup) else {
+    let Some(asset) = find_asset(
+        &lookup,
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        development,
+    ) else {
         // Every path outside the embedded whitelist is simply absent, so
         // nothing else can be served to the browser.
         return Err(ApiError::new(
@@ -1473,6 +1659,8 @@ mod tests {
             provider: Arc::new(Provider::new()),
             batches: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH)),
             allowed_origins: loopback_origins(4175),
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            diagnostics: Diagnostics::disabled(),
         };
         let selected = select_request_snapshot(&state, AudioRoute::Batch,
             &"/api/transcribe?mode=smart&session=77".parse().expect("request URI"))
@@ -1668,5 +1856,39 @@ mod tests {
             origin_allowed(&HeaderMap::new(), &allowed),
             "a client that sends no Origin (curl, probe) is not cross-origin"
         );
+    }
+
+    #[tokio::test]
+    async fn a_disabled_backend_does_not_expose_diagnostic_routes_or_audio_files() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let runtime = Arc::new(SharedRuntime::new(test_snapshot(
+            Language::En, 1, crate::secrets::KeyRing::new(Vec::new()),
+        )));
+        let state = Arc::new(AppState {
+            runtime,
+            provider: Arc::new(Provider::new()),
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            diagnostics: Diagnostics::disabled(),
+            batches: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH)),
+            allowed_origins: loopback_origins(port),
+        });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(state)).await.unwrap();
+        });
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+        for path in ["/api/dev-diagnostics", "/recorder-core.js", "/logs/audio.flac"] {
+            let response = client.get(format!("http://127.0.0.1:{port}{path}"))
+                .send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        let response = client.post(format!("http://127.0.0.1:{port}/api/dev-diagnostics"))
+            .header(header::ORIGIN, format!("http://127.0.0.1:{port}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body("{}")
+            .send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        server.abort();
+        let _ = server.await;
     }
 }

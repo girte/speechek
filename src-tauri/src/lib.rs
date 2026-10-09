@@ -71,6 +71,11 @@ mod audio;
 mod autostart;
 mod backend;
 mod capture;
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+mod diagnostics;
+
+#[cfg(all(feature = "dev-diagnostics", not(debug_assertions)))]
+compile_error!("dev-diagnostics requires a debug build");
 mod i18n;
 mod installer;
 mod live;
@@ -107,6 +112,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use backend::ReservedListener;
 use preferences::{PreferencesState, SettingsUiError, StartupPorts};
+
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+use crate::diagnostics::{
+    CapturePhase, Diagnostics, Event as DiagnosticEvent, Mode, Outcome, Owner,
+    Phase as DiagnosticPhase, SessionKey,
+};
 
 /// Name the shell uses when it has to speak for itself: the active flavor's
 /// title, so a development or test build does not present itself as the
@@ -842,6 +853,176 @@ fn release_failed_lab_capture(app: &AppHandle, generation: u64) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Development diagnostics                                                     */
+/* -------------------------------------------------------------------------- */
+
+/// How long an ordinary exit lets the diagnostics writer drain its queues and
+/// close every take before the process lets it go. An installer's quit gets no
+/// budget at all: its own deadline is what bounds that exit.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+const DIAGNOSTIC_DRAIN: Duration = Duration::from_millis(500);
+
+/// The development sink of one resolved configuration directory.
+///
+/// Only the isolated development profile archives: a debug build with the local
+/// fake-provider harness (`Test`) and every other flavor get the disabled sink,
+/// which registers nothing, writes nothing and touches no file. The archive root
+/// is the `logs` child of this directory, which is the one place the writer may
+/// create a session directory in — and it is the writer thread, not this
+/// selection, that creates it.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn initialize_diagnostics(config_dir: &Path) -> Arc<Diagnostics> {
+    if profile::ACTIVE == profile::BuildFlavor::Development {
+        Diagnostics::start(config_dir)
+    } else {
+        Diagnostics::disabled()
+    }
+}
+
+/// The sink this run archives into, resolved from the settings document the
+/// launch selected: a document with no parent directory leaves nothing to
+/// archive under, so the sink is the disabled one.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn diagnostic_sink(config_path: &Path) -> Arc<Diagnostics> {
+    match config_path.parent() {
+        Some(config_dir) => initialize_diagnostics(config_dir),
+        None => Diagnostics::disabled(),
+    }
+}
+
+/// The sink this shell was started with, for the call sites that only have the
+/// window handle. A process that never reached the shell has none.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn diagnostics_of(app: &AppHandle) -> Option<Arc<Diagnostics>> {
+    app.try_state::<Arc<Diagnostics>>()
+        .map(|state| Arc::clone(&state))
+}
+
+/// The take a shell mode is recorded as. The runtime only ever publishes the
+/// three live modes, so anything else records as the default one.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn diagnostic_mode(mode: &str) -> Mode {
+    match mode {
+        "smart" => Mode::Smart,
+        "verbatim" => Mode::Verbatim,
+        _ => Mode::Live,
+    }
+}
+
+/// The phase a dictation of the shell is in, as the journal names it.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn diagnostic_shell_phase(phase: Phase) -> CapturePhase {
+    match phase {
+        Phase::Idle => CapturePhase::Idle,
+        Phase::Arming => CapturePhase::Arming,
+        Phase::Recording => CapturePhase::Recording,
+        Phase::Finalizing => CapturePhase::Finalizing,
+        Phase::Pasting => CapturePhase::Pasting,
+    }
+}
+
+/// Opens the take of one dictation or laboratory window, under that window's own
+/// generation. The two number spaces never name each other's takes.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn diagnostic_begin(
+    diagnostics: Option<&Arc<Diagnostics>>,
+    owner: Owner,
+    generation: u64,
+    mode: Mode,
+) {
+    if let Some(diagnostics) = diagnostics {
+        let _ = diagnostics.begin(SessionKey { owner, generation }, mode);
+    }
+}
+
+/// Records one phase of a take the shell is running. A take that is already gone
+/// — cancelled, replaced, sealed — has nothing left to record.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn diagnostic_phase(diagnostics: Option<&Arc<Diagnostics>>, key: SessionKey, phase: CapturePhase) {
+    if let Some(diagnostics) = diagnostics {
+        if let Some(handle) = diagnostics.lookup(key) {
+            handle.event(DiagnosticEvent::Phase(DiagnosticPhase { phase }));
+        }
+    }
+}
+
+/// Ends the take of a key the shell is closing, and closes its capture with it.
+///
+/// This is for the endings the native capture cannot see — a reservation that was
+/// withdrawn, an arming that was given up on, a dictation the shell ended — where
+/// no encoder exists to publish the watermark. A take whose capture really ran
+/// has published it already, and closing it again is a no-op.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn diagnostic_end_capture(
+    diagnostics: Option<&Arc<Diagnostics>>,
+    key: SessionKey,
+    outcome: Outcome,
+) {
+    let Some(diagnostics) = diagnostics else {
+        return;
+    };
+    if let Some(handle) = diagnostics.lookup(key) {
+        handle.end_capture(outcome);
+    }
+    diagnostics.end(key, outcome);
+}
+
+/// Records the shell's terminal outcome for a take whose native capture is not
+/// this call's business: an exit that closes the capture afterwards, and the
+/// renderer's own report of a laboratory take.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn diagnostic_end(diagnostics: Option<&Arc<Diagnostics>>, key: SessionKey, outcome: Outcome) {
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.end(key, outcome);
+    }
+}
+
+/// Records the ending of a take whose native capture did not start.
+///
+/// The native side answers the sequence of the last frame it had when the stop
+/// reached it. A take whose device never installed a recording has no encoder to
+/// publish a watermark, so the shell closes its capture here, as a take with no
+/// audio at all; a recording that existed publishes its own capture end, and is
+/// only given the terminal — and a stop that timed out leaves its capture to its
+/// own thread, which is still recording.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn diagnostic_failed_capture(
+    diagnostics: Option<&Arc<Diagnostics>>,
+    owner: Owner,
+    generation: u64,
+    last: Result<u64, UiError>,
+) {
+    let key = SessionKey { owner, generation };
+    if matches!(last, Ok(0)) {
+        diagnostic_end_capture(diagnostics, key, Outcome::Error);
+    } else {
+        diagnostic_end(diagnostics, key, Outcome::Error);
+    }
+}
+
+/// Closes the capture of a take without saying how the take ended: the
+/// laboratory's stop is the case, where the requests of the take keep running
+/// and its terminal arrives from the renderer afterwards.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn diagnostic_close_capture(diagnostics: Option<&Arc<Diagnostics>>, key: SessionKey) {
+    if let Some(diagnostics) = diagnostics {
+        if let Some(handle) = diagnostics.lookup(key) {
+            handle.end_capture(Outcome::Abandoned);
+        }
+    }
+}
+
+/// Ends every take of one owner the shell can no longer reach. The laboratory
+/// window closing is the case: a take whose requests are still being served has
+/// no native reservation left, and only this closes it.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn diagnostic_end_owner(diagnostics: Option<&Arc<Diagnostics>>, owner: Owner, outcome: Outcome) {
+    if let Some(diagnostics) = diagnostics {
+        diagnostics.end_owner(owner, outcome);
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /* Configuration                                                               */
 /* -------------------------------------------------------------------------- */
 
@@ -973,6 +1154,14 @@ fn startup(app: &AppHandle, reservation: ReservedListener) {
         Err(err) => fatal(startup_ui_language(), &err.ui),
     };
 
+    // The development archive of this run, before any window exists: the sink
+    // the capture, the relay and the renderer reports all reach through the
+    // managed state. Only the isolated development profile archives, and its
+    // writer creates `<config dir>/logs` itself — a flavor that does not
+    // archive gets the disabled sink and no filesystem operation at all.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    let diagnostics = diagnostic_sink(&config_path);
+
     // A first run gets the annotated settings document on the path this launch
     // actually selected — the debug override included — and startup continues
     // with it: the key list that is still missing is reported to the user, not
@@ -1066,10 +1255,14 @@ fn startup(app: &AppHandle, reservation: ReservedListener) {
             reservation.actual_port()
         );
     }
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    app.manage(Arc::clone(&diagnostics));
     let running = match backend::Backend::start(
         reservation,
         Arc::clone(&runtime),
         Arc::clone(&provider),
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        Arc::clone(&diagnostics),
     ) {
         Ok(running) => running,
         Err(err) => {
@@ -1486,10 +1679,18 @@ fn arm_overlay(app: &AppHandle) -> Result<(), String> {
         .ok_or_else(|| "the dictation was started without a configuration".to_string())?;
     let generation = overlay::show(app)?;
     inner.generation.store(generation, Ordering::SeqCst);
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    let mode = diagnostic_mode(&snapshot.settings.mode);
     // Pinned before the renderer hears about the dictation and before any
     // request of it can arrive: the take uses this revision's ring and mode
     // even when an apply publishes another one while it is running.
     inner.runtime.pin(generation, snapshot);
+    // The take is opened after its revision is pinned and before the renderer
+    // hears about the dictation, so its capture and every request of it find a
+    // registered take, under the generation the shell pinned and the mode of
+    // that very revision.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    diagnostic_begin(diagnostics_of(app).as_ref(), Owner::Dictation, generation, mode);
     emit_toggle(app, generation);
     Ok(())
 }
@@ -1509,8 +1710,33 @@ fn cancel_arming_locked(app: &AppHandle, err: String) {
     retire_dictation_locked(&inner, generation);
     // No dictation is left to cancel, so Escape goes back to Windows.
     release_cancel_key(app);
-    // A stream this dictation opened on the way is not left running.
+    // The take ends as cancelled: the shell is the one that decided it, and a
+    // later report of this generation can never soften that.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    diagnostic_end(
+        diagnostics_of(app).as_ref(),
+        SessionKey {
+            owner: Owner::Dictation,
+            generation,
+        },
+        Outcome::Cancelled,
+    );
+    // A stream this dictation opened on the way is not left running. A device
+    // that never installed a recording has no encoder to publish the end of its
+    // capture, so the shell closes it — the take could not seal without that.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    let last = capture::stop(app, capture::CaptureOwner::Dictation(generation));
     capture::shutdown(app);
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if matches!(last, Ok(0)) {
+        diagnostic_close_capture(
+            diagnostics_of(app).as_ref(),
+            SessionKey {
+                owner: Owner::Dictation,
+                generation,
+            },
+        );
+    }
     // The dictation is over before it ever became one, so the settings window
     // may offer a chord change again.
     emit_dictation_state(app, false);
@@ -1737,6 +1963,17 @@ fn cancel_dictation(app: &AppHandle, session_id: u64) {
         return;
     }
     let generation = inner.generation.load(Ordering::SeqCst);
+    // The take keeps the phase Escape reached it in, so a cancellation of an
+    // arming, a recording and a finalizing take are told apart.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    diagnostic_phase(
+        diagnostics_of(app).as_ref(),
+        SessionKey {
+            owner: Owner::Dictation,
+            generation,
+        },
+        diagnostic_shell_phase(inner.state.lock().phase),
+    );
     inner.state.lock().phase = Phase::Idle;
     inner.pending_toggle.store(false, Ordering::SeqCst);
     inner.queued_stop.store(false, Ordering::SeqCst);
@@ -1754,7 +1991,33 @@ fn cancel_dictation(app: &AppHandle, session_id: u64) {
     // cancelled generation, and the renderer no longer has a capture to take
     // them.
     emit_cancel(app, generation);
+    // The take ends as cancelled: the shell is the one that decided it, and a
+    // later report of this generation can never soften that.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    diagnostic_end(
+        diagnostics_of(app).as_ref(),
+        SessionKey {
+            owner: Owner::Dictation,
+            generation,
+        },
+        Outcome::Cancelled,
+    );
+    // A device that never installed a recording has no encoder to publish the
+    // end of its capture, so the shell closes it here — the take could not seal
+    // otherwise, and a take whose capture really ran publishes its own end.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    let last = capture::stop(app, capture::CaptureOwner::Dictation(generation));
     capture::shutdown(app);
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if matches!(last, Ok(0)) {
+        diagnostic_close_capture(
+            diagnostics_of(app).as_ref(),
+            SessionKey {
+                owner: Owner::Dictation,
+                generation,
+            },
+        );
+    }
     // The microphone is closed by now, so the system sound of the take has been
     // given back — or it has not. A restore that failed leaves the mute in the
     // worker's hands, so this release is both the second attempt and the
@@ -2347,6 +2610,12 @@ fn lab_window_closed(app: &AppHandle) {
     if let Err(err) = app.emit_to(LAB_LABEL, EVENT_LAB_CLOSED, ()) {
         eprintln!("{APP_TITLE}: cannot tell the comparison window it is closing: {err}.");
     }
+    // Every laboratory take the shell can still reach ends here, before the
+    // early return below: a take whose requests are still being served has no
+    // native reservation left by now, and its capture is closed by its own stop
+    // or by the encoder that publishes its own end.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    diagnostic_end_owner(diagnostics_of(app).as_ref(), Owner::Lab, Outcome::WindowClosed);
     let Some(generation) = generation else {
         return;
     };
@@ -2354,7 +2623,21 @@ fn lab_window_closed(app: &AppHandle) {
     if let Err(err) = std::thread::Builder::new()
         .name(format!("speechek-lab-stop-{generation}"))
         .spawn(move || {
-            if let Err(err) = capture::stop(&handle, capture::CaptureOwner::Lab(generation)) {
+            let last = capture::stop(&handle, capture::CaptureOwner::Lab(generation));
+            // A take whose device never installed a recording has no encoder to
+            // publish the end of its capture: the shell closes it, as a take
+            // with no audio at all.
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            if matches!(last, Ok(0)) {
+                diagnostic_close_capture(
+                    diagnostics_of(&handle).as_ref(),
+                    SessionKey {
+                        owner: Owner::Lab,
+                        generation,
+                    },
+                );
+            }
+            if let Err(err) = last {
                 eprintln!("{APP_TITLE}: the comparison capture did not stop cleanly: {err}.");
             }
         })
@@ -2422,6 +2705,7 @@ pub(crate) fn installer_exit_cleanup(app: &AppHandle, inner: &Inner) {
         // reached the clipboard is dropped exactly like a cancelled one.
         emit_cancel(app, generation);
     }
+
 }
 
 /// Leaves nothing behind: the hotkey is given back, the microphone is released,
@@ -2619,6 +2903,19 @@ async fn capture_started(window: WebviewWindow, app: AppHandle, generation: u64)
             };
             queued
         };
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        diagnostic_phase(
+            diagnostics_of(&app).as_ref(),
+            SessionKey {
+                owner: Owner::Dictation,
+                generation,
+            },
+            if queued_stop {
+                CapturePhase::Finalizing
+            } else {
+                CapturePhase::Recording
+            },
+        );
         if queued_stop {
             emit_toggle(&app, generation);
         }
@@ -2642,10 +2939,24 @@ async fn capture_finalizing(window: WebviewWindow, app: AppHandle, generation: u
         // recorder is part of the dictation's state, not a fact about it.
         let _session = inner.session.lock();
         let mut state = inner.state.lock();
-        if generation == inner.generation.load(Ordering::SeqCst)
-            && matches!(state.phase, Phase::Arming | Phase::Recording)
-        {
+        let finalizing = generation == inner.generation.load(Ordering::SeqCst)
+            && matches!(state.phase, Phase::Arming | Phase::Recording);
+        if finalizing {
             state.phase = Phase::Finalizing;
+        }
+        // Recorded after the state lock is released: the shell's own state is
+        // not held while the journal is written.
+        drop(state);
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        if finalizing {
+            diagnostic_phase(
+                diagnostics_of(&app).as_ref(),
+                SessionKey {
+                    owner: Owner::Dictation,
+                    generation,
+                },
+                CapturePhase::Finalizing,
+            );
         }
     })
     .await;
@@ -2697,7 +3008,39 @@ async fn finish_session(
         retire_dictation_locked(&inner, generation);
         // The dictation is over: Escape is nobody's to cancel any more.
         release_cancel_key(&app);
+        // The take ends with the outcome the renderer reported: the shell is
+        // the one that owns a dictation's ending, and a later report of this
+        // generation cannot soften it.
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        diagnostic_end(
+            diagnostics_of(&app).as_ref(),
+            SessionKey {
+                owner: Owner::Dictation,
+                generation,
+            },
+            if outcome == "error" {
+                Outcome::Error
+            } else {
+                Outcome::Success
+            },
+        );
+        // A recorder that was closed without ever opening a device has no
+        // encoder to publish the end of its capture, so the shell closes it —
+        // the take could not seal otherwise. A capture that really ran
+        // publishes its own end as it stops.
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        let last = capture::stop(&app, capture::CaptureOwner::Dictation(generation));
         capture::shutdown(&app);
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        if matches!(last, Ok(0)) {
+            diagnostic_close_capture(
+                diagnostics_of(&app).as_ref(),
+                SessionKey {
+                    owner: Owner::Dictation,
+                    generation,
+                },
+            );
+        }
         if outcome == "error" {
             overlay::show_error(&app, generation);
         } else {
@@ -2804,7 +3147,18 @@ async fn start_native_capture(
     if !admitted {
         // The device took seconds to open and the dictation is over by now. The
         // capture is closed through its own generation, so a newer take that
-        // owns the microphone in the meantime is not touched.
+        // owns the microphone in the meantime is not touched. The take is over
+        // either way, and an ending the shell already recorded — a
+        // cancellation, a replacement, an exit — outranks the failure this
+        // command saw.
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        diagnostic_failed_capture(
+            diagnostics_of(&app).as_ref(),
+            Owner::Dictation,
+            generation,
+            capture::stop(&app, capture::CaptureOwner::Dictation(generation)),
+        );
+        #[cfg(not(all(debug_assertions, feature = "dev-diagnostics")))]
         let _ = capture::stop(&app, capture::CaptureOwner::Dictation(generation));
         return Err(UiError::new(
             "CAPTURE_ENDED",
@@ -2816,6 +3170,14 @@ async fn start_native_capture(
         // still finishing when the command gave up is closed through its own
         // generation, so the microphone is free for the next take — of this
         // window or of the laboratory. A newer take is never touched.
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        diagnostic_failed_capture(
+            diagnostics_of(&app).as_ref(),
+            Owner::Dictation,
+            generation,
+            capture::stop(&app, capture::CaptureOwner::Dictation(generation)),
+        );
+        #[cfg(not(all(debug_assertions, feature = "dev-diagnostics")))]
         let _ = capture::stop(&app, capture::CaptureOwner::Dictation(generation));
     }
     opened
@@ -2888,7 +3250,13 @@ async fn lab_prepare_capture(window: WebviewWindow, app: AppHandle) -> Result<u6
     tauri::async_runtime::spawn_blocking(move || {
         let inner = inner(&app);
         let _session = inner.session.lock();
-        reserve_lab_capture(&inner)
+        let generation = reserve_lab_capture(&inner)?;
+        // The take is opened the moment the microphone is reserved for it, so
+        // its capture and its requests find a registered take; a refusal above
+        // leaves nothing behind.
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        diagnostic_begin(diagnostics_of(&app).as_ref(), Owner::Lab, generation, Mode::Comparison);
+        Ok(generation)
     })
     .await
     .unwrap_or_else(|_| {
@@ -2958,6 +3326,18 @@ fn start_lab_capture(app: &AppHandle, generation: u64) -> Result<capture::Captur
             // installed in the instant the command gave up — is closed through
             // its own owner: a take of either window is never touched by it.
             release_failed_lab_capture(app, generation);
+            // A take whose device never installed a recording has no encoder to
+            // publish the end of its capture, so the shell closes it; a
+            // recording that existed publishes its own, and is only given the
+            // terminal.
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            diagnostic_failed_capture(
+                diagnostics_of(app).as_ref(),
+                Owner::Lab,
+                generation,
+                capture::stop(app, owner),
+            );
+            #[cfg(not(all(debug_assertions, feature = "dev-diagnostics")))]
             let _ = capture::stop(app, owner);
             return Err(UiError::new(
                 "CAPTURE_FAILED",
@@ -3024,7 +3404,21 @@ fn stop_lab_capture(app: &AppHandle, generation: u64) -> Result<u64, UiError> {
     if !current {
         return Ok(0);
     }
-    match capture::stop(app, capture::CaptureOwner::Lab(generation)) {
+    let last = capture::stop(app, capture::CaptureOwner::Lab(generation));
+    // Only a take whose device never installed a recording has no encoder to
+    // publish a capture end: its capture is closed here, while its requests —
+    // and the renderer's own terminal report — keep running.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if matches!(last, Ok(0)) {
+        diagnostic_close_capture(
+            diagnostics_of(app).as_ref(),
+            SessionKey {
+                owner: Owner::Lab,
+                generation,
+            },
+        );
+    }
+    match last {
         Ok(sequence) => Ok(sequence),
         Err(cause) => {
             let cause =
@@ -3158,6 +3552,17 @@ async fn insert_text(
             // step, before the clipboard transaction: nothing of the hand-over is
             // meant to be visible, and Escape is past winning.
             overlay::hide_now(&paste_app, generation);
+            // The take is in its last phase: the text is on its way into the
+            // window that owns the foreground.
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            diagnostic_phase(
+                diagnostics_of(&paste_app).as_ref(),
+                SessionKey {
+                    owner: Owner::Dictation,
+                    generation,
+                },
+                CapturePhase::Pasting,
+            );
         }
         release_cancel_key(&paste_app);
         paste::transact_foreground(text, own_process)
@@ -3340,6 +3745,19 @@ pub fn run() {
                 backend.shutdown();
             }
             cleanup(app);
+            // The development archive goes last, once the shell has given
+            // everything else back: an ordinary exit gives the writer a bounded
+            // budget to drain its queues, write the last records and close every
+            // take, while an exit the installer asked for gets no budget at all —
+            // its own deadline is what bounds that one.
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            if let Some(diagnostics) = diagnostics_of(app) {
+                diagnostics.shutdown(if installer_quit {
+                    Duration::ZERO
+                } else {
+                    DIAGNOSTIC_DRAIN
+                });
+            }
         }
         _ => {}
     });
@@ -3359,6 +3777,12 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use tauri::Url;
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    use super::{diagnostic_close_capture, diagnostic_end, diagnostic_end_owner};
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    use crate::diagnostics::{Diagnostics, Mode, Outcome, Owner, Policy, Route, SessionKey};
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    use std::time::{Duration, SystemTime};
 
     /// The settings window is told `dictation_active`, and its lab button is
     /// disabled, for exactly the phases a dictation is in — from the arming until
@@ -3806,5 +4230,161 @@ mod tests {
             permutations(items, start + 1, out);
             items.swap(start, index);
         }
+    }
+
+    /* -------------------------------------------------------------------- */
+    /* Development diagnostics: the shell's own endings                      */
+    /* -------------------------------------------------------------------- */
+
+    /// A take whose device never installed a recording has no encoder to
+    /// publish the end of its capture. The shell's own records are what let it
+    /// seal: a terminal alone leaves it open forever, and the capture end the
+    /// shell writes for it is what closes it.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    #[test]
+    fn a_take_with_no_audio_seals_only_once_its_capture_is_closed() {
+        let diagnostics = shell_diagnostics();
+        let key = SessionKey {
+            owner: Owner::Dictation,
+            generation: 1,
+        };
+        assert!(
+            diagnostics.begin(key, Mode::Live).is_some(),
+            "the take is open"
+        );
+
+        // The renderer reported its outcome: a terminal without a capture end
+        // is not a finished take.
+        diagnostic_end(Some(&diagnostics), key, Outcome::Success);
+        diagnostics.advance_clock(Duration::from_secs(3));
+        diagnostics.advance_all();
+        assert!(
+            diagnostics.lookup(key).is_some(),
+            "a terminal alone does not seal a take whose capture never ended"
+        );
+
+        // The shell closes the capture of the take no encoder ever published
+        // for, and the take seals on its own.
+        diagnostic_close_capture(Some(&diagnostics), key);
+        diagnostics.advance_all();
+        assert!(
+            diagnostics.lookup(key).is_none(),
+            "the closed take sealed with the ending the shell recorded"
+        );
+    }
+
+    /// The laboratory window closing ends a take the shell can no longer reach
+    /// even while its requests are still being served: the accepted report of
+    /// that take never arrives, and the take has no native reservation left.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    #[test]
+    fn closing_the_lab_window_ends_a_take_that_is_still_being_processed() {
+        let diagnostics = shell_diagnostics();
+        let key = SessionKey {
+            owner: Owner::Lab,
+            generation: 1,
+        };
+        let handle = diagnostics
+            .begin(key, Mode::Comparison)
+            .expect("the laboratory take is open");
+        // The take's own route is not what matters here: an open request is an
+        // open request, whichever stream it belongs to.
+        let request = handle.request(Route::Live).expect("a request is admitted");
+
+        diagnostic_close_capture(Some(&diagnostics), key);
+        diagnostic_end_owner(Some(&diagnostics), Owner::Lab, Outcome::WindowClosed);
+        diagnostics.advance_clock(Duration::from_secs(3));
+        diagnostics.advance_all();
+        assert!(
+            diagnostics.lookup(key).is_some(),
+            "a request that is still being served keeps the take open"
+        );
+
+        drop(request);
+        diagnostics.advance_all();
+        assert!(
+            diagnostics.lookup(key).is_none(),
+            "the closed window's take sealed with no terminal left to wait for"
+        );
+    }
+
+    /// A sink of the tests' own: no writer, no directory, and a clock the test
+    /// drives. The root is a name that is never created — the producer's own
+    /// records are all this exercises.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn shell_diagnostics() -> Arc<Diagnostics> {
+        Diagnostics::for_test(
+            &std::env::temp_dir().join(format!("speechek-shell-diagnostics-{}", std::process::id())),
+            Policy::DEVELOPMENT,
+            SystemTime::UNIX_EPOCH,
+        )
+    }
+
+    /// The local fake-provider harness is a debug profile of its own, and it
+    /// must never archive: the sink a run of it selects is disabled, it refuses
+    /// every take, and it creates nothing — no directory of its own, not even
+    /// the `logs` root the writer of a development run would own.
+    ///
+    /// The scratch name is this test's own and is never created by anything, so
+    /// a directory appearing under it could only be the sink's doing. Nothing
+    /// here launches the shell, touches the environment or a profile directory.
+    #[cfg(all(
+        test,
+        debug_assertions,
+        feature = "dev-diagnostics",
+        feature = "test-provider"
+    ))]
+    #[test]
+    fn the_test_profile_selects_a_sink_that_archives_nothing() {
+        assert_eq!(
+            crate::profile::ACTIVE,
+            crate::profile::BuildFlavor::Test,
+            "this test runs under the harness profile, the one that must not archive"
+        );
+        let scratch = std::env::temp_dir().join(format!(
+            "speechek-test-profile-no-archive-{}-{}",
+            std::process::id(),
+            next_scratch()
+        ));
+        assert!(!scratch.exists(), "the scratch name is new");
+
+        let diagnostics = super::initialize_diagnostics(&scratch);
+        assert!(
+            !diagnostics.is_enabled(),
+            "the harness profile archives nothing"
+        );
+        assert!(
+            diagnostics
+                .begin(
+                    SessionKey {
+                        owner: Owner::Dictation,
+                        generation: 1,
+                    },
+                    Mode::Live,
+                )
+                .is_none(),
+            "a sink that does not archive refuses every take"
+        );
+        assert!(
+            !scratch.exists(),
+            "a sink that does not archive creates no directory"
+        );
+        assert!(
+            !scratch.join("logs").exists(),
+            "not even the archive root a development writer would own"
+        );
+    }
+
+    /// A name no other test of this process uses, so one test's scratch path is
+    /// never another's.
+    #[cfg(all(
+        test,
+        debug_assertions,
+        feature = "dev-diagnostics",
+        feature = "test-provider"
+    ))]
+    fn next_scratch() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed) + 1
     }
 }

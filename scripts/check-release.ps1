@@ -8,9 +8,14 @@
       1. versions        - the three mirrored X.Y.Z values (tauri.conf.json is
                            authoritative) and, when -Version is given, the tag.
       2. features        - production must not enable `test-provider` (debug
-                           fake-provider harness only) nor `custom-protocol`
-                           (that is exactly what `tauri build` would inject; the
-                           release path uses `tauri bundle` over a prebuilt EXE).
+                          fake-provider harness only) nor `custom-protocol`
+                          (that is exactly what `tauri build` would inject; the
+                          release path uses `tauri bundle` over a prebuilt EXE).
+                          `dev-diagnostics` (debug-only Development diagnostics
+                          with FLAC/journal files) must never be a default
+                          feature nor appear in tauri.conf.json, the workflows
+                          or the release/Test build commands; only
+                          scripts/prepare-preview.ps1 may pass it explicitly.
       3. lockfiles       - Cargo.lock and bun.lock are tracked and Cargo.lock
                            carries the speechek package entry (locked graph).
       4. notices         - third_party/THIRD-PARTY-NOTICES.txt exists and is
@@ -221,6 +226,32 @@ function Check-Features {
     if ($features.ContainsKey('default') -and $features['default'] -match 'custom-protocol') {
         Add-Fail 'features' 'Cargo.toml default features enable custom-protocol'
     }
+    if ($features.ContainsKey('default') -and $features['default'] -match 'dev-diagnostics') {
+        Add-Fail 'features' 'Cargo.toml default features enable dev-diagnostics (debug Development opt-in only)'
+    }
+
+    $conf = Read-RepoText 'src-tauri/tauri.conf.json'
+    if ($null -ne $conf) {
+        if ($conf -match 'test-provider') { Add-Fail 'features' 'tauri.conf.json references test-provider (production config must not enable it)' }
+        if ($conf -match 'custom-protocol') { Add-Fail 'features' 'tauri.conf.json references custom-protocol' }
+        if ($conf -match 'dev-diagnostics') { Add-Fail 'features' 'tauri.conf.json references dev-diagnostics (production config must not enable it)' }
+    }
+
+    # `dev-diagnostics` is only ever passed explicitly by
+    # scripts/prepare-preview.ps1. It must not leak into the release/Test build
+    # commands or into any workflow, where it would ship debug archives.
+    $featureForbidden = @(
+        'scripts/build-release.ps1',
+        'scripts/build-test-installer.ps1',
+        '.github/workflows/candidate.yml',
+        '.github/workflows/release.yml'
+    )
+    foreach ($path in $featureForbidden) {
+        $text = Read-RepoText $path
+        if ($null -ne $text -and $text -match 'dev-diagnostics') {
+            Add-Fail 'features' ($path + ' references dev-diagnostics; only scripts/prepare-preview.ps1 may pass it explicitly')
+        }
+    }
 
     $conf = Read-RepoText 'src-tauri/tauri.conf.json'
     if ($null -ne $conf) {
@@ -229,7 +260,7 @@ function Check-Features {
     }
 
     if ($script:Failures.Count -eq $script:CheckFailBaseline) {
-        Add-Pass 'features' 'test-provider not default; custom-protocol absent from Cargo.toml and tauri.conf.json'
+        Add-Pass 'features' 'test-provider/dev-diagnostics not default; custom-protocol absent from Cargo.toml, tauri.conf.json, workflows and release build commands'
     }
 }
 
@@ -312,7 +343,11 @@ function Get-ForbiddenPathReason([string]$Path) {
     $bn = [System.IO.Path]::GetFileName($n)
     if ($bn -eq '.env') { return '.env' }
     if ($bn -like '.env.*' -and $bn -ne '.env.example') { return '.env credential file' }
-    if ($n -match '\.(wav|pcm|webm|log)$') { return 'non-publishable file type' }
+    if ($n -match '\.(wav|pcm|webm|log|flac|jsonl)$' -or $bn -like '*.flac.part') { return 'non-publishable file type' }
+    # A `logs` path segment (the Development diagnostics directory) is never
+    # published; anchored on separators so names like `changelogs.md` are not
+    # caught.
+    if ($n -match '(^|/)logs(/|$)') { return 'logs path segment' }
     return $null
 }
 

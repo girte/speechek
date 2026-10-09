@@ -9,15 +9,19 @@
       1. the non-bypassable clean-source gate and the version-mirror check;
       2. an exact Rust 1.97.1 / x86_64-pc-windows-msvc toolchain resolution;
       3. the Visual Studio x64 developer environment (vswhere + VsDevCmd);
-      4. `cargo check --locked --no-default-features`;
+      4. `cargo check --locked --no-default-features --features dev-diagnostics`;
          then localization source checks and the Git changed-message report;
-      5. `cargo test --locked --no-default-features --features test-provider`
-         (GUI-free unit tests only; that feature is never used by the final
-         build);
-      6. `cargo build --locked --no-default-features` - the Development debug
-         profile, with no --release and no bundle/installer step, into the
-         canonical src-tauri/target/debug/speechek.exe;
-      7. a clean-source / same-HEAD recheck, then
+      5. the Development notices check (collect-notices.ps1 -Features
+         dev-diagnostics -Check) so the embedded DEV notice file is current;
+      6. `cargo test --locked --no-default-features --features
+         test-provider,dev-diagnostics` (GUI-free unit tests only; test-provider
+         is never used by the final build);
+      7. `cargo build --locked --no-default-features --features dev-diagnostics`
+         - the Development debug profile, with no --release and no
+         bundle/installer step, into the canonical
+         src-tauri/target/debug/speechek.exe; the final build is last so neither
+         test-provider nor a Test profile remains in it;
+      8. a clean-source / same-HEAD recheck, then
          src-tauri/target/debug/preview-manifest.json (schemaVersion 1, full
          commit, version mirrors, flavor=development, exe file + sha256).
 
@@ -115,6 +119,36 @@ function Invoke-SpeechekCargoStep {
     }
 }
 
+# The Development preview embeds third_party/THIRD-PARTY-NOTICES-DEV.txt, which
+# is generated from the dev-diagnostics dependency graph. It must be committed
+# and byte-current before the build embeds it; the collector's -Check mode
+# compares the file against a fresh locked `cargo metadata -Features
+# dev-diagnostics` run. Like scripts/check-release.ps1, the collector runs in a
+# child host process so its native stderr cannot terminate this script.
+function Assert-SpeechekDevNoticesCurrent {
+    $devNotices = Join-Path $repoRoot 'third_party/THIRD-PARTY-NOTICES-DEV.txt'
+    if (-not (Test-Path -LiteralPath $devNotices -PathType Leaf)) {
+        throw ("third_party/THIRD-PARTY-NOTICES-DEV.txt is missing. Generate it once with: " +
+               "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/collect-notices.ps1 " +
+               "-Features dev-diagnostics -OutputPath third_party/THIRD-PARTY-NOTICES-DEV.txt")
+    }
+    $collector = Join-Path $repoRoot 'scripts/collect-notices.ps1'
+    $hostExe = (Get-Process -Id $PID).Path
+    $previousEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = @(& $hostExe -NoProfile -ExecutionPolicy Bypass -File $collector `
+                -Features dev-diagnostics -OutputPath 'third_party/THIRD-PARTY-NOTICES-DEV.txt' `
+                -Check -RepoRoot $repoRoot 2>&1)
+        $code = $LASTEXITCODE
+    }
+    finally { $ErrorActionPreference = $previousEap }
+    if ($code -ne 0) {
+        $lines = @(($output | Out-String) -split "`r?`n" | Where-Object { $_.Trim() -ne '' })
+        throw ("collect-notices -Features dev-diagnostics -Check failed (exit $code): " + ($lines -join ' | '))
+    }
+}
+
 Write-Host '== Speechek portable preview build =='
 Write-Host "repository : $repoRoot"
 
@@ -156,6 +190,9 @@ if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
 
 # 4-6. GUI-free check, the unit tests, then the final Development build last so
 # the test-provider feature does not remain in the canonical debug executable.
+# The Development diagnostics archive (FLAC + JSONL journals) is built into the
+# preview only through the explicit dev-diagnostics feature; Test keeps only
+# test-provider, and the final build keeps only dev-diagnostics.
 $cargoManifestArgument = 'src-tauri/Cargo.toml'
 if (Test-Path -LiteralPath $exePath -PathType Leaf) {
     try {
@@ -169,14 +206,18 @@ if (Test-Path -LiteralPath $exePath -PathType Leaf) {
 }
 
 Invoke-SpeechekCargoStep -Label 'check' -Environment $childEnvironment `
-    -Arguments @('check', '--manifest-path', $cargoManifestArgument, '--locked', '--no-default-features')
+    -Arguments @('check', '--manifest-path', $cargoManifestArgument, '--locked', '--no-default-features', '--features', 'dev-diagnostics')
 # Catalog validation already ran in build.rs above; reuse it, not a second schema.
 . (Join-Path $PSScriptRoot 'check-localization.ps1')
 Invoke-SpeechekLocalizationSources -RepoRoot $repoRoot
+# The embedded Development notices must match the dev-diagnostics graph before
+# the build embeds them; the production THIRD-PARTY-NOTICES.txt stays verified
+# by scripts/check-release.ps1 and is not touched here.
+Assert-SpeechekDevNoticesCurrent
 Invoke-SpeechekCargoStep -Label 'test' -Environment $childEnvironment `
-    -Arguments @('test', '--manifest-path', $cargoManifestArgument, '--locked', '--no-default-features', '--features', 'test-provider')
+    -Arguments @('test', '--manifest-path', $cargoManifestArgument, '--locked', '--no-default-features', '--features', 'test-provider,dev-diagnostics')
 Invoke-SpeechekCargoStep -Label 'build' -Environment $childEnvironment `
-    -Arguments @('build', '--manifest-path', $cargoManifestArgument, '--locked', '--no-default-features')
+    -Arguments @('build', '--manifest-path', $cargoManifestArgument, '--locked', '--no-default-features', '--features', 'dev-diagnostics')
 
 if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
     throw "the preview build did not produce $exePath."
