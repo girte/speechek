@@ -10,7 +10,11 @@
  *
  * On top of that, and only when the page bound a native take with the global
  * `__speechekDevDiagnostics` marker, the decorator observes the take and posts
- * bounded numeric reports to `POST /api/dev-diagnostics`:
+ * reports to `POST /api/dev-diagnostics`: the bounded counters and boundary
+ * events, and the take's content — the error reports the core really handed
+ * over, and, on the terminal report, the exact object `stop()` resolved with.
+ * Content is never truncated: a report that cannot carry it whole is refused
+ * and accounted for instead.
  *
  *   - `setContext(owner, generation)` — one-shot pending binding, called by the
  *     page right before the genuine `start` of a take. A `start` that the core
@@ -26,9 +30,13 @@
  * bound, and the WebSocket and fetch wrappers only decorate requests that
  * belong to a bound take of this same origin.
  *
- * Reports never carry audio, text, transcript, URLs, keys or arguments: only
- * counters, enum names, numeric codes and the bounded boundary events the plan
- * lists. Nothing is stored, and a report is only built once a take is bound.
+ * What a report carries is what the take really produced: the counters and
+ * codes below, the error reports the core delivered (mode, rendered message,
+ * catalog descriptor, the elapsed time of the callback that raised it and,
+ * only when the core handed one over, the raw diagnostic), and the three maps
+ * `stop()` resolved with — results, errors and errorDetails. No URL, host, key,
+ * header, audio frame or setting ever travels, and nothing is stored: a report
+ * is only built once a take is bound.
  */
 
 import { createRecorder as createCoreRecorder } from './recorder-core.js';
@@ -46,6 +54,15 @@ const REPORT_URL = '/api/dev-diagnostics';
 
 /** The endpoint refuses a bigger body, so a report is never built past this. */
 const BODY_LIMIT = 4096;
+/**
+ * A report that carries content travels under its own cap, because the content
+ * is what the archive exists for: text that a take really produced is never
+ * cut. It matches the endpoint's content limit; a body beyond it is refused
+ * and accounted for, never sent short.
+ */
+const CONTENT_BODY_LIMIT = 1048576;
+/** The modes a result or an error report may name; '' is a session error. */
+const MODES = new Set(['', 'live', 'smart', 'verbatim']);
 /** One report carries at most this many boundary events. */
 const EVENTS_LIMIT = 16;
 /** Counters are coalesced into a report at most once per second. */
@@ -158,6 +175,170 @@ function audioBytes(json) {
 }
 
 /* -------------------------------------------------------------------------- */
+/* content helpers                                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A value JSON cannot carry as it is: a cycle, a function, a symbol, an object
+ * whose prototype is not a plain one (a Date, a Map, a class instance — its own
+ * fields are not the value), an array hole or a number that is not finite. It
+ * is never replaced by something else and never dropped: whoever meets it
+ * reports the content as lost, so a report never travels with a piece of the
+ * take quietly missing.
+ */
+const UNSERIALIZABLE = Symbol('unserializable');
+
+/**
+ * A complete copy of one value, at whatever depth it really has: strings,
+ * booleans, finite numbers and null as they are, and every own enumerable
+ * property of a plain object or element of an array rebuilt in full. An
+ * ancestor repeat (a cycle), a non-plain prototype, and a value with no JSON
+ * form are answered with `UNSERIALIZABLE` rather than copied short.
+ */
+function snapshotValue(value, ancestors) {
+  if (value === null) return null;
+  if (typeof value === 'string' || typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : UNSERIALIZABLE;
+  if (typeof value !== 'object') return UNSERIALIZABLE;
+  if (ancestors.includes(value)) return UNSERIALIZABLE;
+  const array = Array.isArray(value);
+  if (!array) {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== null && prototype !== Object.prototype) return UNSERIALIZABLE;
+  }
+  ancestors.push(value);
+  let copy;
+  if (array) {
+    copy = [];
+    for (const item of value) {
+      const nested = snapshotValue(item, ancestors);
+      if (nested === UNSERIALIZABLE) {
+        ancestors.pop();
+        return UNSERIALIZABLE;
+      }
+      copy.push(nested);
+    }
+  } else {
+    copy = {};
+    for (const [name, item] of Object.entries(value)) {
+      const nested = snapshotValue(item, ancestors);
+      if (nested === UNSERIALIZABLE) {
+        ancestors.pop();
+        return UNSERIALIZABLE;
+      }
+      // An own property named `__proto__` is defined, never assigned: assigning
+      // it would reach the copy's prototype instead of the copy, which both
+      // drops the property from the report and pollutes Object.prototype.
+      Object.defineProperty(copy, name, {
+        value: nested,
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+    }
+  }
+  ancestors.pop();
+  return copy;
+}
+
+/**
+ * The frozen whole copy of a value, or null when it has no bounded JSON form.
+ * A structure too deep for the stack is answered the same way: the content is
+ * accounted for as lost instead of thrown into the caller's own callback.
+ */
+function snapshot(value) {
+  try {
+    const copy = snapshotValue(value, []);
+    if (copy === UNSERIALIZABLE) return null;
+    return deepFreeze(copy);
+  } catch {
+    return null;
+  }
+}
+
+/** Freezes a snapshot to its leaves, so what was recorded cannot be changed. */
+function deepFreeze(value) {
+  if (value === null || typeof value !== 'object') return value;
+  for (const nested of Object.values(value)) deepFreeze(nested);
+  return Object.freeze(value);
+}
+
+/**
+ * The catalog descriptor a page re-renders from, copied in full. A value that
+ * is not a descriptor at all — no key, or something that has no JSON form — is
+ * refused, so the report that needed it is accounted for as lost instead.
+ */
+function copyDescriptor(ui) {
+  if (!ui || typeof ui !== 'object' || Array.isArray(ui)) return null;
+  if (typeof ui.key !== 'string' || ui.key === '') return null;
+  return snapshot(ui);
+}
+
+/**
+ * One error report of a take, exactly as the core delivered it. `mode` is a
+ * known mode or '' for a session error; `message` is the text rendered at that
+ * moment; `ui` is the descriptor the page keeps; `diagnostic` carries the raw
+ * text only when the core really handed one over — it is never invented. A
+ * report whose text is not text at all is refused rather than replaced, so the
+ * caller can account for it instead of recording a report that was not made.
+ */
+function errorEntry(mode, message, ui, diagnostic) {
+  const descriptor = copyDescriptor(ui);
+  let text = '';
+  if (message !== undefined && message !== null) {
+    if (typeof message !== 'string') return null;
+    text = message;
+  }
+  if (text === '' && descriptor === null) return null;
+  const entry = {
+    mode: typeof mode === 'string' && MODES.has(mode) ? mode : '',
+    message: text,
+  };
+  if (descriptor !== null) entry.ui = descriptor;
+  if (typeof diagnostic === 'string' && diagnostic !== '') entry.diagnostic = diagnostic;
+  return Object.freeze(entry);
+}
+
+/**
+ * The object `stop()` resolved with, copied whole while the core still holds
+ * it, so the terminal report and the caller see the same values and no later
+ * mutation of either can reach a report that was already built. The three maps
+ * are the whole resolution: a shape the core does not promise is answered with
+ * null, and the caller accounts for that content as lost rather than sending a
+ * repaired or partial resolution.
+ */
+function copyResult(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
+  const results = {};
+  const errors = {};
+  const errorDetails = {};
+  // Results are per mode; errors and their descriptors also name the whole
+  // session with '', the key the core uses for a capture or session failure.
+  for (const [name, target, session] of [['results', results, false], ['errors', errors, true]]) {
+    const map = result[name];
+    if (!map || typeof map !== 'object' || Array.isArray(map)) return null;
+    for (const [mode, text] of Object.entries(map)) {
+      if (!MODES.has(mode) || (!session && mode === '')) return null;
+      if (typeof text !== 'string') return null;
+      target[mode] = text;
+    }
+  }
+  const details = result.errorDetails;
+  if (!details || typeof details !== 'object' || Array.isArray(details)) return null;
+  for (const [mode, ui] of Object.entries(details)) {
+    if (!MODES.has(mode)) return null;
+    const descriptor = copyDescriptor(ui);
+    if (descriptor === null) return null;
+    errorDetails[mode] = descriptor;
+  }
+  return Object.freeze({
+    results: Object.freeze(results),
+    errors: Object.freeze(errors),
+    errorDetails: Object.freeze(errorDetails),
+  });
+}
+
+/* -------------------------------------------------------------------------- */
 /* take reporter                                                               */
 /* -------------------------------------------------------------------------- */
 
@@ -190,6 +371,15 @@ class TakeReporter {
     this.lastReceiveMs = null;
 
     this.events = [];
+    /**
+     * The content of this take: the error reports the core delivered and, once
+     * it resolved, the object `stop()` returned. Both are copied verbatim and
+     * only ever dropped as a whole, never cut down.
+     */
+    this.errors = [];
+    this.result = null;
+    /** True once this take's content was accounted for as lost. */
+    this.contentDisabled = false;
     this.reportIndex = 0;
     /** The immutable payload in flight, and whether one is. */
     this.submitted = null;
@@ -271,6 +461,88 @@ class TakeReporter {
 
   attachSocket(socket) {
     this.socket = socket;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* content                                                           */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * One error report the core really delivered. It is kept verbatim, stamped
+   * with the moment of the callback that raised it — the take's own monotonic
+   * elapsed milliseconds — and the index it was kept at is answered, so the raw
+   * diagnostic a failed start carries in its rejection can complete exactly
+   * this report. A take whose content was already accounted for as lost counts
+   * it there instead of accumulating text that will never leave.
+   */
+  addError(entry) {
+    if (this.closed || this.stopped || this.abandoned) return -1;
+    if (this.contentDisabled) {
+      this.lostReports += 1;
+      this.dirty = true;
+      this.schedule(0);
+      return -1;
+    }
+    const atMs = Math.round(this.elapsed());
+    this.errors.push(Object.freeze({
+      ...entry,
+      atMs: Number.isFinite(atMs) && atMs >= 0 ? atMs : 0,
+    }));
+    this.dirty = true;
+    this.schedule(0);
+    return this.errors.length - 1;
+  }
+
+  /**
+   * Completes one recorded error report with the raw diagnostic the failure
+   * itself handed over. The text is taken from the core's own rejection, so a
+   * report never carries a diagnostic that was not really produced, and the
+   * moment the report was recorded stays exactly the one it was stamped with.
+   */
+  attachDiagnostic(index, diagnostic) {
+    if (this.closed || this.stopped || this.abandoned || this.contentDisabled) return;
+    const entry = this.errors[index];
+    if (!entry || entry.diagnostic !== undefined) return;
+    const completed = errorEntry(entry.mode, entry.message, entry.ui, diagnostic);
+    if (completed === null) return;
+    this.errors[index] = entry.atMs === undefined
+      ? completed
+      : Object.freeze({ ...completed, atMs: entry.atMs });
+    this.dirty = true;
+    this.schedule(0);
+  }
+
+  /**
+   * The object `stop()` resolved with, recorded before the terminal outcome is
+   * settled: the terminal report carries the resolution of the very take whose
+   * outcome it announces. The core promises exactly these three maps, so a
+   * resolution that is not one can only be the observer meeting something it
+   * did not expect: it is accounted for as lost content, never sent repaired or
+   * partial, and the caller's own resolution is not touched either way.
+   */
+  setResult(result) {
+    if (this.closed || this.stopped || this.abandoned || this.contentDisabled) return;
+    const copy = copyResult(result);
+    if (copy === null) {
+      this.loseContent('content_invalid');
+      return;
+    }
+    this.result = copy;
+    // No report is scheduled here: the resolution is carried by the terminal
+    // report, which the take hands over right after this and which is built
+    // from these fields. A body sent before that would carry the resolution
+    // without the outcome it belongs to.
+    this.dirty = true;
+  }
+
+  /** The content this report carries, or null when the take produced none. */
+  content() {
+    if (this.contentDisabled) return null;
+    if (this.result === null && this.errors.length === 0) return null;
+    const content = {};
+    if (this.result !== null) content.result = this.result;
+    if (this.errors.length > 0) content.errors = Object.freeze([...this.errors]);
+    return content;
   }
 
   /* ---------------------------------------------------------------- */
@@ -470,10 +742,40 @@ class TakeReporter {
 
   /**
    * Builds the next report. The index is assigned only after the payload was
-   * proven to fit, so an oversized body is never sent and never retried.
+   * proven to fit, so an oversized body is never sent and never retried. A
+   * report that carries content takes the wide cap; the content itself is
+   * copied once, verbatim, and is never the part that gets cut.
    */
   build() {
-    const scalars = {
+    let scalars = this.scalars();
+    if (!validReport(scalars)) {
+      this.disable();
+      return null;
+    }
+    // The content of this take is built only from what the core really
+    // delivered, and a piece of it that could not be copied was already
+    // accounted for as lost: what is here is whole and of the promised shape.
+    const content = this.content();
+    if (content !== null) {
+      const wide = this.buildContent(scalars, content);
+      if (wide !== null) return wide;
+      // Not one byte of the content may be cut, so the whole report is
+      // accounted for as lost and the take keeps to its counters.
+      this.loseContent('content_overflow');
+      // The loss belongs to the report that follows it: the counters are read
+      // again, so the body that is really sent advertises the lost content.
+      scalars = this.scalars();
+      if (!validReport(scalars)) {
+        this.disable();
+        return null;
+      }
+    }
+    return this.buildNumeric(scalars);
+  }
+
+  /** Every counter, in the order the endpoint's report carries them. */
+  scalars() {
+    return {
       owner: this.owner,
       generation: this.generation,
       reportIndex: this.reportIndex + 1,
@@ -498,16 +800,16 @@ class TakeReporter {
       terminalOutcome: this.terminalOutcome,
       events: this.events,
     };
-    if (!validReport(scalars)) {
-      this.disable();
-      return null;
-    }
+  }
 
+  /**
+   * The counters-only report, under the ordinary cap: the largest prefix of
+   * the bounded events that fits, the rest waiting for the next batch.
+   */
+  buildNumeric(scalars) {
     let events = this.events;
     let body = JSON.stringify({ ...scalars, events });
     if (utf8Bytes(body) > BODY_LIMIT) {
-      // The largest prefix of events that fits; the rest waits for the next
-      // bounded batch. The scalars alone must fit, or the invariant is broken.
       let low = 0;
       let high = events.length;
       while (low < high) {
@@ -530,16 +832,44 @@ class TakeReporter {
         return null;
       }
     }
+    return this.submit(scalars, events, body, null);
+  }
 
+  /**
+   * The report that carries the take's content, under the wide cap. The events
+   * are the droppable part — they are bounded and counted — while the content
+   * is not: a body that cannot hold it whole is refused here, never cut.
+   */
+  buildContent(scalars, content) {
+    let events = this.events;
+    let body = JSON.stringify({ ...scalars, events, ...content });
+    if (utf8Bytes(body) > CONTENT_BODY_LIMIT) {
+      this.eventsDropped += events.length;
+      events = [];
+      body = JSON.stringify({ ...scalars, events, ...content });
+      if (utf8Bytes(body) > CONTENT_BODY_LIMIT) return null;
+    }
+    return this.submit(scalars, events, body, content);
+  }
+
+  /**
+   * Takes the built body: the batch of events it carried is consumed, the index
+   * is spent and the terminal report is the one that ends the take. The payload
+   * is frozen once, so a retry sends exactly these bytes again.
+   */
+  submit(scalars, events, body, content) {
     this.events = this.events.slice(events.length);
     this.reportIndex += 1;
-    // The submitted payload is the one that carries the terminal outcome; the
-    // acknowledgement of exactly this report ends the take.
     if (this.terminalOutcome !== null) this.terminalSent = true;
+    const payload = { ...scalars, events: Object.freeze(events) };
+    if (content !== null) {
+      if (content.result !== undefined) payload.result = content.result;
+      if (content.errors !== undefined) payload.errors = content.errors;
+    }
     return Object.freeze({
       index: this.reportIndex,
       body,
-      payload: Object.freeze({ ...scalars, events: Object.freeze(events) }),
+      payload: Object.freeze(payload),
     });
   }
 
@@ -548,6 +878,24 @@ class TakeReporter {
     const amount = socket && typeof socket.bufferedAmount === 'number' ? socket.bufferedAmount : 0;
     if (!Number.isFinite(amount) || amount <= 0) return 0;
     return Math.min(Number.MAX_SAFE_INTEGER, Math.floor(amount));
+  }
+
+  /**
+   * Content that cannot be delivered whole is lost, never cut: the take is
+   * marked as incomplete through its own counters, one technical warning names
+   * the reason, and no later report of this take may carry content again. The
+   * take advertises that incompleteness once: a repeated signal, or one raised
+   * after the take or its reporting already ended, adds nothing to it.
+   */
+  loseContent(code) {
+    if (this.closed || this.stopped || this.abandoned || this.contentDisabled) return;
+    this.result = null;
+    this.errors = [];
+    this.contentDisabled = true;
+    this.lostReports += 1;
+    this.dirty = true;
+    this.schedule(0);
+    this.warn(0, code);
   }
 
   /** The reporter turns itself off; the capture it observed goes on. */
@@ -966,6 +1314,13 @@ export function createRecorder(handlers = {}) {
   /** The core's state, mirrored from its own callbacks. */
   let mirroredState = 'idle';
   let disposed = false;
+  /**
+   * The error report the core delivered last and the take it belongs to. It is
+   * read once more when a start rejects, because that rejection is what carries
+   * the raw diagnostic: the report is completed only when the rejection names
+   * the very descriptor this report was recorded from.
+   */
+  let lastFailure = null;
 
   function reporterOf(current) {
     return current && current.genuine ? current.reporter : null;
@@ -996,17 +1351,34 @@ export function createRecorder(handlers = {}) {
       // starts belongs to itself, not to the event that called it.
       if (originalState) maskDispatch(() => originalState(next));
     },
-    onError(name, message, ui) {
+    onError(...args) {
+      const [name, message, ui, diagnostic] = args;
       try {
         // A core error raised from a socket callback belongs to the take that
         // socket dispatched for: an error frame or a transport error of a take
-        // that is already over is never counted against a later take.
+        // that is already over is never counted or recorded against a later
+        // take. Only a raw diagnostic the core really passed travels with it.
         const current = dispatchToken ?? token;
-        if (current !== null && current.genuine && current.reporter) current.reporter.error();
+        if (current !== null && current.genuine && current.reporter) {
+          current.reporter.error();
+          const entry = errorEntry(name, message, ui, diagnostic);
+          if (entry === null) {
+            lastFailure = null;
+            // The core delivered something that is not the report it promises,
+            // so this take's content is incomplete: it is accounted for as
+            // lost instead of being recorded in a shape of the observer's own.
+            current.reporter.loseContent('content_invalid');
+          } else {
+            const index = current.reporter.addError(entry);
+            // Remembered for the rejection of a failed start, which is the one
+            // place the core hands over the original raw text of this failure.
+            lastFailure = index < 0 ? null : { token: current, ui, index };
+          }
+        }
       } catch { /* observation never breaks a dictation */ }
-      // The original handler keeps its arguments, its receiver and its own
-      // exceptions, and runs outside the dispatching socket's context.
-      if (originalError) maskDispatch(() => originalError(name, message, ui));
+      // The original handler keeps its receiver, its exact arguments and its
+      // own exceptions, and runs outside the dispatching socket's context.
+      if (originalError) maskDispatch(() => originalError(...args));
     },
   });
 
@@ -1026,6 +1398,24 @@ export function createRecorder(handlers = {}) {
     } catch { /* the capture is unaffected */ }
     if (activeToken === current) activeToken = null;
   }
+
+  /**
+   * A start that fails reports its error first and rejects with the same
+   * descriptor afterwards, carrying the raw text of the original exception on
+   * it. The report is completed from that rejection — and only when it names
+   * the very descriptor this take recorded — so no diagnostic is ever invented
+   * and the caller's rejection itself stays exactly the core's own.
+   */
+  function completeFailure(current, cause) {
+    const failure = lastFailure;
+    lastFailure = null;
+    if (failure === null || failure.token !== current || !current.reporter) return;
+    if (!cause || cause.ui !== failure.ui) return;
+    const diagnostic = typeof cause.diagnosticMessage === 'string' ? cause.diagnosticMessage : '';
+    if (diagnostic === '') return;
+    current.reporter.attachDiagnostic(failure.index, diagnostic);
+  }
+
   function implStart(options = {}) {
     const starting = !disposed && mirroredState === 'idle';
     let current = token;
@@ -1041,7 +1431,12 @@ export function createRecorder(handlers = {}) {
     if (starting && current !== null && current.genuine) {
       promise.then(
         () => {},
-        () => settleTake(current, 'error'),
+        (cause) => {
+          try {
+            completeFailure(current, cause);
+          } catch { /* observation never breaks a dictation */ }
+          settleTake(current, 'error');
+        },
       );
     }
     return promise;
@@ -1056,6 +1451,12 @@ export function createRecorder(handlers = {}) {
     if (genuine) {
       promise.then(
         (result) => {
+          try {
+            // The exact object the core resolved with is recorded before the
+            // terminal outcome is settled, so the terminal report carries the
+            // resolution of the very take whose outcome it announces.
+            if (current.reporter) current.reporter.setResult(result);
+          } catch { /* observation never breaks a dictation */ }
           const failed = Boolean(result && result.errors && Object.keys(result.errors).length > 0);
           settleTake(current, failed ? 'error' : 'success');
         },

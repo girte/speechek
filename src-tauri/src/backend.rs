@@ -49,7 +49,7 @@ use crate::provider::Provider;
 use crate::secrets::SecretKey;
 use crate::settings::{RuntimeSnapshot, SharedRuntime};
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
-use crate::diagnostics::{Diagnostics, Owner, Outcome, RendererReport, ReportAdmission, RequestTrace, Route, SessionKey, RENDERER_REPORT_MAX_BYTES};
+use crate::diagnostics::{ContentFormat, ContentKind, Diagnostics, Owner, Outcome, RendererReport, ReportAdmission, RequestTrace, Route, SessionKey, RENDERER_CONTENT_MAX_BYTES, RENDERER_REPORT_MAX_BYTES};
 
 /* -------------------------------------------------------------------------- */
 /* Constants                                                                  */
@@ -151,6 +151,9 @@ fn redact_string(text: &mut String, keys: &[Arc<SecretKey>]) {
         *text = text.replace(key, "[redacted]");
     }
 }
+
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+pub(crate) use crate::diagnostics::redaction::{diagnostic_json, diagnostic_redact_value, diagnostic_text};
 
 /// Redacts one descriptor in place: every string argument, however deeply nested
 /// behind a nested `UiMessage`, is cleaned against the same ring the message's
@@ -624,6 +627,7 @@ fn diagnostic_trace(
     uri: &Uri,
     session: Option<u64>,
     route: Route,
+    ring: &[Arc<SecretKey>],
 ) -> Option<RequestTrace> {
     let mut key = None;
     for pair in uri.query()?.split('&') {
@@ -640,7 +644,9 @@ fn diagnostic_trace(
     if key.owner == Owner::Dictation && session != Some(key.generation) {
         return None;
     }
-    state.diagnostics.lookup(key)?.request(route)
+    let handle = state.diagnostics.lookup(key)?;
+    handle.remember_keys(ring);
+    handle.request(route)
 }
 
 /// Which audio route is asking; decides what a session tag has to match.
@@ -847,7 +853,7 @@ async fn handle(
         let provider = Arc::clone(&state.provider);
         let ring = Arc::clone(&request.snapshot.keys);
         #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
-        let trace = diagnostic_trace(state, uri, request.session, Route::Live);
+        let trace = diagnostic_trace(state, uri, request.session, Route::Live, request.keys());
         return Ok(upgrade
             .max_message_size(MAX_WS_PAYLOAD)
             .on_upgrade(move |socket| async move {
@@ -917,29 +923,35 @@ async fn handle_diagnostic_report(
     }
     if let Some(length) = headers.get(header::CONTENT_LENGTH) {
         match length.to_str().ok().and_then(|value| value.parse::<u64>().ok()) {
-            Some(length) if length > RENDERER_REPORT_MAX_BYTES as u64 => {
+            Some(length) if length > RENDERER_CONTENT_MAX_BYTES as u64 => {
                 return rejected(StatusCode::PAYLOAD_TOO_LARGE, "report_too_large");
             }
             None => return rejected(StatusCode::BAD_REQUEST, "invalid_report"),
             _ => {}
         }
     }
-    let mut bytes = [0_u8; RENDERER_REPORT_MAX_BYTES];
-    let mut used = 0;
+    let mut bytes = Vec::new();
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else {
             return rejected(StatusCode::BAD_REQUEST, "invalid_report");
         };
-        if chunk.len() > bytes.len() - used {
+        if chunk.len() > RENDERER_CONTENT_MAX_BYTES - bytes.len() {
             return rejected(StatusCode::PAYLOAD_TOO_LARGE, "report_too_large");
         }
-        bytes[used..used + chunk.len()].copy_from_slice(&chunk);
-        used += chunk.len();
+        bytes.extend_from_slice(&chunk);
     }
-    let Ok(report) = serde_json::from_slice::<RendererReport>(&bytes[..used]) else {
+    let Ok(mut report) = serde_json::from_slice::<RendererReport>(&bytes) else {
         return rejected(StatusCode::BAD_REQUEST, "invalid_report");
     };
+    if report.result.is_none() && report.errors.is_empty() && bytes.len() > RENDERER_REPORT_MAX_BYTES {
+        return rejected(StatusCode::PAYLOAD_TOO_LARGE, "report_too_large");
+    }
+    if let Some(handle) = state.diagnostics.lookup(report.key()) {
+        let current = state.runtime.snapshot();
+        handle.remember_keys(current.keys.keys());
+        handle.redact_renderer_content(&mut report);
+    }
     match state.diagnostics.admit_renderer_report(report) {
         ReportAdmission::Accepted => json_response(StatusCode::ACCEPTED, json!({ "accepted": true })),
         ReportAdmission::StaleReport => rejected(StatusCode::OK, "stale_report"),
@@ -1055,6 +1067,7 @@ async fn handle_transcribe(
     let trace = diagnostic_trace(
         state, uri, request.session,
         if mode == "smart" { Route::Smart } else { Route::Verbatim },
+        request.keys(),
     );
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
     if let Some(trace) = &trace {
@@ -1067,6 +1080,16 @@ async fn handle_transcribe(
     ).await;
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
     if let Some(trace) = &trace {
+        match &result {
+            Ok(text) => {
+                trace.content(ContentKind::ProviderResponse, ContentFormat::Json,
+                    diagnostic_json(&json!({ "applicationResult": { "text": text } }), request.keys()));
+            }
+            Err(error) => {
+                trace.content(ContentKind::TransportError, ContentFormat::Json,
+                    diagnostic_json(&json!({ "status": error.status, "code": error.code, "message": error.message, "ui": error.ui }), request.keys()));
+            }
+        }
         trace.finish(if result.is_ok() { Outcome::Success } else { Outcome::Error });
     }
     let text = result?;

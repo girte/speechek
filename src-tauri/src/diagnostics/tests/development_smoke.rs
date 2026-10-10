@@ -11,14 +11,18 @@
 //! * the same frames, served over `/fixture/frames`, are what the browser
 //!   wrapper feeds to the core, so the native tap, the emitted frames and the
 //!   relayed audio are one sample sequence;
-//! * the relay really forwards every frame to a real upstream socket, and the
+//! * the relay really forwards every frame to a real upstream socket; the
 //!   upstream's own boundaries (setup, an interim, a turn, the final tail, one
-//!   close) reach the journal as numbers;
-//! * the renderer's own report is admitted over the real loopback endpoint
-//!   while the take is open, and its boundaries land beside the native ones;
+//!   close) reach the journal as numbers, and the text those frames carried is
+//!   archived beside them complete - the interim, the final and the close
+//!   detail the archive is read back for;
+//! * the renderer's own report, result and errors included, is admitted over
+//!   the real loopback endpoint while the take is open, and its boundaries land
+//!   beside the native ones;
 //! * the take closes exactly once: one verified FLAC whose samples claxon
-//!   decodes to exactly the committed PCM, one manifest, one journal, and no
-//!   secret, transcript, close reason, path or raw body anywhere in them.
+//!   decodes to exactly the committed PCM, one manifest, one journal whose
+//!   content records hold what the take produced in full, and no pinned key, no
+//!   device and no path anywhere in them.
 //!
 //! The child is a real process, the servers are real sockets on ephemeral
 //! loopback ports and the sink is isolated to a scratch root. Everything is
@@ -85,12 +89,21 @@ const BATCH_SOURCE: usize = 128 * 512;
 /// The frames one served batch may carry.
 const BATCH_FRAMES: usize = 128;
 
-/// The synthetic secret, the transcripts and the close reason the fake
-/// upstream uses. None of them may reach the archive.
+/// The synthetic secrets the fake upstream is configured with. Neither may
+/// reach the archive in any form - not as the key itself, not as the text a
+/// JSON document would carry it as and not as the text a query string would.
+/// The second key is shaped so those three forms really are three different
+/// strings: a key the archive leaks in one of them is still a leaked key.
 const SECRET: &str = "synthetic-smoke-secret-key";
+const ESCAPED_SECRET: &str = "synthetic\"secret\\key/+=?&%";
+/// The synthetic transcripts and the close detail the fake upstream uses. Every
+/// one of them is what the take really produced, so every one of them has to be
+/// read back from the archive complete.
 const INTERIM: &str = "synthetic interim transcript";
 const FINAL: &str = "synthetic final transcript";
 const CLOSE_REASON: &str = "synthetic close reason";
+/// Every key the take is pinned with, for the absence scan.
+const PINNED_KEYS: &[&str] = &[SECRET, ESCAPED_SECRET];
 
 /* -------------------------------------------------------------------------- */
 /* Tool and script resolution                                                 */
@@ -551,7 +564,7 @@ impl Drop for Rig {
 /* The smoke                                                                  */
 /* -------------------------------------------------------------------------- */
 
-/// The take's configuration revision: Live, one synthetic key, pinned to the
+/// The take's configuration revision: Live, the synthetic keys, pinned to the
 /// generation the child drives. No environment variable is read on any path.
 fn snapshot() -> Arc<RuntimeSnapshot> {
     Arc::new(RuntimeSnapshot {
@@ -563,9 +576,12 @@ fn snapshot() -> Arc<RuntimeSnapshot> {
             input_device: None,
             language: Language::En,
         },
-        keys: Arc::new(KeyRing::new(vec![Arc::new(SecretKey::new(
-            SECRET.to_owned(),
-        ))])),
+        keys: Arc::new(KeyRing::new(
+            PINNED_KEYS
+                .iter()
+                .map(|key| Arc::new(SecretKey::new((*key).to_owned())))
+                .collect(),
+        )),
         revision: 1,
     })
 }
@@ -774,6 +790,7 @@ pub(crate) fn development_archive_smoke_body() {
     let dir = single_bundle(&scratch.logs());
     verify_archive(&dir);
     verify_journal(&dir);
+    verify_content(&dir);
     verify_privacy(&dir);
     rig.finish();
 }
@@ -952,7 +969,7 @@ fn journal(dir: &Path) -> Vec<Value> {
 
 fn verify_archive(dir: &Path) {
     let manifest = manifest_of(dir);
-    assert_eq!(manifest["schemaVersion"], 1, "{manifest}");
+    assert_eq!(manifest["schemaVersion"], 2, "{manifest}");
     assert_eq!(manifest["owner"], "dictation");
     assert_eq!(manifest["generation"], GENERATION);
     assert_eq!(manifest["mode"], "live");
@@ -1034,7 +1051,7 @@ fn verify_journal(dir: &Path) {
     let mut previous_utc_ms = 0_u64;
     let mut previous_elapsed_us = 0_u64;
     for record in &records {
-        assert_eq!(record["schemaVersion"], 1, "{record}");
+        assert_eq!(record["schemaVersion"], 2, "{record}");
         assert_eq!(record["owner"], "dictation", "{record}");
         assert_eq!(record["generation"], GENERATION, "{record}");
         assert!(record["event"].is_string(), "{record}");
@@ -1271,10 +1288,27 @@ fn verify_journal(dir: &Path) {
 /* Privacy                                                                    */
 /* -------------------------------------------------------------------------- */
 
-/// The journal and the manifest are numbers, classes and enums: no secret, no
-/// transcript, no close reason, no device, no path and no raw body may appear
-/// anywhere under the bundle.
-fn verify_privacy(dir: &Path) {
+/// Every form one pinned key could reach a file in: the key itself, the text a
+/// JSON document would hold it as and the text a query string would.
+fn key_forms(key: &str) -> Vec<String> {
+    let quoted = serde_json::to_string(key).unwrap_or_else(|_| format!("\"{key}\""));
+    let json_escaped = quoted.trim_matches('"').to_owned();
+    let mut percent = String::new();
+    for byte in key.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            percent.push(byte as char);
+        } else {
+            percent.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    let mut forms = vec![key.to_owned(), json_escaped, percent.clone(), percent.to_lowercase()];
+    forms.sort();
+    forms.dedup();
+    forms
+}
+
+/// The bundle files, in name order.
+fn bundle_files(dir: &Path) -> Vec<PathBuf> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .expect("the bundle directory")
         .flatten()
@@ -1282,16 +1316,27 @@ fn verify_privacy(dir: &Path) {
         .filter(|path| path.is_file())
         .collect();
     files.sort();
+    files
+}
+
+/// No pinned key, no device, no path and nothing that is not the take's own
+/// recorded text may appear anywhere under the bundle: the archive holds what
+/// the take produced, in full, and nothing else.
+fn verify_privacy(dir: &Path) {
+    let files = bundle_files(dir);
     assert!(!files.is_empty(), "the bundle has files");
 
-    let forbidden = [SECRET, INTERIM, FINAL, CLOSE_REASON];
+    let forbidden: Vec<String> = PINNED_KEYS
+        .iter()
+        .flat_map(|key| key_forms(key))
+        .collect();
     for file in &files {
         let bytes = std::fs::read(file).expect("a bundle file");
         let text = String::from_utf8_lossy(&bytes);
-        for needle in forbidden {
+        for needle in &forbidden {
             assert!(
-                !text.contains(needle),
-                "{} carries {needle}",
+                !text.contains(needle.as_str()),
+                "{} carries a pinned key in one of its forms",
                 file.display()
             );
         }
@@ -1300,22 +1345,83 @@ fn verify_privacy(dir: &Path) {
             "{} carries its own path",
             file.display()
         );
-        assert!(!text.contains("reportIndex"), "no raw carrier body");
-        assert!(!text.contains("accepted"), "no carrier answer");
-        assert!(
-            !text.contains("\"data\":\""),
-            "no record carries a payload string: {}",
-            file.display()
-        );
     }
+}
 
-    // Records are bounded: nothing in them is a whole body or a base64 frame.
-    for record in journal(dir) {
-        let line = record.to_string();
+/// The content the take really produced, read back from the bundle. The
+/// transcripts its upstream sent, the text the browser was handed and the
+/// detail its one close carried are all present and complete: a body the
+/// archive shortened, redacted or dropped would not be found here.
+fn verify_content(dir: &Path) {
+    let records = journal(dir);
+    let content: Vec<&Value> = records
+        .iter()
+        .filter(|record| record["event"] == "content")
+        .collect();
+    assert!(!content.is_empty(), "the take archived its content");
+
+    let bodies = |kind: &str| -> Vec<String> {
+        content
+            .iter()
+            .filter(|record| record["data"]["kind"] == kind)
+            .filter_map(|record| record["data"]["body"].as_str().map(str::to_owned))
+            .collect()
+    };
+    let carries = |kind: &str, needle: &str| -> bool {
+        bodies(kind).iter().any(|body| body.contains(needle))
+    };
+    let describing = |kind: &str, needle: &str| {
+        let all = bodies(kind);
         assert!(
-            line.len() <= 2_048,
-            "a record is bounded, not a payload: {}",
-            line.len()
+            all.iter().any(|body| body.contains(needle)),
+            "no {kind} record carries its text: {all:?}"
         );
+    };
+    // Both transcripts the fake upstream sent, whole, in the records of the
+    // frames that carried them.
+    describing("live_message", INTERIM);
+    describing("live_message", FINAL);
+    // And the same text as the take handed it to the browser.
+    assert!(
+        carries("live_output", INTERIM) || carries("live_output", FINAL),
+        "the transcript the browser was handed is archived: {:?}",
+        bodies("live_output")
+    );
+    // The recorder's own result, which the wrapper posted in the terminal
+    // report, carries the final transcription it was told.
+    describing("recorder_result", FINAL);
+    // The one close this session got, with the reason it carried.
+    describing("socket_close", CLOSE_REASON);
+
+    // Every record is a whole body: nothing is shortened and nothing is a
+    // payload of a class the archive does not know.
+    for record in content.iter().copied() {
+        assert_eq!(record["schemaVersion"], 2);
+        let kind = record["data"]["kind"].as_str().expect("a content kind");
+        let format = record["data"]["format"].as_str().expect("a content format");
+        let body = record["data"]["body"].as_str().expect("a content body");
+        assert!(!body.is_empty(), "an empty content body: {record}");
+        assert!(matches!(format, "json" | "text"), "{record}");
+        let source = record["source"].as_str().expect("a source class");
+        assert!(
+            ["shell", "capture", "renderer", "relay", "provider", "archive"].contains(&source),
+            "{record}"
+        );
+        assert!(
+            record["data"]["observedUtcMs"].as_u64().is_some(),
+            "{record}"
+        );
+        assert!(
+            record["data"]["observedElapsedUs"].as_u64().is_some(),
+            "{record}"
+        );
+        // A body announced as JSON is JSON: the raw frame or the wrapper's own
+        // object, never a fragment of one.
+        if format == "json" {
+            assert!(
+                serde_json::from_str::<Value>(body).is_ok(),
+                "a json body that is not json: {kind}"
+            );
+        }
     }
 }

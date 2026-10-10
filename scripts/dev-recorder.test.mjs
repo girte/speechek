@@ -48,12 +48,18 @@ const SETTINGS_SOURCE = JSON.stringify({ settings: { language: 'en' }, runtimeRe
 
 /**
  * A unique module tree per fixture: no module cache entry and no global state
- * can survive from one fixture into the next.
+ * can survive from one fixture into the next. A fixture may serve the real core
+ * under another name and put its own `recorder-core.js` in front of it: that
+ * wrapper still runs the untouched recorder, and only the shape it answers a
+ * call with is the fixture's own.
  */
-function makeFixtureTree() {
+function makeFixtureTree(files = null) {
   const root = mkdtempSync(path.join(tmpdir(), FIXTURE_PREFIX));
   writeFileSync(path.join(root, 'dev-recorder.js'), DEV_SOURCE);
-  writeFileSync(path.join(root, 'recorder-core.js'), CORE_SOURCE);
+  writeFileSync(path.join(root, 'recorder-core.js'), files?.core ?? CORE_SOURCE);
+  for (const [name, source] of Object.entries(files?.extra ?? {})) {
+    writeFileSync(path.join(root, name), source);
+  }
   writeFileSync(path.join(root, 'i18n.js'), I18N_SOURCE);
   return root;
 }
@@ -177,7 +183,7 @@ function makeFakeWebSocketClass() {
 function makeHarness(options = {}) {
   const origin = options.origin ?? 'http://127.0.0.1:4173';
 
-  const root = makeFixtureTree();
+  const root = makeFixtureTree(options.files ?? null);
   const restores = [];
 
   /* ---------------------------------------------------------------- */
@@ -487,12 +493,20 @@ async function runUnit() {
       for (const name of ['recorder_start', 'socket_open', 'socket_ready', 'socket_done', 'recorder_stop', 'recorder_idle']) {
         expect(names).toContain(name);
       }
-      // Privacy: no text, URL, key, argument or payload field may travel.
+      // The take's own content now travels: the transcript it produced is in
+      // the terminal report complete and unredacted, while no URL, host,
+      // argument or carrier field ever travels with it.
       const wire = harness.reports.map((entry) => entry.body).join('\n');
-      expect(wire).not.toContain('SECRET_TRANSCRIPT');
+      expect(wire).toContain('SECRET_TRANSCRIPT');
       expect(wire).not.toContain('ws://');
       expect(wire).not.toContain('/api/live');
       expect(wire).not.toContain('127.0.0.1');
+      expect(wire).not.toContain('session=');
+      const terminal = harness.reports
+        .filter((entry) => entry.payload.terminalOutcome !== null).at(-1).payload;
+      expect(terminal.result.results.live).toBe('SECRET_TRANSCRIPT');
+      expect(terminal.result.errors).toEqual({});
+      expect(terminal.result.errorDetails).toEqual({});
       for (const entry of report.events) {
         for (const forbidden of ['message', 'url', 'key', 'text', 'args', 'payload']) {
           expect(Object.prototype.hasOwnProperty.call(entry, forbidden)).toBe(false);
@@ -611,7 +625,25 @@ async function runUnit() {
       const report = harness.reports.at(-1).payload;
       expect(report.terminalOutcome).toBe('error');
       expect(report.errorCount).toBe(1);
-      expect(harness.reports.map((entry) => entry.body).join('\n')).not.toContain('SECRET_SERVICE_DETAIL');
+      // The raw server detail is content now: it travels complete and
+      // unredacted inside the descriptor the page keeps for a re-render.
+      const wire = harness.reports.map((entry) => entry.body).join('\n');
+      expect(wire).toContain('SECRET_SERVICE_DETAIL');
+      expect(report.result.errors.live).toBe(
+        CATALOG.RecorderLiveServiceError.en.replace('{detail}', 'SECRET_SERVICE_DETAIL'),
+      );
+      expect(report.result.errorDetails.live).toEqual({
+        key: 'RecorderLiveServiceError',
+        args: { detail: 'SECRET_SERVICE_DETAIL' },
+      });
+      const reported = report.errors.find((entry) => entry.mode === 'live');
+      expect(reported.ui.args.detail).toBe('SECRET_SERVICE_DETAIL');
+      // The report is time-addressable: it carries the elapsed milliseconds of
+      // the socket callback that raised it, as a real non-negative number.
+      expect(Number.isFinite(reported.atMs)).toBe(true);
+      expect(reported.atMs).toBeGreaterThanOrEqual(0);
+      // The core handed over no raw diagnostic of its own for this report.
+      expect(reported.diagnostic).toBeUndefined();
       recorder.dispose();
     });
   });
@@ -1172,6 +1204,594 @@ async function runUnit() {
       expect(calls[0].message).toBe(CATALOG.RecorderLiveConnectionFailed.en);
       expect(calls[1].ui.key).toBe('RecorderLiveServerTimeout');
       expect(calls[1].message).toBe(CATALOG.RecorderLiveServerTimeout.en);
+      recorder.dispose();
+    });
+  });
+
+  test('a long multi-byte result travels whole, past the ordinary cap', async () => {
+    // Six bytes per unit in UTF-8, far past the numeric cap: the content of a
+    // take is never the part that gets cut.
+    const long = 'é😀'.repeat(3000);
+    expect(new TextEncoder().encode(long).length).toBe(18000);
+    await withHarness({}, async (harness) => {
+      const module = await load(harness);
+      const { recorder, socket } = await boundTake(harness, module, 51);
+      message(socket, { type: 'ready' });
+      feed(recorder, 1);
+      message(socket, { type: 'final', text: long });
+      message(socket, { type: 'done' });
+      const result = await recorder.stop();
+      await harness.advance(1000);
+      expect(result.results.live).toBe(long);
+      // The terminal report is the only one the take sent, and it carries the
+      // whole resolution under the wide cap.
+      expect(harness.reports).toHaveLength(1);
+      const terminal = harness.reports[0];
+      const bytes = new TextEncoder().encode(terminal.body).length;
+      expect(bytes).toBeGreaterThan(4096);
+      expect(bytes).toBeLessThanOrEqual(1048576);
+      const parsed = JSON.parse(terminal.body);
+      expect(parsed.result.results.live).toBe(long);
+      expect(parsed.result.results.live.length).toBe(long.length);
+      expect(parsed.result.errors).toEqual({});
+      expect(parsed.result.errorDetails).toEqual({});
+      expect(parsed.lostReports).toBe(0);
+      expect(terminal.payload.result.results.live).toBe(long);
+      expect(harness.warnings).toEqual([]);
+      await harness.advance(25000);
+      expect(harness.reportCount()).toBe(1);
+      expect(harness.timerCount()).toBe(0);
+      recorder.dispose();
+    });
+  });
+
+  test('a content report in flight keeps its exact bytes across a 429 retry', async () => {
+    await withHarness({
+      report: (_request, count) => ({ status: count <= 2 ? 429 : 202 }),
+    }, async (harness) => {
+      const module = await load(harness);
+      const { recorder, socket } = await boundTake(harness, module, 59);
+      message(socket, { type: 'ready' });
+      feed(recorder, 2);
+      // The take's own error report is content, and it is recorded before the
+      // report that is in flight when the endpoint answers 429.
+      message(socket, { type: 'error', message: 'RETRY_CONTENT_DETAIL' });
+      await harness.advance(1000);
+      await harness.advance(1000);
+      expect(harness.reportCount()).toBe(2);
+      // The retry carried the identical body and the identical index: the
+      // payload is built once and is immutable while it is in flight.
+      expect(harness.reports[1].body).toBe(harness.reports[0].body);
+      expect(harness.reports[1].payload.reportIndex).toBe(harness.reports[0].payload.reportIndex);
+      const parsed = JSON.parse(harness.reports[0].body);
+      expect(parsed.terminalOutcome).toBeNull();
+      expect(parsed.errors).toHaveLength(1);
+      expect(parsed.errors[0].mode).toBe('live');
+      expect(parsed.errors[0].ui.args.detail).toBe('RETRY_CONTENT_DETAIL');
+      expect(harness.reports[0].body).toContain('RETRY_CONTENT_DETAIL');
+      recorder.dispose();
+    });
+  });
+
+  test('a multi-mode resolution is carried whole with its descriptors and its errors', async () => {
+    await withHarness({}, async (harness) => {
+      const module = await load(harness);
+      const { recorder, socket } = await boundTake(harness, module, 52, ['live', 'smart']);
+      message(socket, { type: 'ready' });
+      feed(recorder, 2);
+      message(socket, { type: 'final', text: 'live text' });
+      message(socket, { type: 'done' });
+      const result = await recorder.stop();
+      // The fixture answers the batch route with an empty object, so that mode
+      // really failed: both of its maps belong to the resolution.
+      expect(result.results.live).toBe('live text');
+      expect(Object.keys(result.errors)).toEqual(['smart']);
+      expect(result.errorDetails.smart).toEqual({ key: 'RecorderEmptyText' });
+      await harness.advance(1000);
+
+      const terminal = harness.reports
+        .filter((entry) => entry.payload.terminalOutcome === 'error').at(-1).payload;
+      expect(terminal.result.results.live).toBe('live text');
+      expect(terminal.result.errors.smart).toBe(CATALOG.RecorderEmptyText.en);
+      expect(terminal.result.errorDetails.smart).toEqual({ key: 'RecorderEmptyText' });
+      const reported = terminal.errors.find((entry) => entry.mode === 'smart');
+      expect(reported.message).toBe(CATALOG.RecorderEmptyText.en);
+      expect(reported.ui).toEqual({ key: 'RecorderEmptyText' });
+      // The core handed over no raw diagnostic of its own for this report.
+      expect(reported.diagnostic).toBeUndefined();
+      recorder.dispose();
+    });
+  });
+
+  test('a failed start saves its UI error detail and leaves the caller exception as it was', async () => {
+    await withHarness({}, async (harness) => {
+      const module = await load(harness);
+      harness.useVirtualTimers();
+      const original = new Error('fixture socket failure');
+      const Throwing = class extends harness.FakeWebSocket {
+        constructor() {
+          super('about:blank');
+          throw original;
+        }
+      };
+      const restoreSocket = setGlobal('WebSocket', Throwing);
+      try {
+        const calls = [];
+        const recorder = module.createRecorder({
+          onError(name, message, ui) { calls.push({ name, message, ui, argc: arguments.length }); },
+        });
+        harness.bind('dictation', 53);
+        let failure = null;
+        try {
+          await recorder.start({ external: true, modes: ['live'], sessionId: 53 });
+        } catch (cause) {
+          failure = cause;
+        }
+        // The page catches exactly the core's own failure: the same descriptor
+        // object the handler saw, the same raw text and the same cause.
+        expect(failure).toBeInstanceOf(Error);
+        expect(failure.name).toBe('Error');
+        expect(failure.ui).toEqual({ key: 'RecorderStartFailed', args: { detail: 'fixture socket failure' } });
+        expect(failure.diagnosticMessage).toBe('fixture socket failure');
+        expect(failure.cause).toBe(original);
+        expect(calls).toHaveLength(1);
+        expect(calls[0].argc).toBe(3);
+        expect(calls[0].ui).toBe(failure.ui);
+        expect(calls[0].message).toBe(failure.message);
+
+        await harness.advance(1000);
+        const terminal = harness.reports
+          .filter((entry) => entry.payload.terminalOutcome === 'error').at(-1).payload;
+        expect(terminal.errors).toHaveLength(1);
+        const reported = terminal.errors[0];
+        expect(reported.mode).toBe('');
+        expect(reported.message).toBe(failure.message);
+        expect(reported.ui).toEqual({ key: 'RecorderStartFailed', args: { detail: 'fixture socket failure' } });
+        // The raw diagnostic came from the core's own rejection, not from a
+        // guess about what the failure must have been. The report is stamped
+        // with the moment its callback was raised, before the rejection.
+        expect(reported.diagnostic).toBe('fixture socket failure');
+        expect(Number.isFinite(reported.atMs)).toBe(true);
+        expect(reported.atMs).toBeGreaterThanOrEqual(0);
+        recorder.dispose();
+      } finally {
+        restoreSocket();
+      }
+    });
+  });
+
+  test('a late error of an old socket lands on no later take and on no content', async () => {
+    await withHarness({}, async (harness) => {
+      const module = await load(harness);
+      const { recorder, socket: first } = await boundTake(harness, module, 55);
+      message(first, { type: 'ready' });
+      feed(recorder, 1);
+      message(first, { type: 'final', text: 'first take' });
+      message(first, { type: 'done' });
+      await recorder.stop();
+      await harness.flush();
+
+      harness.bind('dictation', 56);
+      const second = recorder.start({ external: true, modes: ['live'] });
+      await harness.flush();
+      await second;
+      const latest = harness.FakeWebSocket.instances.at(-1);
+      message(latest, { type: 'ready' });
+      feed(recorder, 1);
+      await harness.advance(1000);
+      const open = harness.reports.filter((entry) => entry.payload.generation === 56);
+      expect(open.length).toBeGreaterThan(0);
+      expect(open.every((entry) => entry.payload.errorCount === 0)).toBe(true);
+      expect(open.every((entry) => entry.payload.errors === undefined)).toBe(true);
+
+      // The take that is already over fails afterwards, with a text of its own:
+      // neither its transport error nor its error frame may reach the newest
+      // take's errors, its result or any body of it.
+      first.emit('error');
+      message(first, { type: 'error', message: 'LATE_OLD_FAILURE' });
+      // The newest take keeps recording after that failure: the report it sends
+      // next is still its own, with none of the old socket's error on it.
+      feed(recorder, 1);
+      await harness.advance(1000);
+      const newest = harness.reports.filter((entry) => entry.payload.generation === 56);
+      expect(newest.length).toBeGreaterThan(open.length);
+      for (const entry of newest) {
+        expect(entry.payload.errorCount).toBe(0);
+        expect(entry.payload.errors).toBeUndefined();
+        expect(entry.body).not.toContain('LATE_OLD_FAILURE');
+      }
+      // The take that is already over is over: its own reports carry neither
+      // the late error nor its text.
+      for (const entry of harness.reports.filter((row) => row.payload.generation === 55)) {
+        expect(entry.body).not.toContain('LATE_OLD_FAILURE');
+      }
+
+      // The newest take is dropped, not stopped: its cancelled terminal carries
+      // the failure of the old socket nowhere.
+      recorder.dispose();
+      await harness.advance(1000);
+      const cancelled = harness.reports.filter((entry) => entry.payload.generation === 56).at(-1).payload;
+      expect(cancelled.terminalOutcome).toBe('cancelled');
+      expect(cancelled.errors).toBeUndefined();
+      expect(cancelled.result).toBeUndefined();
+      expect(cancelled.errorCount).toBe(0);
+    });
+  });
+
+  test('content that cannot fit whole is counted as lost, never sent short', async () => {
+    const huge = 'x'.repeat(1200000);
+    await withHarness({}, async (harness) => {
+      const module = await load(harness);
+      const { recorder, socket } = await boundTake(harness, module, 57);
+      message(socket, { type: 'ready' });
+      feed(recorder, 1);
+      message(socket, { type: 'final', text: huge });
+      message(socket, { type: 'done' });
+      const result = await recorder.stop();
+      expect(result.results.live).toBe(huge);
+      await harness.advance(2000);
+
+      const terminal = harness.reports
+        .filter((entry) => entry.payload.terminalOutcome === 'success').at(-1);
+      expect(terminal).toBeDefined();
+      // Not one byte of a report was cut: the take advertised the loss through
+      // its own counters instead, and the counters stayed inside their cap.
+      expect(terminal.payload.result).toBeUndefined();
+      expect(terminal.payload.errors).toBeUndefined();
+      expect(terminal.payload.lostReports).toBeGreaterThan(0);
+      expect(new TextEncoder().encode(terminal.body).length).toBeLessThanOrEqual(4096);
+      for (const entry of harness.reports) expect(entry.body).not.toContain('xxxx');
+      expect(harness.warnings.some((line) => line.includes('content_overflow'))).toBe(true);
+      recorder.dispose();
+    });
+  });
+
+  test('a terminal report with content that is never answered expires whole', async () => {
+    let release = null;
+    await withHarness({
+      report: (_request, count) => (count === 1
+        ? { status: 202 }
+        : new Promise((resolve) => { release = resolve; })),
+    }, async (harness) => {
+      const module = await load(harness);
+      const { recorder, socket } = await boundTake(harness, module, 58);
+      message(socket, { type: 'ready' });
+      feed(recorder, 1);
+      // One heartbeat is acknowledged, so what stalls below is the terminal one.
+      await harness.advance(1000);
+      message(socket, { type: 'final', text: 'expiring content' });
+      message(socket, { type: 'done' });
+      await recorder.stop();
+      await harness.flush();
+      const stalled = harness.reportCount();
+      expect(stalled).toBe(2);
+      // The attempt that is stalled carries the content complete.
+      const attempt = harness.reports.at(-1);
+      expect(JSON.parse(attempt.body).result.results.live).toBe('expiring content');
+
+      // The endpoint never answers: the take's own grace ends its reporting,
+      // and a late answer, a socket event or a callback changes nothing.
+      await harness.advance(25000);
+      expect(harness.reportCount()).toBe(stalled);
+      expect(harness.timerCount()).toBe(0);
+      release?.({ status: 202 });
+      await harness.flush();
+      await harness.advance(5000);
+      expect(harness.reportCount()).toBe(stalled);
+      expect(harness.timerCount()).toBe(0);
+      // Every body that travelled carried the content whole; none was cut.
+      for (const entry of harness.reports) {
+        const parsed = JSON.parse(entry.body);
+        if (parsed.result) expect(parsed.result.results.live).toBe('expiring content');
+      }
+      recorder.dispose();
+    });
+  });
+
+  test('a resolution the core did not promise is advertised as lost, never sent partial', async () => {
+    // The real recorder, wrapped: the untouched core does the whole take, and
+    // only the object it resolves `stop()` with is the fixture's own — a
+    // resolution that names a descriptor which cannot be JSON at all.
+    const wrapper = [
+      "import { createRecorder as createReal } from './recorder-real.js';",
+      'export function createRecorder(handlers = {}) {',
+      '  const core = createReal(handlers);',
+      '  return {',
+      '    start: core.start,',
+      '    acceptPcmChunk: core.acceptPcmChunk,',
+      '    dispose: core.dispose,',
+      '    stop() {',
+      '      return core.stop().then((result) => {',
+      "        const cyclic = { key: 'RecorderEmptyText' };",
+      '        cyclic.args = { detail: cyclic };',
+      '        return { ...result, errorDetails: { live: cyclic } };',
+      '      });',
+      '    },',
+      '  };',
+      '}',
+    ].join('\n');
+    await withHarness({
+      files: { core: wrapper, extra: { 'recorder-real.js': CORE_SOURCE } },
+    }, async (harness) => {
+      const module = await load(harness);
+      const { recorder, socket } = await boundTake(harness, module, 60);
+      message(socket, { type: 'ready' });
+      feed(recorder, 1);
+      message(socket, { type: 'final', text: 'kept' });
+      message(socket, { type: 'done' });
+      const result = await recorder.stop();
+      // The caller got exactly the wrapped resolution: it was never replaced,
+      // repaired or copied into something else.
+      expect(result.results.live).toBe('kept');
+      expect(result.errorDetails.live.args.detail).toBe(result.errorDetails.live);
+      await harness.advance(1000);
+
+      // That content could not travel, so the take advertised it as lost: no
+      // report carried a part of it, and the counters stayed inside their cap.
+      const terminal = harness.reports
+        .filter((entry) => entry.payload.terminalOutcome !== null).at(-1);
+      expect(terminal).toBeDefined();
+      expect(terminal.payload.result).toBeUndefined();
+      expect(terminal.payload.errors).toBeUndefined();
+      expect(terminal.payload.lostReports).toBeGreaterThan(0);
+      expect(terminal.payload.terminalOutcome).toBe('success');
+      expect(new TextEncoder().encode(terminal.body).length).toBeLessThanOrEqual(4096);
+      for (const entry of harness.reports) expect(entry.body).not.toContain('RecorderEmptyText');
+      expect(harness.warnings.some((line) => line.includes('content_invalid'))).toBe(true);
+      recorder.dispose();
+    });
+  });
+
+  test('nested descriptor arguments travel at their real depth', async () => {
+    // A descriptor nested far deeper than a shallow copy would keep: every
+    // level of it has to reach the report. The literal is written into the
+    // fixture's own wrapper, so the untouched core still runs the take. The
+    // whole arguments tree is compared at once, so what the report carries is
+    // exactly the value the core handed over, at whatever depth it had.
+    let deep = { innermost: 'deep value' };
+    for (let level = 0; level < 12; level += 1) deep = { [`l${level}`]: deep };
+    const args = { chain: deep };
+    const literal = JSON.stringify({ key: 'RecorderEmptyText', args });
+    const wrapper = [
+      "import { createRecorder as createReal } from './recorder-real.js';",
+      'export function createRecorder(handlers = {}) {',
+      '  const core = createReal(handlers);',
+      '  return {',
+      '    start: core.start,',
+      '    acceptPcmChunk: core.acceptPcmChunk,',
+      '    dispose: core.dispose,',
+      '    stop() {',
+      '      return core.stop().then((result) => ({',
+      '        ...result,',
+      `        errorDetails: { live: ${literal} },`,
+      '      }));',
+      '    },',
+      '  };',
+      '}',
+    ].join('\n');
+    await withHarness({
+      files: { core: wrapper, extra: { 'recorder-real.js': CORE_SOURCE } },
+    }, async (harness) => {
+      const module = await load(harness);
+      const { recorder, socket } = await boundTake(harness, module, 61);
+      message(socket, { type: 'ready' });
+      feed(recorder, 1);
+      message(socket, { type: 'final', text: 'deep' });
+      message(socket, { type: 'done' });
+      await recorder.stop();
+      await harness.advance(1000);
+      const terminal = harness.reports
+        .filter((entry) => entry.payload.terminalOutcome !== null).at(-1);
+      const parsed = JSON.parse(terminal.body);
+      expect(parsed.result.errorDetails.live.args).toEqual(args);
+      expect(terminal.payload.lostReports).toBe(0);
+      expect(harness.warnings).toEqual([]);
+      recorder.dispose();
+    });
+  });
+
+  test('an own __proto__ field travels as it is and pollutes nothing', async () => {
+    // A descriptor whose own property is literally named `__proto__`, the way
+    // JSON.parse builds one. It has to reach the report as its own field, and
+    // the page's objects must be exactly as they were afterwards.
+    const descriptor = '{"key":"RecorderEmptyText","args":{"__proto__":{"polluted":true},"detail":"kept"}}';
+    const wrapper = [
+      "import { createRecorder as createReal } from './recorder-real.js';",
+      'export function createRecorder(handlers = {}) {',
+      '  const core = createReal(handlers);',
+      '  return {',
+      '    start: core.start,',
+      '    acceptPcmChunk: core.acceptPcmChunk,',
+      '    dispose: core.dispose,',
+      '    stop() {',
+      '      return core.stop().then((result) => ({',
+      '        ...result,',
+      `        errorDetails: { live: JSON.parse(${JSON.stringify(descriptor)}) },`,
+      '      }));',
+      '    },',
+      '  };',
+      '}',
+    ].join('\n');
+    await withHarness({
+      files: { core: wrapper, extra: { 'recorder-real.js': CORE_SOURCE } },
+    }, async (harness) => {
+      harness.useVirtualTimers();
+      const module = await load(harness);
+      const seen = [];
+      const recorder = module.createRecorder({
+        onError(name, message, ui) { seen.push({ receiver: this, argc: arguments.length, ui }); },
+      });
+      harness.bind('dictation', 62);
+      const started = recorder.start({ external: true, modes: ['live'], sessionId: 62 });
+      await harness.flush();
+      await started;
+      const socket = harness.FakeWebSocket.instances.at(-1);
+      message(socket, { type: 'ready' });
+      feed(recorder, 1);
+      // A real core failure, so the page's own handler really runs.
+      message(socket, { type: 'error', message: 'live failed' });
+      message(socket, { type: 'done' });
+      await recorder.stop();
+      await harness.advance(1000);
+
+      const terminal = harness.reports
+        .filter((entry) => entry.payload.terminalOutcome !== null).at(-1);
+      const args = terminal.payload.result.errorDetails.live.args;
+      expect(Object.prototype.hasOwnProperty.call(args, '__proto__')).toBe(true);
+      expect(args.detail).toBe('kept');
+      expect(terminal.body).toContain('"__proto__"');
+      expect(Object.prototype.polluted).toBeUndefined();
+      expect({}.polluted).toBeUndefined();
+      expect(Object.getPrototypeOf(terminal.payload.result.errorDetails.live)).toBe(Object.prototype);
+      // The page's handler kept its receiver and its exact argument count, and
+      // saw the core's own descriptor.
+      expect(seen).toHaveLength(1);
+      expect(seen[0].receiver).toBeUndefined();
+      expect(seen[0].argc).toBe(3);
+      expect(seen[0].ui.key).toBe('RecorderLiveServiceError');
+      recorder.dispose();
+    });
+  });
+
+  test('a descriptor value that is not plain JSON is advertised as lost', async () => {
+    // A Date has a prototype of its own, so its fields are not the value JSON
+    // would carry: the take reports the content lost instead of sending `{}`.
+    const wrapper = [
+      "import { createRecorder as createReal } from './recorder-real.js';",
+      'export function createRecorder(handlers = {}) {',
+      '  const core = createReal(handlers);',
+      '  return {',
+      '    start: core.start,',
+      '    acceptPcmChunk: core.acceptPcmChunk,',
+      '    dispose: core.dispose,',
+      '    stop() {',
+      '      return core.stop().then((result) => ({',
+      '        ...result,',
+      "        errorDetails: { live: { key: 'RecorderEmptyText', args: { when: new Date(0) } } },",
+      '      }));',
+      '    },',
+      '  };',
+      '}',
+    ].join('\n');
+    await withHarness({
+      files: { core: wrapper, extra: { 'recorder-real.js': CORE_SOURCE } },
+    }, async (harness) => {
+      const module = await load(harness);
+      const { recorder, socket } = await boundTake(harness, module, 63);
+      message(socket, { type: 'ready' });
+      feed(recorder, 1);
+      message(socket, { type: 'final', text: 'plain' });
+      message(socket, { type: 'done' });
+      const result = await recorder.stop();
+      expect(result.results.live).toBe('plain');
+      expect(result.errorDetails.live.args.when).toBeInstanceOf(Date);
+      await harness.advance(1000);
+      const terminal = harness.reports
+        .filter((entry) => entry.payload.terminalOutcome !== null).at(-1);
+      expect(terminal.payload.result).toBeUndefined();
+      expect(terminal.payload.errors).toBeUndefined();
+      expect(terminal.payload.lostReports).toBeGreaterThan(0);
+      expect(terminal.body).not.toContain('RecorderEmptyText');
+      expect(harness.warnings.some((line) => line.includes('content_invalid'))).toBe(true);
+      recorder.dispose();
+    });
+  });
+
+  test('a structure too deep to copy is lost, never thrown at the caller', async () => {
+    const wrapper = [
+      "import { createRecorder as createReal } from './recorder-real.js';",
+      'export function createRecorder(handlers = {}) {',
+      '  const core = createReal(handlers);',
+      '  return {',
+      '    start: core.start,',
+      '    acceptPcmChunk: core.acceptPcmChunk,',
+      '    dispose: core.dispose,',
+      '    stop() {',
+      '      return core.stop().then((result) => {',
+      "        let deep = 'end';",
+      '        for (let level = 0; level < 40000; level += 1) deep = { n: deep };',
+      '        return {',
+      '          ...result,',
+      "          errorDetails: { live: { key: 'RecorderEmptyText', args: { chain: deep } } },",
+      '        };',
+      '      });',
+      '    },',
+      '  };',
+      '}',
+    ].join('\n');
+    await withHarness({
+      files: { core: wrapper, extra: { 'recorder-real.js': CORE_SOURCE } },
+    }, async (harness) => {
+      const module = await load(harness);
+      const { recorder, socket } = await boundTake(harness, module, 64);
+      message(socket, { type: 'ready' });
+      feed(recorder, 1);
+      message(socket, { type: 'final', text: 'kept' });
+      message(socket, { type: 'done' });
+      // The stop promise still resolves with the core's own object: copying it
+      // never turns into an exception for the page that awaits it.
+      const result = await recorder.stop();
+      expect(result.results.live).toBe('kept');
+      expect(result.errorDetails.live.args.chain.n.n).toBeDefined();
+      await harness.advance(1000);
+      const terminal = harness.reports
+        .filter((entry) => entry.payload.terminalOutcome === 'success').at(-1);
+      expect(terminal).toBeDefined();
+      // Either the whole chain was copied and travels inside the wide cap, or
+      // it could not be copied and the take advertises the loss: a body that
+      // carries a piece of it only is what must never happen.
+      const parsed = JSON.parse(terminal.body);
+      if (parsed.result === undefined) {
+        expect(terminal.payload.lostReports).toBeGreaterThan(0);
+      } else {
+        expect(parsed.result.results.live).toBe('kept');
+        expect(parsed.result.errorDetails.live.args.chain.n.n.n).toBeDefined();
+        expect(new TextEncoder().encode(terminal.body).length).toBeLessThanOrEqual(1048576);
+      }
+      recorder.dispose();
+    });
+  });
+
+  test('error reports stay time-addressable across reports that accumulate them', async () => {
+    // Two failures of the same take, raised at different moments: the live
+    // socket fails first, the stop finds a recording too short to transcribe
+    // afterwards. Both reach the page, and each keeps the moment its own
+    // callback was raised rather than the moment a report happened to carry it.
+    await withHarness({}, async (harness) => {
+      const module = await load(harness);
+      const { recorder, socket } = await boundTake(harness, module, 65);
+      message(socket, { type: 'ready' });
+      message(socket, { type: 'error', message: 'first failure' });
+      // The take keeps running for a while before its stop: the second failure
+      // belongs to a later moment, and so does its report.
+      await harness.advance(1200);
+      const result = await recorder.stop();
+      expect(Object.keys(result.errors)).toEqual(['live', '']);
+      await harness.advance(1000);
+
+      const terminal = harness.reports
+        .filter((entry) => entry.payload.terminalOutcome !== null).at(-1).payload;
+      expect(terminal.errors).toHaveLength(2);
+      const [first, second] = terminal.errors;
+      expect(first.mode).toBe('live');
+      expect(second.mode).toBe('');
+      for (const entry of terminal.errors) {
+        expect(Number.isFinite(entry.atMs)).toBe(true);
+        expect(entry.atMs).toBeGreaterThanOrEqual(0);
+      }
+      // The order of the reports is the order of their moments, and the second
+      // one really belongs to the later half of this take.
+      expect(first.atMs).toBeLessThan(second.atMs);
+      expect(second.atMs).toBeGreaterThanOrEqual(1200);
+      // Every report that carried errors carried the same stamps: a take's
+      // errors accumulate, so each body's chronology is the leading run of the
+      // final one, and no report ever restamps an error it already carried.
+      const stamps = terminal.errors.map((row) => row.atMs);
+      for (const entry of harness.reports) {
+        const parsed = JSON.parse(entry.body);
+        if (parsed.errors === undefined) continue;
+        expect(stamps.slice(0, parsed.errors.length)).toEqual(parsed.errors.map((row) => row.atMs));
+      }
       recorder.dispose();
     });
   });

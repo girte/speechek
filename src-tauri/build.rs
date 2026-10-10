@@ -25,6 +25,16 @@ fn main() {
     println!("cargo:rerun-if-changed={CATALOG_RELATIVE}");
     // The validator is a module of this script; watch its source explicitly.
     println!("cargo:rerun-if-changed=catalog.rs");
+    // Official previews provide their clean HEAD. The logger records it without
+    // needing the owner to identify which same-version executable was running.
+    // https://doc.rust-lang.org/cargo/reference/build-scripts.html#rustc-env
+    if env::var_os("CARGO_FEATURE_DEV_DIAGNOSTICS").is_some() {
+        println!("cargo:rerun-if-env-changed=SPEECHEK_BUILD_COMMIT");
+        let commit = env::var("SPEECHEK_BUILD_COMMIT").unwrap_or_default();
+        assert!(commit.is_empty() || (commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit())),
+            "SPEECHEK_BUILD_COMMIT must be a full hexadecimal commit SHA");
+        println!("cargo:rustc-env=SPEECHEK_DIAGNOSTIC_COMMIT={commit}");
+    }
     tauri_build::try_build(
         tauri_build::Attributes::new()
             .windows_attributes(

@@ -41,8 +41,8 @@ use crate::{LAB_LABEL, OVERLAY_LABEL};
 
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
 use crate::diagnostics::{
-    CaptureArchive, CaptureAttempt, CaptureStarted, Diagnostics, Event, Outcome, Owner,
-    SessionHandle, SessionKey,
+    CaptureArchive, CaptureAttempt, CaptureStarted, ContentKind, Diagnostics, Event, Outcome,
+    Owner, SessionHandle, SessionKey,
 };
 
 /// Emitted for every captured frame, to the window of the take it belongs to.
@@ -508,6 +508,20 @@ fn failure_key(failure: &AttemptError) -> Option<MessageId> {
     match failure {
         AttemptError::Fallback(error) | AttemptError::Fatal(error) => Some(error.ui.key),
         AttemptError::Ended(_) => None,
+    }
+}
+
+/// The outcome and the full descriptor of a failed attempt. The driver's own
+/// words travel with the descriptor, so a device that would not open, refused
+/// the format or was held by another stream can be read back without
+/// reproducing the failure. Nothing of it is archived before the caller
+/// redacts it against the take's own ring.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn failure_reason(failure: &AttemptError) -> (&'static str, &UiError) {
+    match failure {
+        AttemptError::Fallback(error) => ("fallback", error),
+        AttemptError::Fatal(error) => ("fatal", error),
+        AttemptError::Ended(error) => ("ended", error),
     }
 }
 
@@ -1690,7 +1704,8 @@ struct Attempt<'a> {
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
     attempt_index: u32,
     /// The take's diagnostics handle, looked up once by the worker. Nothing is
-    /// recorded about this attempt without it.
+    /// recorded about this attempt without it, and it redacts every body of the
+    /// attempt against the ring it remembered when the take began.
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
     session: Option<&'a SessionHandle>,
     closed: &'a AtomicU64,
@@ -1725,6 +1740,8 @@ impl Attempt<'_> {
         };
         #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
         timing.opened(&input);
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        self.note_resolution(&input);
         if self.handshake.over(self.closed, self.admission, self.control) {
             // The device answered, but the take is over: it is given back
             // without a stream ever running, so nothing of it is recorded.
@@ -1826,6 +1843,31 @@ impl Attempt<'_> {
         })
     }
 
+    /// The device this attempt resolved, as the archive records it: the id the
+    /// settings named and the id, the name and the source format of the device
+    /// that really answered. A take that recorded from a device nobody asked
+    /// for — the system device standing in for a selected one that was gone —
+    /// or at a format its settings did not name can be told apart from the
+    /// settings alone.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn note_resolution(&self, input: &Input) {
+        let Some(session) = self.session else {
+            return;
+        };
+        let body = serde_json::json!({
+            "stage": "opened",
+            "attempt": self.attempt_index,
+            "fallback": self.fallback,
+            "requested_device": self.selected,
+            "resolved_device_id": input.used_device_id,
+            "resolved_device_name": input.name,
+            "source_format": input.format.to_string(),
+            "source_rate": input.rate,
+            "source_channels": input.channels,
+        });
+        let _ = session.redacted_content_json(ContentKind::CaptureContext, &body);
+    }
+
     /// One device attempt, as the take's journal records it: the numbers of the
     /// attempt and, for one that failed, the catalog key of its reason. The
     /// device's own name and its driver's words never travel through here.
@@ -1839,6 +1881,26 @@ impl Attempt<'_> {
                 failure.and_then(failure_key),
             ));
         }
+        // A failed attempt leaves the reason the numeric event cannot carry:
+        // the descriptor the renderer would have shown, with the driver's own
+        // words in it, redacted against the take's ring before it is archived.
+        let Some((outcome, error)) = failure.map(failure_reason) else {
+            return;
+        };
+        let Some(session) = self.session else {
+            return;
+        };
+        let body = serde_json::json!({
+            "stage": "failed",
+            "attempt": self.attempt_index,
+            "fallback": self.fallback,
+            "requested_device": self.selected,
+            "outcome": outcome,
+            "code": error.code,
+            "message": error.message,
+            "ui": { "key": error.ui.key, "args": error.ui.args },
+        });
+        let _ = session.redacted_content_json(ContentKind::CaptureContext, &body);
     }
 }
 
@@ -2155,8 +2217,10 @@ fn session_thread(
     let state = app.state::<NativeCapture>();
     // The take's diagnostics handle, looked up once, before the first device is
     // asked for anything: every attempt, the start record and the archive of
-    // this capture read it from here. A build without the diagnostics never
-    // looks anything up.
+    // this capture read it from here, and it redacts every body against the ring
+    // it remembered when the take began — never a ring read later, when a save
+    // may have replaced the running revision. A build without the diagnostics
+    // looks nothing up.
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
     let session = diagnostics_session(&app, owner);
     let mut reservation = Reservation {
@@ -2351,6 +2415,22 @@ fn session_thread(
             Outcome::Abandoned
         };
         opened.encoder.finish_diagnostics(outcome);
+    }
+    // A device that failed while the take was recording is the other failure
+    // the numeric events cannot carry: the same descriptor the renderer is
+    // about to be shown, redacted against the ring this capture was started
+    // under, so a stream that stopped on its own can be read back with the
+    // driver's own words in it.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if let (Some(error), Some(session)) = (&failure, &session) {
+        let body = serde_json::json!({
+            "stage": "stream-failed",
+            "outcome": "error",
+            "code": error.code,
+            "message": error.message,
+            "ui": { "key": error.ui.key, "args": error.ui.args },
+        });
+        let _ = session.redacted_content_json(ContentKind::CaptureContext, &body);
     }
     if let Some(error) = &failure {
         mic_error(&app, owner, error);

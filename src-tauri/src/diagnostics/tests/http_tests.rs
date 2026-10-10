@@ -66,10 +66,16 @@ fn unique() -> u64 {
 fn now() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)
 }
-
 /// One configuration revision with a synthetic key: the router only reads it
 /// for the audio routes, and nothing here ever calls one.
 fn snapshot() -> Arc<RuntimeSnapshot> {
+    snapshot_with_keys(&["synthetic-carrier-key"], 1)
+}
+
+/// The same revision, built from the keys and the revision a test is about:
+/// the redaction case moves the configuration on and needs to name both the
+/// key a take still remembers and the one the runtime uses now.
+fn snapshot_with_keys(keys: &[&str], revision: u64) -> Arc<RuntimeSnapshot> {
     Arc::new(RuntimeSnapshot {
         settings: Settings {
             hotkey: "F2".to_owned(),
@@ -79,17 +85,24 @@ fn snapshot() -> Arc<RuntimeSnapshot> {
             input_device: None,
             language: Language::En,
         },
-        keys: Arc::new(KeyRing::new(vec![Arc::new(SecretKey::new(
-            "synthetic-carrier-key".to_owned(),
-        ))])),
-        revision: 1,
+        keys: Arc::new(KeyRing::new(
+            keys.iter()
+                .map(|key| Arc::new(SecretKey::new((*key).to_owned())))
+                .collect(),
+        )),
+        revision,
     })
 }
 
-/// The real router on an ephemeral loopback port, plus the sink behind it.
+/// The real router on an ephemeral loopback port, plus the sink and the
+/// configuration behind it.
 struct App {
     port: u16,
     diagnostics: Arc<Diagnostics>,
+    /// The same revision the router reads, so a test can move the
+    /// configuration on and prove what the endpoint does with the keys a take
+    /// no longer uses.
+    runtime: Arc<SharedRuntime>,
     serving: tokio::task::JoinHandle<()>,
 }
 
@@ -115,13 +128,19 @@ async fn app(scratch: &Scratch) -> App {
         .local_addr()
         .expect("the bound address")
         .port();
-    let router = diagnostic_test_router(runtime, provider, Arc::clone(&diagnostics), port);
+    let router = diagnostic_test_router(
+        Arc::clone(&runtime),
+        provider,
+        Arc::clone(&diagnostics),
+        port,
+    );
     let serving = tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });
     App {
         port,
         diagnostics,
+        runtime,
         serving,
     }
 }
@@ -218,6 +237,42 @@ fn refused(text: &str, code: &str) -> bool {
     text.contains("\"accepted\":false") && text.contains(&format!("\"code\":\"{code}\""))
 }
 
+/// The cap the endpoint reads a body against: the transport bound, not the
+/// bound a report's own numbers are held to. It is the endpoint's own constant,
+/// so this test cannot drift from the limit it is testing.
+const BODY_CAP: usize = RENDERER_CONTENT_MAX_BYTES;
+
+/// The report body with one request's message and header, for a body this test
+/// built itself.
+fn post_head(app: &App, length: usize) -> String {
+    format!(
+        "POST /api/dev-diagnostics HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: {}\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n",
+        app.port,
+        app.origin(),
+    )
+}
+
+/// One report carrying the wrapper's own content beside its numbers: the
+/// `result` object and the `errors` array a terminal report may add.
+fn content_report(owner: &str, generation: u64, index: u64, result: Value, errors: &[Value]) -> Value {
+    let mut body = report(owner, generation, index);
+    body["result"] = result;
+    body["errors"] = Value::Array(errors.to_vec());
+    body
+}
+
+/// The wrapper's own `result`: one map of mode-keyed text beside the error maps
+/// the same object always carries. A result is all three maps or it is not a
+/// result, so every positive fixture is built from this and a negative one
+/// deviates from it in exactly one way.
+fn content_result(mode: &str, text: &str) -> Value {
+    json!({
+        "results": { mode: text },
+        "errors": {},
+        "errorDetails": {},
+    })
+}
+
 /// The same head with `Content-Type` replaced, for the type table.
 fn head_with_type(app: &App, kind: &str, length: usize) -> String {
     format!(
@@ -225,6 +280,23 @@ fn head_with_type(app: &App, kind: &str, length: usize) -> String {
         app.port,
         app.origin(),
     )
+}
+
+/// The one renderer report an accepted POST left in the shared metadata queue.
+/// The queue is a FIFO that also carries the take's own records - its
+/// `session_begin` first of all - so the whole queue is drained and the report
+/// is found among what it held, rather than read off the head. Draining it
+/// also releases the content budget the queued report held, exactly as the
+/// writer's own drain does.
+fn take_renderer(diagnostics: &Diagnostics) -> RendererReport {
+    diagnostics
+        .take_meta(usize::MAX)
+        .into_iter()
+        .find_map(|pending| match pending.meta {
+            Meta::Renderer(report) => Some(report),
+            _ => None,
+        })
+        .expect("the queued renderer report")
 }
 
 fn chunked_head(app: &App) -> String {
@@ -384,11 +456,14 @@ async fn a_declared_body_over_the_cap_is_refused_before_it_is_read() {
     let scratch = Scratch::new("declared-size");
     let app = app(&scratch).await;
     // The declared length alone refuses it: no body byte is ever sent, so a
-    // server that had to read the body first could not answer at all.
+    // server that had to read the body first could not answer at all. The bound
+    // is the transport's: a body is read before anything can be said about
+    // whether the report inside it carries content of its own.
     let head = format!(
-        "POST /api/dev-diagnostics HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: {}\r\nContent-Type: application/json\r\nContent-Length: 4097\r\nConnection: close\r\n\r\n",
+        "POST /api/dev-diagnostics HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         app.port,
         app.origin(),
+        BODY_CAP + 1,
     );
     let (status, text) = app.request(&head, &[]).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE.as_u16());
@@ -396,13 +471,8 @@ async fn a_declared_body_over_the_cap_is_refused_before_it_is_read() {
 
     // Exactly the cap is admitted to parsing and refused for what it is, which
     // is what makes the limit a `>` and not a `>=`.
-    let body = vec![b' '; 4_096];
-    let head = format!(
-        "POST /api/dev-diagnostics HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nOrigin: {}\r\nContent-Type: application/json\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n",
-        app.port,
-        app.origin(),
-    );
-    let (status, text) = app.request(&head, &body).await;
+    let body = vec![b' '; BODY_CAP];
+    let (status, text) = app.request(&post_head(&app, BODY_CAP), &body).await;
     assert_eq!(status, StatusCode::BAD_REQUEST.as_u16(), "{text}");
     assert!(refused(&text, "invalid_report"), "{text}");
 }
@@ -415,10 +485,11 @@ async fn a_chunked_body_is_counted_as_it_arrives() {
     // The take this batch belongs to: one registered key for the whole test,
     // which the rejected oversize body never reaches.
     let _take = begin(&app.diagnostics, Owner::Lab, 3);
-
     // A chunked body past the cap: there is no length to trust, so the running
-    // total is what refuses it.
-    let oversize = chunked(&[vec![b' '; 1_500], vec![b' '; 1_500], vec![b' '; 1_500]]);
+    // total is what refuses it. Each chunk is well under the cap; only the
+    // running total crosses it, and the refusal comes while it is still
+    // arriving rather than after the whole body was held.
+    let oversize = chunked(&[vec![b' '; BODY_CAP / 2 + 1], vec![b' '; BODY_CAP / 2]]);
     let (status, text) = app.request(&chunked_head(&app), &oversize).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE.as_u16(), "{text}");
     assert!(refused(&text, "report_too_large"), "{text}");
@@ -741,4 +812,202 @@ async fn an_unusable_sink_answers_that_it_is_unusable() {
     assert_eq!(status, StatusCode::GONE.as_u16(), "{text}");
     assert!(refused(&text, "stale_session"), "{text}");
     assert_eq!(handle.key().generation, 11);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Content                                                                    */
+/* -------------------------------------------------------------------------- */
+//
+// A terminal report may carry the wrapper's own content beside its numbers:
+// the `result` object and the `errors` array. That is a report the numeric
+// bound never fit, so the two bounds are separate - the transport bound that
+// refuses a body before it is read, and the bound an ordinary report's numbers
+// are held to once the body has been parsed.
+
+#[tokio::test]
+async fn a_report_with_content_past_the_numeric_bound_is_still_admitted() {
+    let scratch = Scratch::new("content-bound");
+    let app = app(&scratch).await;
+    let _take = begin(&app.diagnostics, Owner::Lab, 20);
+
+    // A body far past the bound a report's numbers are held to, carried by the
+    // one shape that may be that large: a terminal report with the wrapper's
+    // own result.
+    let long = "synthetic final transcription ".repeat(400);
+    let body = content_report("lab", 20, 1, content_result("live", &long), &[]);
+    let encoded = serde_json::to_vec(&body).expect("the report encoding");
+    assert!(
+        encoded.len() > RENDERER_REPORT_MAX_BYTES,
+        "the body really is past the numeric bound"
+    );
+    let (status, text) = app.post(&body).await;
+    assert_eq!(status, StatusCode::ACCEPTED.as_u16(), "{text}");
+    assert!(accepted(&text), "{text}");
+
+    // The report was taken whole: the queued record carries the content the
+    // wrapper sent, not a fragment of it.
+    let report = take_renderer(&app.diagnostics);
+    let stored = report.result.expect("the result it carried").to_string();
+    assert!(
+        stored.len() > RENDERER_REPORT_MAX_BYTES,
+        "the result was not shortened"
+    );
+    assert!(stored.contains("synthetic final transcription"), "{stored}");
+}
+
+#[tokio::test]
+async fn an_ordinary_report_past_the_numeric_bound_is_refused() {
+    let scratch = Scratch::new("ordinary-bound");
+    let app = app(&scratch).await;
+    let _take = begin(&app.diagnostics, Owner::Lab, 21);
+
+    // No content of its own: the numbers of an ordinary report are held to the
+    // numeric bound exactly as they always were. The padding is legal JSON
+    // whitespace, so what refuses it is the bound and not the parse.
+    let mut encoded = serde_json::to_vec(&report("lab", 21, 1)).expect("the report encoding");
+    assert!(encoded.len() < RENDERER_REPORT_MAX_BYTES);
+    encoded.extend(std::iter::repeat(b' ').take(RENDERER_REPORT_MAX_BYTES + 1 - encoded.len()));
+    assert_eq!(encoded.len(), RENDERER_REPORT_MAX_BYTES + 1);
+    let (status, text) = app.request(&post_head(&app, encoded.len()), &encoded).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE.as_u16(), "{text}");
+    assert!(refused(&text, "report_too_large"), "{text}");
+
+    // Exactly the numeric bound is admitted to parsing and refused for what it
+    // is, which is what makes that limit a `>` and not a `>=`.
+    let body = vec![b' '; RENDERER_REPORT_MAX_BYTES];
+    let (status, text) = app.request(&post_head(&app, body.len()), &body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST.as_u16(), "{text}");
+    assert!(refused(&text, "invalid_report"), "{text}");
+}
+
+#[tokio::test]
+async fn content_of_an_unknown_shape_is_refused() {
+    let scratch = Scratch::new("content-shape");
+    let app = app(&scratch).await;
+    let _take = begin(&app.diagnostics, Owner::Lab, 22);
+
+    // An unknown key beside the three maps a result is: the result is exactly
+    // those three keys, so a body that carries a stranger is refused rather
+    // than stored, and the refusal never reflects what it refused.
+    let body = content_report(
+        "lab",
+        22,
+        1,
+        json!({
+            "results": {},
+            "errors": {},
+            "errorDetails": {},
+            "transcript": "synthetic-transcript",
+        }),
+        &[],
+    );
+    let (status, text) = app.post(&body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST.as_u16(), "{text}");
+    assert!(refused(&text, "invalid_report"), "{text}");
+    assert!(!text.contains("synthetic-transcript"), "{text}");
+
+    // A mode the wrapper never sends, in an otherwise complete result.
+    let body = content_report(
+        "lab",
+        22,
+        2,
+        json!({ "results": { "bogus": "x" }, "errors": {}, "errorDetails": {} }),
+        &[],
+    );
+    let (status, text) = app.post(&body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST.as_u16(), "{text}");
+    assert!(refused(&text, "invalid_report"), "{text}");
+
+    // A result that is not an object at all.
+    let body = content_report("lab", 22, 3, json!("not-a-result"), &[]);
+    let (status, text) = app.post(&body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST.as_u16(), "{text}");
+    assert!(refused(&text, "invalid_report"), "{text}");
+
+    // An error descriptor with a key of its own.
+    let body = content_report(
+        "lab",
+        22,
+        4,
+        content_result("live", "x"),
+        &[json!({ "mode": "live", "message": "synthetic", "extra": 1 })],
+    );
+    let (status, text) = app.post(&body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST.as_u16(), "{text}");
+    assert!(refused(&text, "invalid_report"), "{text}");
+
+    // An error descriptor with no message: the mode alone is not a descriptor.
+    let body = content_report("lab", 22, 5, content_result("live", "x"), &[json!({ "mode": "live" })]);
+    let (status, text) = app.post(&body).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST.as_u16(), "{text}");
+    assert!(refused(&text, "invalid_report"), "{text}");
+
+    // The shapes that are content at all are served, so the refusals above are
+    // about the shape and not about content in general: one empty result whose
+    // global error key is filled, and one result whose `errorDetails` carries
+    // the wrapper's descriptor.
+    let body = content_report(
+        "lab",
+        22,
+        6,
+        json!({ "results": {}, "errors": { "": "the whole session failed" }, "errorDetails": {} }),
+        &[json!({ "mode": "live", "message": "the live socket closed" })],
+    );
+    let (status, text) = app.post(&body).await;
+    assert!(accepted(&text), "{status}: {text}");
+
+    let body = content_report(
+        "lab",
+        22,
+        7,
+        json!({
+            "results": { "live": "the final tail" },
+            "errors": {},
+            "errorDetails": { "live": { "key": "RecorderLiveServiceError", "args": { "detail": "synthetic" } } },
+        }),
+        &[json!({ "mode": "live", "message": "the live socket closed", "atMs": 12.5 })],
+    );
+    let (status, text) = app.post(&body).await;
+    assert!(accepted(&text), "{status}: {text}");
+}
+
+#[tokio::test]
+async fn a_key_a_take_still_remembers_is_redacted_from_a_later_report() {
+    let scratch = Scratch::new("content-redact");
+    let app = app(&scratch).await;
+
+    // A key an earlier revision used. It is shaped so that the raw text, the
+    // text a JSON document holds and the text a query string carries are three
+    // different strings: a key removed in only one of those forms is still in
+    // the archive.
+    let retired = "retired\"secret\\key/+=?&%";
+    let take = begin(&app.diagnostics, Owner::Lab, 23);
+    take.remember_keys(&[Arc::new(SecretKey::new(retired.to_owned()))]);
+    // The runtime moves on: the retired key is not one of the current ones, so
+    // only the take's own memory of it can redact it.
+    app.runtime
+        .publish(snapshot_with_keys(&["current-synthetic-key"], 2));
+
+    let escaped = serde_json::to_string(retired)
+        .expect("the escaped key")
+        .trim_matches('"')
+        .to_owned();
+    let percent = "retired%22secret%5Ckey%2F%2B%3D%3F%26%25";
+    let value = format!("raw {retired} escaped {escaped} percent {percent}");
+
+    // The report is admitted, and what is queued beside its numbers is the
+    // sanitized result: the endpoint redacts before the record ever exists.
+    let body = content_report("lab", 23, 1, content_result("live", &value), &[]);
+    let (status, text) = app.post(&body).await;
+    assert_eq!(status, StatusCode::ACCEPTED.as_u16(), "{text}");
+    assert!(accepted(&text), "{text}");
+
+    let report = take_renderer(&app.diagnostics);
+    let stored = report.result.expect("the result it carried").to_string();
+    for form in [retired, escaped.as_str(), percent] {
+        assert!(
+            !stored.contains(form),
+            "a retired key survived the endpoint in one of its forms: {stored}"
+        );
+    }
 }

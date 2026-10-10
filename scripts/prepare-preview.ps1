@@ -175,6 +175,7 @@ if (-not $cargoPath) { throw "cargo was not found on PATH; install rustup." }
 $vs = Get-SpeechekVsEnvironment $repoRoot
 Write-Host "vs         : $($vs.InstallPath)"
 $childEnvironment = New-SpeechekPreviewEnvironment -Vs $vs
+$childEnvironment['SPEECHEK_BUILD_COMMIT'] = $commit
 
 # The cargo probe and every build step use the same child map.
 $cargoProbe = Get-SpeechekProcessResult -FilePath $cargoPath -Arguments @('--version') `

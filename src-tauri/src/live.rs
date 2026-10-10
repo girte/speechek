@@ -16,6 +16,18 @@
 //! transcript (6 s once a final was already seen), 900 ms/600 ms settle windows, an
 //! 11-minute session cap, a 10-minute audio cap and a 700 s idle timeout. Deadlines
 //! are absolute here, so a stalled environment cannot move them.
+//!
+//! Development diagnostics may also archive the session's content: the setup
+//! frame as it was sent together with the pinned rotation entry this socket
+//! bound - its 1-based ordinal and the ring's key count, never the key - every
+//! frame that arrived from the upstream - parsed or not - every message written
+//! back to the browser, the upstream's close and every transport failure. Each
+//! record is already redacted against the ring the socket was bound to, and
+//! every hook is gated on
+//! `all(debug_assertions, feature = "dev-diagnostics")` and on a traced request,
+//! so a production build and an untraced take build nothing. Nothing here reads
+//! audio: the recording itself is archived as PCM16 by the capture side, never
+//! again as the base64 this relay forwards.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,11 +40,16 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::protocol::Message as UpstreamMessage;
 
 use crate::backend::{redact, redact_ui};
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+use crate::backend::{diagnostic_json, diagnostic_text};
 use crate::i18n::{render, Language, MessageId, UiMessage};
 use crate::provider::Provider;
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+use crate::provider::key_ordinal;
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
 use crate::diagnostics::{
-    DeadlineTimer, Outcome, ReceiveFlags, RequestCause, RequestTrace, SendKind, UpstreamKind,
+    ContentFormat, ContentKind, DeadlineTimer, Outcome, ReceiveFlags, RequestCause, RequestTrace,
+    SendKind, UpstreamKind,
 };
 use crate::secrets::{KeyRing, SecretKey};
 
@@ -351,8 +368,9 @@ fn receive_flags(message: &Value) -> ReceiveFlags {
 }
 
 /// The `goAway.timeLeft` the upstream announced, as a duration: the API sends
-/// seconds, as a number or as `"<n>s"`. Anything else is no duration at all -
-/// a string never reaches the sink.
+/// seconds, as a number or as `"<n>s"`. Anything else is no duration at all.
+/// This is the numeric half of the metadata only; the frame's own text is
+/// archived as content where it arrives.
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
 fn go_away_time_left(message: &Value) -> Option<Duration> {
     let value = message.get("goAway")?.get("timeLeft")?;
@@ -406,6 +424,150 @@ fn send_pcm_bytes(payload: &Value) -> u64 {
         .and_then(Value::as_str)
         .map(|data| base64_byte_length(data).max(0) as u64)
         .unwrap_or(0)
+}
+
+/* -------------------------------------------------------------------------- */
+/* Content evidence                                                           */
+/* -------------------------------------------------------------------------- */
+/*
+ * What the archive is told, and in what shape. Every one of these is gated the
+ * same way and computes nothing when the request has no trace: with production
+ * or an untraced take, none of the strings below is even built.
+ *
+ * Redaction always borrows the pinned ring - the whole revision the socket was
+ * bound to, not only the key this socket chose - so a key another member of the
+ * ring could be quoted with is masked in its raw, JSON-escaped and
+ * percent-encoded spellings alike.
+ */
+
+/// One frame from the upstream, archived as the exact text that arrived and
+/// before the relay parses, uses or discards it: `setupComplete`, usage, an
+/// unknown shape, an error payload and a frame that is not JSON at all are all
+/// evidence, and a malformed frame is exactly the one worth keeping.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_upstream_frame(state: &Relay, raw: &str) {
+    let Some(trace) = state.trace.as_ref() else {
+        return;
+    };
+    let body = match serde_json::from_str::<Value>(raw) {
+        Ok(value) => diagnostic_json(&value, state.ring.keys()),
+        Err(_) => diagnostic_text(raw, state.ring.keys()),
+    };
+    trace.content(ContentKind::LiveMessage, ContentFormat::Json, body);
+}
+
+/// One frame from the upstream that is not UTF-8 text: what went wrong is the
+/// encoding, so the record names the byte count instead of inventing text.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_undecodable_frame(state: &Relay, bytes: usize) {
+    let Some(trace) = state.trace.as_ref() else {
+        return;
+    };
+    trace.content(
+        ContentKind::LiveMessage,
+        ContentFormat::Json,
+        format!("{{\"non_utf8_bytes\":{bytes}}}"),
+    );
+}
+
+/// One message the relay wrote to the browser, archived as the exact JSON text
+/// it sent: `ready`, `interim`, `final`, `error` and `done`. What the browser
+/// received is therefore reconstructible without a second recorder.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_browser_message(state: &Relay, payload: &Value) {
+    let Some(trace) = state.trace.as_ref() else {
+        return;
+    };
+    trace.content(
+        ContentKind::LiveOutput,
+        ContentFormat::Json,
+        diagnostic_json(payload, state.ring.keys()),
+    );
+}
+
+/// What the Live API was opened with: the setup frame as it was sent, field
+/// for field, redacted the same way, plus which pinned rotation entry this
+/// socket bound - a 1-based ordinal and the ring's key count, never the key
+/// itself. The send is already counted numerically; this is the configuration
+/// those counts belong to, and the entry a 401/429 on this socket came from.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_setup(state: &Relay, setup: &Value) {
+    let Some(trace) = state.trace.as_ref() else {
+        return;
+    };
+    let ring = state.ring.keys();
+    trace.content(
+        ContentKind::LiveSetup,
+        ContentFormat::Json,
+        diagnostic_json(
+            &json!({
+                "frame": setup,
+                "key_ordinal": key_ordinal(&state.key, ring),
+                "ring_keys": ring.len(),
+            }),
+            ring,
+        ),
+    );
+}
+
+/// The upstream's close, archived at the frame that carried it and before any
+/// UI wording is derived from it: the code and the reason text as they arrived.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_close(state: &Relay, code: u16, reason: &str) {
+    let Some(trace) = state.trace.as_ref() else {
+        return;
+    };
+    trace.content(
+        ContentKind::SocketClose,
+        ContentFormat::Json,
+        diagnostic_json(&json!({ "code": code, "reason": reason }), state.ring.keys()),
+    );
+}
+
+/// One transport failure, in full and redacted: the whole rendered source chain
+/// - a top message such as a socket error often hides its actual cause - with
+/// every URL it names masked before anything else, because those URLs carry the
+/// key in their query, and with every spelling of every key of the pinned ring
+/// redacted. No header ever reaches this call.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_transport_error(state: &Relay, detail: &str) {
+    let Some(trace) = state.trace.as_ref() else {
+        return;
+    };
+    trace.content(
+        ContentKind::TransportError,
+        ContentFormat::Text,
+        diagnostic_text(&mask_urls(detail), state.ring.keys()),
+    );
+}
+
+/// Replaces every `ws://`/`wss://` URL inside one diagnostic with `[url]`: a
+/// socket error may quote the address the relay dialed, and that address holds
+/// the key. The scan stops at whitespace or a quote, so it never swallows the
+/// wording around the URL.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn mask_urls(detail: &str) -> String {
+    const SCHEMES: [&str; 2] = ["wss://", "ws://"];
+
+    let mut masked = String::with_capacity(detail.len());
+    let mut rest = detail;
+    loop {
+        let next = SCHEMES
+            .iter()
+            .filter_map(|scheme| rest.find(*scheme))
+            .min();
+        let Some(start) = next else {
+            masked.push_str(rest);
+            return masked;
+        };
+        masked.push_str(&rest[..start]);
+        masked.push_str("[url]");
+        let url = &rest[start..];
+        let end = url
+            .find(|character: char| character.is_whitespace() || character == '"')
+            .unwrap_or(url.len());
+        rest = &url[end..];
+    }
 }
 
 /// What woke the loop. The sockets are borrowed by the select's futures only, so the
@@ -620,6 +782,8 @@ async fn open_upstream(
         Ok(Err(error)) => {
             #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
             note_cause(state, RequestCause::SetupFailed);
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_transport_error(state, &crate::provider::transport_chain_text(&error));
             let ui = UiMessage::new(MessageId::LiveConnectFailed)
                 .with_arg("detail", json!(error.to_string()));
             fail(socket, upstream, state, ui).await;
@@ -640,7 +804,12 @@ async fn open_upstream(
     };
 
     // The setup frame is a send like any other: it is marked in flight before
-    // it is awaited, so a setup write that never returns is visible too.
+    // it is awaited, so a setup write that never returns is visible too. The
+    // payload is built once here, so the configuration the archive keeps is the
+    // exact one this send writes.
+    let setup = setup_payload(mode);
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    note_setup(state, &setup);
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
     if let Some(trace) = state.trace.as_ref() {
         trace.send_started(SendKind::Setup);
@@ -649,7 +818,7 @@ async fn open_upstream(
     let sent_at = Instant::now();
     match tokio::time::timeout_at(
         ready_at,
-        live.send(UpstreamMessage::text(setup_payload(mode).to_string())),
+        live.send(UpstreamMessage::text(setup.to_string())),
     )
     .await
     {
@@ -665,6 +834,8 @@ async fn open_upstream(
                 trace.send_finished_kind(SendKind::Setup, 0, sent_at.elapsed(), false);
             }
             // A close event or the ready deadline reports a setup that never confirms.
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_transport_error(state, &crate::provider::transport_chain_text(&error));
             warn(
                 state.ring.keys(),
                 &format!("Could not write to the Live API socket: {error}"),
@@ -820,6 +991,10 @@ async fn handle_upstream(
     match message {
         Some(Ok(UpstreamMessage::Text(text))) => {
             let raw = text.as_str().to_owned();
+            // Archived before the message is parsed, used or dropped: a frame
+            // this relay cannot make sense of is evidence of itself.
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_upstream_frame(state, &raw);
             handle_upstream_message(socket, upstream, state, &raw).await;
         }
         Some(Ok(UpstreamMessage::Close(frame))) => {
@@ -827,11 +1002,11 @@ async fn handle_upstream(
                 Some(frame) => (u16::from(frame.code), frame.reason.as_str().to_owned()),
                 None => (1005, String::new()),
             };
+            // The code is recorded as a number by `upstream_closed`, and the
+            // whole close - code and reason as they arrived, redacted - is
+            // archived here, before any UI wording is derived from it.
             #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
             if let Some(trace) = state.trace.as_ref() {
-                // The close is a received message like any other; only its
-                // numeric code goes to the sink, never the reason text. The
-                // code itself is recorded once, by `upstream_closed`.
                 trace.received_with_details(
                     ReceiveFlags {
                         close: true,
@@ -841,14 +1016,26 @@ async fn handle_upstream(
                     None,
                 );
             }
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_close(state, code, &reason);
             upstream_closed(socket, upstream, state, code, &reason).await;
         }
         Some(Ok(UpstreamMessage::Binary(data))) => {
             // Binary frames are decoded as UTF-8 and parsed the same way;
-            // undecodable bytes are not JSON either, so they are dropped.
-            if let Ok(raw) = std::str::from_utf8(&data) {
-                let raw = raw.to_owned();
-                handle_upstream_message(socket, upstream, state, &raw).await;
+            // undecodable bytes are not JSON either, so they are dropped. The
+            // archive keeps the text when there is any, and the byte count when
+            // there is not - either way the frame is not silently gone.
+            match std::str::from_utf8(&data) {
+                Ok(raw) => {
+                    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                    note_upstream_frame(state, raw);
+                    let raw = raw.to_owned();
+                    handle_upstream_message(socket, upstream, state, &raw).await;
+                }
+                Err(_) => {
+                    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                    note_undecodable_frame(state, data.len());
+                }
             }
         }
         // Ping/Pong are answered by the socket layer, but they are still
@@ -892,6 +1079,8 @@ async fn handle_upstream(
                     None,
                 );
             }
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_transport_error(state, &crate::provider::transport_chain_text(&error));
             // This only warns; the close event (or the ready deadline) reports the
             // failure, and a terminated stream yields `None` next.
             warn(
@@ -908,6 +1097,11 @@ async fn handle_upstream(
                 // boundary are still recorded.
                 trace.boundary(UpstreamKind::Close, Some(1006), None);
             }
+            // No close frame arrived, so the archive records the 1006 this
+            // end of stream means with no reason at all - the same code the
+            // numeric boundary above carries.
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_close(state, 1006, "");
             upstream_closed(socket, upstream, state, 1006, "").await;
         }
     }
@@ -932,7 +1126,8 @@ async fn handle_upstream_message(
         // One call per message, whatever it turned out to be: every class it
         // carried is counted once, and a message of none of the known shapes is
         // counted as `other` instead of vanishing. A `goAway` contributes the
-        // duration it announced, as a number; its text never leaves this file.
+        // duration it announced, as a number; the frame itself is archived as
+        // content before this runs.
         trace.received_with_details(
             receive_flags(&message),
             None,
@@ -943,7 +1138,7 @@ async fn handle_upstream_message(
     if message.get("setupComplete").is_some() {
         state.ready_at = None;
         state.upstream_ready = true;
-        write_client(socket, state.ring.keys(), &json!({ "type": "ready" })).await;
+        write_client(socket, state, &json!({ "type": "ready" })).await;
         write_upstream(
             upstream,
             state,
@@ -984,7 +1179,7 @@ async fn handle_upstream_message(
     if let Some(interim) = content.get("interimInputTranscription").and_then(text_of) {
         write_client(
             socket,
-            state.ring.keys(),
+            state,
             &json!({ "type": "interim", "text": interim }),
         )
         .await;
@@ -993,7 +1188,7 @@ async fn handle_upstream_message(
     if let Some(final_text) = content.get("inputTranscription").and_then(text_of) {
         write_client(
             socket,
-            state.ring.keys(),
+            state,
             &json!({ "type": "final", "text": final_text }),
         )
         .await;
@@ -1242,7 +1437,7 @@ async fn fail(
     let safe = redact(&render(Language::En, &ui), state.ring.keys());
     write_client(
         socket,
-        state.ring.keys(),
+        state,
         &json!({ "type": "error", "message": safe, "ui": ui }),
     )
     .await;
@@ -1258,7 +1453,7 @@ async fn finish(socket: &mut WebSocket, upstream: &mut Option<Upstream>, state: 
     note_terminal(state, Outcome::Success);
     state.done = true;
     state.clear_timers();
-    write_client(socket, state.ring.keys(), &json!({ "type": "done" })).await;
+    write_client(socket, state, &json!({ "type": "done" })).await;
     close_upstream(upstream).await;
     let _ = socket
         .send(ClientMessage::Close(Some(CloseFrame {
@@ -1292,10 +1487,19 @@ async fn close_upstream(upstream: &mut Option<Upstream>) {
 
 /// Best-effort write: a browser socket that went away is noticed by the read half
 /// of the loop, not by this call.
-async fn write_client(socket: &mut WebSocket, keys: &[Arc<SecretKey>], payload: &Value) {
+///
+/// The payload is archived as the exact text about to be written, so every
+/// transformation between the provider's message and what the browser receives
+/// - a filtered interim, a promoted final, a mapped error - is visible next to
+/// the frame it came from.
+async fn write_client(socket: &mut WebSocket, state: &Relay, payload: &Value) {
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    note_browser_message(state, payload);
     if let Err(error) = socket.send(ClientMessage::text(payload.to_string())).await {
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        note_transport_error(state, &crate::provider::transport_chain_text(&error));
         warn(
-            keys,
+            state.ring.keys(),
             &format!("Could not write to the browser socket: {error}"),
         );
     }
@@ -1329,6 +1533,8 @@ async fn write_upstream(upstream: &mut Option<Upstream>, state: &Relay, payload:
         );
     }
     if let Err(error) = sent {
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        note_transport_error(state, &crate::provider::transport_chain_text(&error));
         warn(
             state.ring.keys(),
             &format!("Could not write to the Live API socket: {error}"),
@@ -1722,20 +1928,6 @@ mod relay_tests {
         text
     }
 
-    /// The journal, once the writer has written `needle`. The writer wakes
-    /// every 100 ms; the wait is bounded and real, and the longest one here is
-    /// the six-second tail grace.
-    async fn journal_until(root: &Path, needle: &str) -> String {
-        for _ in 0..300 {
-            let text = journal(root);
-            if text.contains(needle) {
-                return text;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-        journal(root)
-    }
-
     /// Every journal record of the one take under `root`, parsed. The segments
     /// are read in name order, so the records are in the order they were
     /// written, and a line the writer is still appending is skipped.
@@ -1809,6 +2001,24 @@ mod relay_tests {
             .filter(|record| record["event"] == "upstream_boundary")
             .filter(|record| record["data"]["kind"] == kind)
             .map(|record| &record["data"])
+            .collect()
+    }
+    /// Every content record of the take, in the order they were written. The
+    /// body is the record's own, exactly as the producer handed it over.
+    fn contents<'a>(records: &'a [Value]) -> Vec<&'a Value> {
+        records
+            .iter()
+            .filter(|record| record["event"] == "content")
+            .map(|record| &record["data"])
+            .collect()
+    }
+
+    /// The bodies of the content records of one kind.
+    fn content_bodies<'a>(records: &'a [Value], kind: &str) -> Vec<&'a str> {
+        contents(records)
+            .into_iter()
+            .filter(|record| record["kind"] == kind)
+            .filter_map(|record| record["body"].as_str())
             .collect()
     }
 
@@ -2051,14 +2261,18 @@ mod relay_tests {
         cleanup(diagnostics, &root);
     }
 
-    /// The upstream error text is a payload the sink never sees.
+    /// The upstream error text is evidence: the frame as it arrived is archived
+    /// in full, and so is the error the browser was given - while a key either
+    /// of them echoed is redacted out of both.
     #[tokio::test]
-    async fn an_upstream_error_message_never_reaches_the_journal() {
+    async fn an_upstream_error_message_is_archived_with_its_key_redacted() {
         let root = scratch("upstream-error");
         let (diagnostics, trace) = take(&root);
         let (upstream_port, mut received) = fake_upstream(
             vec![json!({ "setupComplete": {} })],
-            Some(json!({ "error": { "message": format!("rejected: {SYNTHETIC_SECRET}") } })),
+            Some(json!({
+                "error": { "message": format!("rejected: {SYNTHETIC_SECRET} key={SYNTHETIC_KEY}") }
+            })),
             None,
         )
         .await;
@@ -2084,36 +2298,63 @@ mod relay_tests {
         })
         .await;
 
-        let text = journal_until(&root, "\"cause\":\"upstream_error\"").await;
+        // Wait for both records of the error: the frame as it arrived, and the
+        // message the browser was given.
+        let records = journal_when(&root, 300, |rows| {
+            content_bodies(rows, "live_output")
+                .iter()
+                .any(|body| body.contains("\"type\":\"error\""))
+                && content_bodies(rows, "live_message")
+                    .iter()
+                    .any(|body| body.contains(SYNTHETIC_SECRET))
+        })
+        .await;
+        let frames = content_bodies(&records, "live_message");
+        assert!(
+            frames.iter().any(|body| body.contains(SYNTHETIC_SECRET)),
+            "the upstream error frame is archived as it arrived: {frames:?}"
+        );
+        let outputs = content_bodies(&records, "live_output");
+        assert!(
+            outputs
+                .iter()
+                .any(|body| body.contains("\"type\":\"error\"")),
+            "the browser-bound error is archived too: {outputs:?}"
+        );
+        for body in frames.iter().chain(outputs.iter()) {
+            assert!(
+                !body.contains(SYNTHETIC_KEY),
+                "the key is redacted out of every record: {body}"
+            );
+        }
+
+        let text = journal(&root);
         assert!(
             text.contains("\"cause\":\"upstream_error\""),
-            "the upstream error is the request's cause: {text}"
-        );
-        assert!(
-            !text.contains(SYNTHETIC_SECRET),
-            "the upstream error text is not in the journal: {text}"
+            "the upstream error is still the request's cause: {text}"
         );
         assert!(
             !text.contains(&payload),
-            "the PCM payload is not in the journal: {text}"
-        );
-        assert!(
-            !text.contains(SYNTHETIC_KEY),
-            "the key is not in the journal: {text}"
+            "the PCM payload is not duplicated into the archive: {text}"
         );
         cleanup(diagnostics, &root);
     }
 
-    /// A close reason is text from the upstream, and it stays out of the sink:
-    /// only its numeric code is recorded.
+    /// The upstream's close is archived whole - the code and the reason text
+    /// that arrived with it - while the numeric code the counters use and the
+    /// one close boundary stay exactly as they were. A key inside the reason is
+    /// redacted out of the archived copy.
     #[tokio::test]
-    async fn an_upstream_close_reason_never_reaches_the_journal() {
+    async fn an_upstream_close_reason_is_archived_with_its_code() {
         let root = scratch("close-reason");
         let (diagnostics, trace) = take(&root);
         let (upstream_port, _received) = fake_upstream(
             vec![json!({ "setupComplete": {} })],
             None,
-            Some((1011, format!("closed because of {SYNTHETIC_SECRET}"))),
+            Some((
+                1011,
+                format!("closed because of {SYNTHETIC_SECRET} key={SYNTHETIC_KEY}"),
+            )),
         )
         .await;
         let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
@@ -2128,23 +2369,189 @@ mod relay_tests {
             .expect("text")
             .contains("ready"));
 
-        let text = journal_until(&root, "\"close_code\":1011").await;
+        let records = journal_when(&root, 300, |rows| {
+            !content_bodies(rows, "socket_close").is_empty()
+        })
+        .await;
+        let closes = content_bodies(&records, "socket_close");
+        assert_eq!(closes.len(), 1, "one close frame, one record: {closes:?}");
+        assert!(
+            closes[0].contains("\"code\":1011"),
+            "the code the frame carried: {closes:?}"
+        );
+        assert!(
+            closes[0].contains(SYNTHETIC_SECRET),
+            "the reason text is archived in full: {closes:?}"
+        );
+        assert!(
+            !closes[0].contains(SYNTHETIC_KEY),
+            "the key is redacted out of the reason: {closes:?}"
+        );
+
+        let text = journal(&root);
         assert!(
             text.contains("\"close_code\":1011"),
-            "the numeric close code is recorded: {text}"
+            "the numeric close code is still recorded: {text}"
         );
         assert!(
             text.contains("\"cause\":\"upstream_close\""),
-            "the close is the request's cause: {text}"
+            "the close is still the request's cause: {text}"
         );
         assert_eq!(
             text.matches("\"kind\":\"close\"").count(),
             1,
             "the close frame is one close boundary, not two: {text}"
         );
+        cleanup(diagnostics, &root);
+    }
+
+    /// A frame that is not JSON at all is archived before the relay drops it,
+    /// and the take keeps running: the malformed bytes are evidence of
+    /// themselves, exactly like every other message.
+    #[tokio::test]
+    async fn a_malformed_upstream_frame_is_archived_before_it_is_dropped() {
+        let root = scratch("malformed");
+        let (diagnostics, trace) = take(&root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let upstream_port = listener.local_addr().expect("an address").port();
+        let malformed = "{\"serverContent\": \"unterminated".to_string();
+        let answer = malformed.clone();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let _ = ws.next().await;
+            if ws
+                .send(WsMessage::text(
+                    json!({ "setupComplete": {} }).to_string(),
+                ))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let _ = ws.send(WsMessage::text(answer)).await;
+            // The socket stays open: the relay must survive the frame.
+            while ws.next().await.is_some() {}
+        });
+        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+
+        let mut client = client(port).await;
+        client
+            .send(WsMessage::text(json!({ "type": "start", "mode": "smart" }).to_string()))
+            .await
+            .expect("the start frame");
+        assert!(client.next().await.expect("a frame").expect("text")
+            .to_text()
+            .expect("text")
+            .contains("ready"));
+
+        let records = journal_when(&root, 300, |rows| {
+            content_bodies(rows, "live_message")
+                .iter()
+                .any(|body| body.contains("unterminated"))
+        })
+        .await;
+        let frames = content_bodies(&records, "live_message");
         assert!(
-            !text.contains(SYNTHETIC_SECRET),
-            "the close reason text is not in the journal: {text}"
+            frames.iter().any(|body| body.contains("unterminated")),
+            "the malformed frame is archived as it arrived: {frames:?}"
+        );
+        assert!(
+            terminal(&records).is_none(),
+            "a malformed frame is not a terminal: {records:?}"
+        );
+        cleanup(diagnostics, &root);
+    }
+
+    /// The setup configuration and the browser-bound transcripts are archived in
+    /// the order they happened: what was configured, then the interim, then the
+    /// final - with both transcripts complete.
+    #[tokio::test]
+    async fn the_setup_and_the_browser_transcripts_are_archived_in_order() {
+        let root = scratch("content-order");
+        let (diagnostics, trace) = take(&root);
+        let (upstream_port, _received) = fake_upstream(
+            vec![
+                json!({ "setupComplete": {} }),
+                json!({ "serverContent": { "interimInputTranscription": { "text": "first words" } } }),
+                json!({ "serverContent": { "inputTranscription": { "text": "first words finally" } } }),
+            ],
+            None,
+            None,
+        )
+        .await;
+        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+
+        let mut client = client(port).await;
+        client
+            .send(WsMessage::text(json!({ "type": "start", "mode": "smart" }).to_string()))
+            .await
+            .expect("the start frame");
+        assert!(client.next().await.expect("a frame").expect("text")
+            .to_text()
+            .expect("text")
+            .contains("ready"));
+
+        // `ready`, the interim and the final: three messages for the browser.
+        let records = journal_when(&root, 300, |rows| {
+            content_bodies(rows, "live_output").len() >= 3
+        })
+        .await;
+        let outputs = content_bodies(&records, "live_output");
+        let interim = outputs
+            .iter()
+            .position(|body| body.contains("\"type\":\"interim\""));
+        let final_text = outputs
+            .iter()
+            .position(|body| body.contains("\"type\":\"final\""));
+        assert!(
+            interim.is_some() && final_text.is_some(),
+            "both transcripts reach the archive: {outputs:?}"
+        );
+        assert!(
+            interim < final_text,
+            "the interim precedes the final: {outputs:?}"
+        );
+        assert!(
+            interim.is_some_and(|index| index >= 1),
+            "`ready` comes first: {outputs:?}"
+        );
+        assert!(
+            outputs
+                .iter()
+                .any(|body| body.contains("first words finally")),
+            "the final transcript is complete: {outputs:?}"
+        );
+
+        let setups = content_bodies(&records, "live_setup");
+        assert_eq!(setups.len(), 1, "one setup frame, one record: {setups:?}");
+        assert!(
+            setups[0].contains("models/gemini-3.5-transcribe-live"),
+            "the exact model the socket was opened with: {setups:?}"
+        );
+        assert!(
+            setups[0].contains("\"mode\":\"SMART\""),
+            "the mode the socket was opened with: {setups:?}"
+        );
+        // The rotation entry this socket bound, by ordinal and count: enough
+        // to name the entry a 401/429 came from, never the key itself.
+        assert!(
+            setups[0].contains("\"key_ordinal\":1"),
+            "the bound entry's 1-based ordinal: {setups:?}"
+        );
+        assert!(
+            setups[0].contains("\"ring_keys\":1"),
+            "how many entries the pinned ring had: {setups:?}"
+        );
+        assert!(
+            !setups[0].contains(SYNTHETIC_KEY),
+            "the key itself never enters the record: {setups:?}"
         );
         cleanup(diagnostics, &root);
     }
@@ -2214,6 +2621,28 @@ mod relay_tests {
             "the failed read is counted, the end of stream is not"
         );
         cleanup(diagnostics, &root);
+    }
+
+    /// The dialed URL is the one place a Live key could reach the archive: a
+    /// socket error quotes the address the relay opened, and that address
+    /// carries the key in its query. The mask runs before the redaction, so the
+    /// address itself - key included - is never part of the record.
+    #[test]
+    fn a_dialed_socket_url_is_masked_out_of_a_transport_error() {
+        let masked = mask_urls("connect error: wss://host/ws?key=super-secret-9f3b refused");
+        assert_eq!(masked, "connect error: [url] refused");
+        assert!(
+            !masked.contains("super-secret-9f3b"),
+            "the key inside the URL goes with it: {masked}"
+        );
+        // A URL quoted inside a rendered error stops at the quote, so the
+        // wording around it survives the masking.
+        assert_eq!(
+            mask_urls("\"ws://host/ws?key=abc\" refused"),
+            "\"[url]\" refused"
+        );
+        // Nothing to mask: the detail is handed on unchanged.
+        assert_eq!(mask_urls("timed out"), "timed out");
     }
 
     /// The final deadline's expiry reports the timer that was armed, not one

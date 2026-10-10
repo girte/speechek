@@ -115,7 +115,7 @@ use preferences::{PreferencesState, SettingsUiError, StartupPorts};
 
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
 use crate::diagnostics::{
-    CapturePhase, Diagnostics, Event as DiagnosticEvent, Mode, Outcome, Owner,
+    CapturePhase, ContentKind, Diagnostics, Event as DiagnosticEvent, Mode, Outcome, Owner,
     Phase as DiagnosticPhase, SessionKey,
 };
 
@@ -226,6 +226,114 @@ const LAB_SIZE: (f64, f64) = (1_100.0, 800.0);
 /// The renderer never hands over a long dictation in one piece: this is the
 /// ceiling the shell accepts, in bytes of UTF-8.
 const MAX_TEXT_BYTES: usize = 64 * 1024;
+
+/// The body of a paste record: the generation the hand-over belongs to, the
+/// stage it has reached, and the text it carries byte for byte. Nothing is cut
+/// here: a transcript the shell accepts is archived whole, and one too large for
+/// the archive is refused by the writer and counted as a loss there rather than
+/// stored as a prefix a reader could mistake for the dictation. The caller
+/// redacts the body against the take's own ring, so a transcript that happens to
+/// contain key material is not written down.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn paste_text_body(generation: u64, stage: &str, text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "generation": generation,
+        "stage": stage,
+        "text": text,
+    })
+}
+
+/// The body that closes a paste record: the outcome of the clipboard
+/// transaction and, for a failure, the full descriptor the shell would have
+/// shown - the code, the English diagnostic and the catalog key with its raw
+/// arguments - so a hand-over that never became a paste can be read back
+/// without reproducing it. The process the command runs as travels with it; the
+/// window the text was meant for is not known here and is recorded by the
+/// transaction itself, which is the only thing that ever observed it.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn paste_result_body(
+    generation: u64,
+    own_process_id: u32,
+    result: Result<&'static str, &UiError>,
+) -> serde_json::Value {
+    let mut body = match result {
+        Ok(outcome) => serde_json::json!({
+            "generation": generation,
+            "stage": "result",
+            "result": outcome,
+        }),
+        Err(error) => serde_json::json!({
+            "generation": generation,
+            "stage": "result",
+            "result": "failed",
+            "code": error.code,
+            "message": error.message,
+            "ui": { "key": error.ui.key, "args": error.ui.args },
+        }),
+    };
+    body["own_process_id"] = serde_json::json!(own_process_id);
+    body
+}
+
+/// Records one content body on the take of one generation. The handle redacts
+/// the body with the ring it remembered when the take began - the revision that
+/// take was pinned to - so a record written after a save, or after the pin was
+/// retired, is still redacted against the ring the take really ran under and
+/// never against a newer one, and never leaves its known secrets unredacted. A
+/// take that is already sealed has no handle and nothing is written.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn record_content(
+    app: &AppHandle,
+    generation: u64,
+    kind: ContentKind,
+    body: &serde_json::Value,
+) {
+    if let Some(sink) = diagnostics_of(app) {
+        let key = SessionKey {
+            owner: Owner::Dictation,
+            generation,
+        };
+        if let Some(handle) = sink.lookup(key) {
+            let _ = handle.redacted_content_json(kind, body);
+        }
+    }
+}
+
+/// Records the text one hand-over received, before any of the command's own
+/// checks have run: a payload the paste path refuses is still archived with the
+/// reason no paste followed, so a dictation whose text never reached the window
+/// is read back from the archive and not from the user's memory. The whole text
+/// is stored, byte for byte; a transcript is neither a secret nor shortened, and
+/// a shell with no keys configured has nothing to redact against, which is not a
+/// reason to withhold it.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn record_paste_requested(app: &AppHandle, generation: u64, own_process_id: u32, text: &str) {
+    let mut body = paste_text_body(generation, "requested", text);
+    body["own_process_id"] = serde_json::json!(own_process_id);
+    record_content(app, generation, ContentKind::PasteRequested, &body);
+}
+
+/// Records how one hand-over ended: the settlement of a transaction that ran,
+/// or one of the command's own refusals - an empty or oversized payload, a
+/// generation that is no longer waiting, a cancellation, a worker that could
+/// not be reached, a clipboard that could not be written. A failure carries its
+/// full descriptor, so the archive says why no paste happened. The record lands
+/// in the take of the very generation it names: a stale answer finds no open
+/// take and writes nothing into the session that replaced it.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn record_paste_result(
+    app: &AppHandle,
+    generation: u64,
+    own_process_id: u32,
+    result: Result<&'static str, &UiError>,
+) {
+    record_content(
+        app,
+        generation,
+        ContentKind::PasteResult,
+        &paste_result_body(generation, own_process_id, result),
+    );
+}
 
 /* -------------------------------------------------------------------------- */
 /* Window pages                                                                */
@@ -909,6 +1017,40 @@ fn diagnostic_mode(mode: &str) -> Mode {
     }
 }
 
+/// The flavor this build runs as, in its wire spelling: the archive names the
+/// build that produced a take, so a record is never read as a run of another
+/// flavor.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn build_flavor() -> &'static str {
+    match profile::ACTIVE {
+        profile::BuildFlavor::Production => "production",
+        profile::BuildFlavor::Development => "development",
+        profile::BuildFlavor::Test => "test",
+    }
+}
+
+/// The ordinary settings a take begins under, as the recorder archives them: the
+/// fields the shell reads from a revision, and the identity of the build that
+/// reads them. The revision itself is never serialized — it also carries the
+/// keys — and the body is redacted by the handle the take began on, against the
+/// ring that handle remembered, so a stored device id or chord that happens to
+/// carry key material is not written down.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn runtime_context(snapshot: &RuntimeSnapshot) -> serde_json::Value {
+    let settings = &snapshot.settings;
+    serde_json::json!({
+        "mode": settings.mode,
+        "input_device": settings.input_device,
+        "language": settings.language,
+        "mute": settings.mute_during_recording,
+        "hotkey": settings.hotkey,
+        "port": settings.port,
+        "build": build_flavor(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": option_env!("SPEECHEK_DIAGNOSTIC_COMMIT").filter(|value| !value.is_empty()),
+    })
+}
+
 /// The phase a dictation of the shell is in, as the journal names it.
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
 fn diagnostic_shell_phase(phase: Phase) -> CapturePhase {
@@ -923,16 +1065,51 @@ fn diagnostic_shell_phase(phase: Phase) -> CapturePhase {
 
 /// Opens the take of one dictation or laboratory window, under that window's own
 /// generation. The two number spaces never name each other's takes.
+///
+/// `pinned` is the revision the take records under, exactly as it was captured
+/// when the take was reserved: the dictation's own revision, or the laboratory's
+/// reservation snapshot. Its ordinary settings are recorded as this take's
+/// context, and its ring is remembered on the take, so the whole take is
+/// redacted against the revision it really ran under and never against a newer
+/// one a save published afterwards. A take whose revision could not be resolved
+/// still begins; it just carries no context record and no ring.
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
 fn diagnostic_begin(
     diagnostics: Option<&Arc<Diagnostics>>,
     owner: Owner,
     generation: u64,
     mode: Mode,
+    pinned: Option<&RuntimeSnapshot>,
 ) {
-    if let Some(diagnostics) = diagnostics {
-        let _ = diagnostics.begin(SessionKey { owner, generation }, mode);
+    let Some(diagnostics) = diagnostics else {
+        return;
+    };
+    if let Some(handle) = diagnostics.begin(SessionKey { owner, generation }, mode) {
+        if let Some(snapshot) = pinned {
+            // The take's ring is remembered on its own handle before anything is
+            // serialized: every later record of this take - its capture, its
+            // requests, its paste - is redacted by the handle against this ring,
+            // so no producer has to hold a revision, or the session lock, to get
+            // a redaction right.
+            handle.remember_keys(snapshot.keys.keys());
+            let _ = handle.redacted_content_json(ContentKind::RuntimeContext, &runtime_context(snapshot));
+        }
     }
+}
+
+/// The revision a laboratory take is recording under. The reservation pins it
+/// when the microphone is reserved and holds it until the take is stopped, so
+/// the take's own settings and ring are read back from here — never the running
+/// revision, which a save may already have replaced. A generation that no
+/// reservation names has no revision left of its own.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn lab_pinned(inner: &Inner, generation: u64) -> Option<Arc<RuntimeSnapshot>> {
+    inner
+        .lab
+        .lock()
+        .as_ref()
+        .filter(|reserved| reserved.generation == generation)
+        .map(|reserved| Arc::clone(&reserved.snapshot))
 }
 
 /// Records one phase of a take the shell is running. A take that is already gone
@@ -1679,18 +1856,30 @@ fn arm_overlay(app: &AppHandle) -> Result<(), String> {
         .ok_or_else(|| "the dictation was started without a configuration".to_string())?;
     let generation = overlay::show(app)?;
     inner.generation.store(generation, Ordering::SeqCst);
+    // The take's own mode and revision: read from the revision it is about to
+    // pin, and never from a newer one a save could publish while it runs. The
+    // revision is pinned before the renderer hears about the dictation and
+    // before any request of it can arrive, so the take uses this revision's ring
+    // and mode even when an apply publishes another one while it is running. The
+    // handle the context is read from is the very revision that was pinned.
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
-    let mode = diagnostic_mode(&snapshot.settings.mode);
-    // Pinned before the renderer hears about the dictation and before any
-    // request of it can arrive: the take uses this revision's ring and mode
-    // even when an apply publishes another one while it is running.
+    let (mode, context_revision) = (
+        diagnostic_mode(&snapshot.settings.mode),
+        Arc::clone(&snapshot),
+    );
     inner.runtime.pin(generation, snapshot);
     // The take is opened after its revision is pinned and before the renderer
     // hears about the dictation, so its capture and every request of it find a
     // registered take, under the generation the shell pinned and the mode of
     // that very revision.
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
-    diagnostic_begin(diagnostics_of(app).as_ref(), Owner::Dictation, generation, mode);
+    diagnostic_begin(
+        diagnostics_of(app).as_ref(),
+        Owner::Dictation,
+        generation,
+        mode,
+        Some(&*context_revision),
+    );
     emit_toggle(app, generation);
     Ok(())
 }
@@ -3003,6 +3192,27 @@ async fn finish_session(
             state.phase = Phase::Idle;
         }
         inner.queued_stop.store(false, Ordering::SeqCst);
+        // The shell's own terminal for this dictation, archived before the pin
+        // is released and before the terminal rises. The renderer reported the
+        // outcome and nothing else: the reason a failed take shows is already
+        // in the pill, and the renderer's own report content is archived beside
+        // this record, so what the shell knew here is written down rather than
+        // left to whichever screen the user happened to see.
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        record_content(
+            &app,
+            generation,
+            if outcome == "error" {
+                ContentKind::RecorderError
+            } else {
+                ContentKind::RecorderResult
+            },
+            &serde_json::json!({
+                "generation": generation,
+                "stage": "finalizer",
+                "outcome": &outcome,
+            }),
+        );
         // The take is over, so the revision it pinned is released: nothing that
         // belongs to it may be asked for again, and its ring stops being held.
         retire_dictation_locked(&inner, generation);
@@ -3253,9 +3463,17 @@ async fn lab_prepare_capture(window: WebviewWindow, app: AppHandle) -> Result<u6
         let generation = reserve_lab_capture(&inner)?;
         // The take is opened the moment the microphone is reserved for it, so
         // its capture and its requests find a registered take; a refusal above
-        // leaves nothing behind.
+        // leaves nothing behind. Its context and ring come from the revision
+        // the reservation just pinned, never from the running one, which a save
+        // may already have replaced.
         #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
-        diagnostic_begin(diagnostics_of(&app).as_ref(), Owner::Lab, generation, Mode::Comparison);
+        diagnostic_begin(
+            diagnostics_of(&app).as_ref(),
+            Owner::Lab,
+            generation,
+            Mode::Comparison,
+            lab_pinned(&inner, generation).as_deref(),
+        );
         Ok(generation)
     })
     .await
@@ -3500,18 +3718,35 @@ async fn insert_text(
             UiMessage::new(MessageId::OverlayForbidden),
         ));
     }
+    // Everything below is the overlay's own page; a payload that arrived from
+    // any other window was refused above, before one byte of it could reach the
+    // archive. The records go through the take's own handle, which redacts them
+    // against the ring it remembered when the take began - the revision that
+    // take was pinned to - so nothing here has to hold a revision, take a lock
+    // or read a key. The process the hand-over runs as is read here too: it is
+    // what tells the target window apart from the shell's own, so a paste into
+    // the wrong window can be told from a wrong clipboard without a screenshot.
+    let own_process = std::process::id();
+    // The text the command received, recorded before its own checks run: a
+    // payload the paste path refuses is archived together with the reason no
+    // paste followed.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    record_paste_requested(&app, generation, own_process, &text);
     if text.trim().is_empty() {
-        return Err(UiError::new(
-            "EMPTY",
-            UiMessage::new(MessageId::InsertTextEmpty),
-        ));
+        let refusal = UiError::new("EMPTY", UiMessage::new(MessageId::InsertTextEmpty));
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        record_paste_result(&app, generation, own_process, Err(&refusal));
+        return Err(refusal);
     }
     if text.len() > MAX_TEXT_BYTES {
-        return Err(UiError::new(
+        let refusal = UiError::new(
             "TOO_LONG",
             UiMessage::new(MessageId::InsertTextTooLong)
                 .with_arg("kib", serde_json::json!(MAX_TEXT_BYTES / 1024)),
-        ));
+        );
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        record_paste_result(&app, generation, own_process, Err(&refusal));
+        return Err(refusal);
     }
     let inner = inner(&app);
     {
@@ -3520,17 +3755,19 @@ async fn insert_text(
             || state.phase != Phase::Finalizing
             || state.inserted
         {
-            return Err(UiError::new(
+            let refusal = UiError::new(
                 "STALE_SESSION",
                 UiMessage::new(MessageId::InsertTextNotWaiting),
-            ));
+            );
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            record_paste_result(&app, generation, own_process, Err(&refusal));
+            return Err(refusal);
         }
         state.inserted = true;
     }
 
     // The clipboard transaction blocks off the UI thread. Share ownership of
     // the original String with its worker and the last successful dictation.
-    let own_process = std::process::id();
     let text = Arc::new(text);
     let kept = Arc::clone(&text);
     // Cancellation and clipboard hand-off share one session lock. Escape wins
@@ -3538,48 +3775,103 @@ async fn insert_text(
     // and an installer's exit refuses the hand-over exactly like a cancel.
     let gate = Arc::clone(&inner);
     let paste_app = app.clone();
+    // The take's own handle, looked up here, outside the session lock: the
+    // transaction archives what only it observes - the target window, the
+    // foreground, the chord and the read receipt - on the take this hand-over
+    // belongs to. A take that is already gone has no handle, and the transaction
+    // then records nothing of it.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    let paste_diagnostics = diagnostics_of(&app).and_then(|sink| {
+        sink.lookup(SessionKey {
+            owner: Owner::Dictation,
+            generation,
+        })
+    });
     let pasted = tauri::async_runtime::spawn_blocking(move || {
-        {
+        let refusal = {
             let _session = gate.session.lock();
             if !paste_may_begin(&gate, generation) {
-                return Err(UiError::new(
+                Some(UiError::new(
                     "CANCELLED",
                     UiMessage::new(MessageId::InsertTextCancelled),
-                ));
+                ))
+            } else {
+                gate.state.lock().phase = Phase::Pasting;
+                // The dictation is going through, so the pill comes down in the
+                // same step, before the clipboard transaction: nothing of the
+                // hand-over is meant to be visible, and Escape is past winning.
+                overlay::hide_now(&paste_app, generation);
+                // The take is in its last phase: the text is on its way into the
+                // window that owns the foreground.
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                diagnostic_phase(
+                    diagnostics_of(&paste_app).as_ref(),
+                    SessionKey {
+                        owner: Owner::Dictation,
+                        generation,
+                    },
+                    CapturePhase::Pasting,
+                );
+                None
             }
-            gate.state.lock().phase = Phase::Pasting;
-            // The dictation is going through, so the pill comes down in the same
-            // step, before the clipboard transaction: nothing of the hand-over is
-            // meant to be visible, and Escape is past winning.
-            overlay::hide_now(&paste_app, generation);
-            // The take is in its last phase: the text is on its way into the
-            // window that owns the foreground.
+        };
+        // The take was over - cancelled, replaced, or the shell is leaving - and
+        // the refusal is archived for the generation it names, which is the take
+        // that was waiting for this text. It is written here, after the session
+        // lock was released: nothing of this record runs inside the critical
+        // section that decided the hand-over.
+        if let Some(refusal) = refusal {
             #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
-            diagnostic_phase(
-                diagnostics_of(&paste_app).as_ref(),
-                SessionKey {
-                    owner: Owner::Dictation,
-                    generation,
-                },
-                CapturePhase::Pasting,
-            );
+            record_paste_result(&paste_app, generation, own_process, Err(&refusal));
+            return Err(refusal);
         }
         release_cancel_key(&paste_app);
-        paste::transact_foreground(text, own_process)
-    })
-    .await
-    .map_err(|err| {
-        UiError::new(
-            "INTERNAL",
-            UiMessage::new(MessageId::InsertTextHandoverFailed)
-                .with_arg("detail", serde_json::Value::from(err.to_string())),
+        // The text of this hand-over was already archived when the command
+        // received it, and it is the same `Arc` this transaction consumes: the
+        // record is not written twice, and it is written before any clipboard
+        // work begins. The take's handle goes with it, so the transaction - the
+        // only thing that observes the target window, the foreground, the chord
+        // and the read receipt - archives what it saw on the same take.
+        paste::transact_foreground(
+            text,
+            own_process,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            paste_diagnostics.as_ref(),
         )
-    })?
-    .map_err(|err| {
-        redact_capture_error(&app, capture::CaptureOwner::Dictation(generation), err)
-    })?;
+    })
+    .await;
+    let settled = match pasted {
+        Err(join) => {
+            let failure = UiError::new(
+                "INTERNAL",
+                UiMessage::new(MessageId::InsertTextHandoverFailed)
+                    .with_arg("detail", serde_json::Value::from(join.to_string())),
+            );
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            record_paste_result(&app, generation, own_process, Err(&failure));
+            return Err(failure);
+        }
+        Ok(Ok(settled)) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            record_paste_result(&app, generation, own_process, Ok(settled.as_str()));
+            settled
+        }
+        Ok(Err(failure)) => {
+            // The transaction ran and failed. Its full descriptor is archived
+            // before it is redacted for the renderer, so the archive holds what
+            // became of the hand-over even though the command answers with an
+            // error.
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            record_paste_result(&app, generation, own_process, Err(&failure));
+            return Err(redact_capture_error(
+                &app,
+                capture::CaptureOwner::Dictation(generation),
+                failure,
+            ));
+        }
+    };
     inner.state.lock().text = Some(kept);
-    Ok(pasted.as_str())
+    Ok(settled.as_str())
 }
 
 /* -------------------------------------------------------------------------- */
@@ -3779,6 +4071,8 @@ mod tests {
     use tauri::Url;
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
     use super::{diagnostic_close_capture, diagnostic_end, diagnostic_end_owner};
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    use super::{lab_pinned, runtime_context};
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
     use crate::diagnostics::{Diagnostics, Mode, Outcome, Owner, Policy, Route, SessionKey};
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
@@ -4386,5 +4680,41 @@ mod tests {
     fn next_scratch() -> u64 {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         NEXT.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// The context a laboratory take begins under is the revision its own
+    /// reservation pinned, never the running one: a save that lands while the
+    /// take runs must not put the new settings - or the new ring - under a take
+    /// that is recording with the old ones.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    #[test]
+    fn a_laboratory_context_is_the_revision_its_reservation_pinned() {
+        let inner = idle_inner();
+        let generation = reserve_lab_capture(&inner).expect("an idle shell reserves a take");
+        let pinned = lab_pinned(&inner, generation).expect("the reservation pins a revision");
+        let before = runtime_context(&pinned);
+        // A save publishes a replacement for the takes that follow.
+        inner.runtime.publish(Arc::new(RuntimeSnapshot {
+            settings: Settings {
+                hotkey: "Ctrl+Shift+F9".to_owned(),
+                mode: "verbatim".to_owned(),
+                mute_during_recording: true,
+                port: 65_535,
+                input_device: Some("wasapi:card-two".to_owned()),
+                language: crate::i18n::Language::Ru,
+            },
+            keys: Arc::new(KeyRing::empty()),
+            revision: 2,
+        }));
+        assert_ne!(
+            before,
+            runtime_context(&inner.runtime.snapshot()),
+            "the running revision is not the take's"
+        );
+        assert_eq!(
+            before,
+            runtime_context(&lab_pinned(&inner, generation).expect("still the reserved take")),
+            "the take keeps the revision it was reserved under"
+        );
     }
 }

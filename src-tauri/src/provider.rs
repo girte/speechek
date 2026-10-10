@@ -38,6 +38,18 @@
 //!   Only a debug build compiled with the `test-provider` feature reads
 //!   `SPEECHEK_TEST_PROVIDER_HTTP`/`SPEECHEK_TEST_PROVIDER_WSS`; release
 //!   binaries contain no override code at all.
+//!
+//! Development diagnostics may additionally archive this module's content: the
+//! pinned request configuration together with the rotation entry the request
+//! used - its 1-based ordinal and the ring's key count, never the key - and
+//! every response body that was read - the
+//! upload finalize and interaction bodies, a non-2xx refusal, and the bodies the
+//! transport itself ignores, which a diagnostics-only observer reads without
+//! ever making the request wait. Each record carries the status and the stage it
+//! belongs to, is redacted against the request-selected ring, and is built only
+//! when `all(debug_assertions, feature = "dev-diagnostics")` holds and the
+//! request is traced; the transport, the payloads and the deadlines never depend
+//! on it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,7 +58,11 @@ use serde_json::{json, Value};
 
 use crate::backend::{redact, ApiError};
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
-use crate::diagnostics::{ErrorClass, RequestCause, RequestTrace, Stage, StagePhase};
+use crate::backend::{diagnostic_json, diagnostic_text};
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+use crate::diagnostics::{
+    ContentFormat, ContentKind, ErrorClass, RequestCause, RequestTrace, Stage, StagePhase,
+};
 use crate::i18n::{MessageId, UiMessage};
 use crate::secrets::SecretKey;
 
@@ -256,6 +272,33 @@ impl Provider {
 
         #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
         let traced = traced.as_ref();
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        if let Some(traced) = traced {
+            // The exact batch request about to be sent: the pinned model, the
+            // mode and the configuration the interaction body carries. The
+            // redaction borrows the same request-selected ring the transport
+            // uses, so a key echoed by any of its members never reaches the
+            // archive.
+            traced.content(
+                ContentKind::ProviderRequest,
+                ContentFormat::Json,
+                diagnostic_json(
+                    &json!({
+                        "route": "batch",
+                        "model": BATCH_MODEL,
+                        "mode": mode,
+                        "mode_payload": &mode_payload,
+                        "wav_bytes": wav.len(),
+                        // Which pinned rotation entry this request used, and
+                        // how many the ring had: the ordinal and the count
+                        // only, never the key.
+                        "key_ordinal": key_ordinal(key, keys),
+                        "ring_keys": keys.len(),
+                    }),
+                    keys,
+                ),
+            );
+        }
         let uploaded = self
             .upload_audio_file(
                 key,
@@ -329,7 +372,15 @@ impl Provider {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         // Dropping the response cancels the metadata body, and the upload URL
-        // above is all we read from it.
+        // above is all the transport reads from it. A traced request hands that
+        // ignored body to a diagnostics-only observer instead: the request path
+        // never awaits it, and an untraced one drops it exactly as before.
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        match traced {
+            Some(traced) => observe_body(start_response, Stage::UploadStart, traced, keys),
+            None => drop(start_response),
+        }
+        #[cfg(not(all(debug_assertions, feature = "dev-diagnostics")))]
         drop(start_response);
         let Some(upload_url) = upload_url else {
             return Err(ApiError::new(
@@ -365,6 +416,8 @@ impl Provider {
             traced,
             #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
             Stage::UploadFinalize,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            keys,
         )
         .await
         .filter(Value::is_object);
@@ -438,6 +491,8 @@ impl Provider {
             traced,
             #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
             Stage::Interaction,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            keys,
         )
         .await
         .filter(Value::is_object);
@@ -494,14 +549,19 @@ impl Provider {
             .header("x-goog-api-key", key.as_str());
         match request.timeout(DELETE_TIMEOUT).send().await {
             Ok(response) if response.status().is_success() => {
+                // The status the cleanup's own completion carried, recorded
+                // before the body is handed on.
                 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
-                note_stage(
-                    traced,
-                    Stage::Delete,
-                    StagePhase::End,
-                    Some(response.status().as_u16()),
-                    false,
-                );
+                let delete_status = response.status().as_u16();
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                note_stage(traced, Stage::Delete, StagePhase::End, Some(delete_status), false);
+                // A cleanup that succeeded has its own body, and the transport
+                // never reads it: the same diagnostics-only observer takes it,
+                // so this path still does not wait for it.
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                if let Some(traced) = traced {
+                    observe_body(response, Stage::Delete, traced, keys);
+                }
             }
             Ok(response) => {
                 let status = response.status().as_u16();
@@ -511,6 +571,14 @@ impl Provider {
                 );
                 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
                 note_stage(traced, Stage::Delete, StagePhase::Error, Some(status), false);
+                // The refusal's own body is evidence, and the cleanup must not
+                // wait for it: an ignored body is read by a diagnostics-only
+                // observer that can outlive the request without changing the
+                // result the caller already has.
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                if let Some(traced) = traced {
+                    observe_body(response, Stage::Delete, traced, keys);
+                }
             }
             Err(error) => {
                 eprintln!(
@@ -520,6 +588,14 @@ impl Provider {
                         keys
                     )
                 );
+                #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                if let Some(traced) = traced {
+                    traced.content(
+                        ContentKind::TransportError,
+                        ContentFormat::Text,
+                        transport_detail(&error, keys),
+                    );
+                }
                 // A delete failure is best effort: it reports its own stage and
                 // never overwrites the cause, the class or the status of the
                 // request it followed.
@@ -575,13 +651,22 @@ async fn send_checked(
         // The transport never produced an HTTP status, so the failure is
         // classified from the `reqwest::Error` alone - timeout, connect, body
         // or decode - before its rendered text is redacted into the authored
-        // detail. Neither that text nor the URL ever reaches the sink.
+        // detail the browser sees. The archive keeps that failure in full with
+        // the URL removed: neither the URL nor an auth header ever reaches it.
         Err(error) => {
             #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
             {
                 note_stage(traced, stage, StagePhase::Error, None, error.is_timeout());
                 if let Some(traced) = traced {
                     traced.error_class(classify_transport_error(&error));
+                    // The whole transport failure, not just the mapped 502: the
+                    // request URL is stripped because it carries the key in its
+                    // query, and every key of the pinned ring is redacted.
+                    traced.content(
+                        ContentKind::TransportError,
+                        ContentFormat::Text,
+                        transport_detail(&error, keys),
+                    );
                 }
             }
             return Err(ApiError::new(
@@ -604,7 +689,16 @@ async fn send_checked(
         }
         Ok(response)
     } else {
-        let failure = google_failure(response, action, keys).await;
+        let failure = google_failure(
+            response,
+            action,
+            keys,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            traced,
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            stage,
+        )
+        .await;
         #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
         note_stage(
             traced,
@@ -624,13 +718,51 @@ async fn send_checked(
 /// really ended: at the body, not at its headers. A body that times out and a
 /// payload that will not decode are classified from the actual `reqwest::Error`
 /// and still yield `None`, exactly like the previous `.ok()`.
+///
+/// The archive needs the exact bytes this stage consumed and a body can only be
+/// read once, so a traced request reads them once, archives them in full with
+/// the status and the stage, and decodes them from memory with the same
+/// `serde_json` call `.json()` makes - which is `bytes` followed by
+/// `from_slice`, its failure mapped to the decode class. An untraced request
+/// keeps `.json()` exactly as it was, and neither path reads a body twice.
 async fn read_stage_body(
     response: reqwest::Response,
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] traced: Option<&RequestTrace>,
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] stage: Stage,
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] keys: &[Arc<SecretKey>],
 ) -> Option<Value> {
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
     let status = response.status().as_u16();
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    if let Some(traced) = traced {
+        let (class, timeout) = match response.bytes().await {
+            Ok(bytes) => {
+                note_body(Some(traced), stage, status, &bytes, keys);
+                match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(payload) => {
+                        note_stage(Some(traced), stage, StagePhase::End, Some(status), false);
+                        return Some(payload);
+                    }
+                    // The headers arrived and the body was not JSON: this is a
+                    // *complete* body the archive already has in full, so it is
+                    // not a lost observation - only a decode failure, with the
+                    // class the old `.json()` reported, at exactly this moment.
+                    Err(_) => (ErrorClass::Decode, false),
+                }
+            }
+            // The body itself failed: the actual `reqwest::Error` classifies
+            // it, no complete copy exists to archive, and the observation is
+            // recorded as lost with the stage, the status and the full redacted
+            // detail rather than being silently reduced to a numeric stage.
+            Err(error) => {
+                note_body_unreadable(Some(traced), stage, status, &error, keys);
+                (classify_transport_error(&error), error.is_timeout())
+            }
+        };
+        note_stage(Some(traced), stage, StagePhase::Error, Some(status), timeout);
+        traced.error_class(class);
+        return None;
+    }
     match response.json::<Value>().await {
         Ok(payload) => {
             #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
@@ -652,6 +784,19 @@ async fn read_stage_body(
     }
 }
 
+/// Which entry of the request-selected ring the transport actually used, as a
+/// 1-based ordinal, and how many entries that ring had. Identity comes from the
+/// pinned `Arc`s themselves - never the key text, a fingerprint or a header -
+/// so the archive can say which rotation entry a 401/429 belonged to without
+/// holding or exposing any key material. `None` when the chosen handle is not
+/// an element of the ring it was handed with.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+pub(crate) fn key_ordinal(key: &Arc<SecretKey>, keys: &[Arc<SecretKey>]) -> Option<usize> {
+    keys.iter()
+        .position(|candidate| Arc::ptr_eq(candidate, key))
+        .map(|index| index + 1)
+}
+
 /// One request stage observation: a request without a trace instruments
 /// nothing, and a stage call is the only thing that goes to the sink.
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
@@ -665,6 +810,210 @@ fn note_stage(
     if let Some(traced) = traced {
         traced.stage(stage, phase, status, timeout);
     }
+}
+
+/// One response body offered to the archive, in full: the status, the stage and
+/// the exact body that came back. The stage is spelled by its own `Serialize`
+/// implementation, so the record can never drift from the stage record and the
+/// manifest. Nothing here truncates: the sink owns the queued-content budget,
+/// and a record it cannot hold is a counted, diagnosable drop rather than a
+/// shortened body. A body that is not text at all is recorded as such - its
+/// byte count and nothing else - so the missing text is visible too.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_body(
+    traced: Option<&RequestTrace>,
+    stage: Stage,
+    status: u16,
+    body: &[u8],
+    keys: &[Arc<SecretKey>],
+) {
+    let Some(traced) = traced else {
+        return;
+    };
+    let stage = json!(stage);
+    let record = match std::str::from_utf8(body) {
+        Ok(text) => json!({
+            "status": status,
+            "stage": stage,
+            "body": text,
+        }),
+        Err(_) => json!({
+            "status": status,
+            "stage": stage,
+            "non_utf8_bytes": body.len(),
+        }),
+    };
+    traced.content(
+        ContentKind::ProviderResponse,
+        ContentFormat::Json,
+        diagnostic_json(&record, keys),
+    );
+}
+
+/// One body the archive does not have at all: the read failed before any
+/// complete copy existed. The record says exactly that - the stage and the
+/// status it belonged to, and the actual `reqwest::Error` classed and rendered
+/// with its URL stripped and every pinned key redacted - and the observation is
+/// counted as lost. An empty body is never passed off as the upstream's answer.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_body_unreadable(
+    traced: Option<&RequestTrace>,
+    stage: Stage,
+    status: u16,
+    error: &reqwest::Error,
+    keys: &[Arc<SecretKey>],
+) {
+    let Some(traced) = traced else {
+        return;
+    };
+    traced.note_content_lost();
+    traced.content(
+        ContentKind::TransportError,
+        ContentFormat::Json,
+        diagnostic_json(
+            &json!({
+                "stage": json!(stage),
+                "status": status,
+                "body_incomplete": true,
+                "reason": "body_unreadable",
+                "error_class": classify_transport_error(error),
+                "message": transport_detail(error, keys),
+                "causes": error_causes(error, error.url().map(|url| url.as_str()), keys),
+            }),
+            keys,
+        ),
+    );
+}
+/// The cap one observed body is read up to: the sink's own content budget, so a
+/// large Provider JSON body is still eligible for the archive rather than being
+/// cut at some smaller diagnostic limit.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+const OBSERVED_BODY_MAX_BYTES: usize = crate::diagnostics::CONTENT_MAX_BYTES;
+
+/// Reads at most [`OBSERVED_BODY_MAX_BYTES`] of one body, on a bounded loop of
+/// its own. `true` means the body was longer than the cap and the read stopped
+/// there; what came back is then incomplete and is never presented as the body.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+async fn read_body_capped(
+    mut response: reqwest::Response,
+) -> Result<(Vec<u8>, bool), reqwest::Error> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > OBSERVED_BODY_MAX_BYTES {
+            return Ok((body, true));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((body, false))
+}
+
+/// Archives a body the transport path does not read, without ever making that
+/// path wait for it: a diagnostics-only task owns the response, the trace and a
+/// clone of the pinned ring, reads the body once, and records either the body
+/// itself, an explicit incompleteness when it exceeded the cap, or the read
+/// failure. The request has already ended semantically; an observation that
+/// lands after it is timestamped as what it is.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn observe_body(
+    response: reqwest::Response,
+    stage: Stage,
+    traced: &RequestTrace,
+    keys: &[Arc<SecretKey>],
+) {
+    // The status comes off the response itself, so the record can never carry
+    // one its caller guessed: the upstream's own is the only status archived.
+    let status = response.status().as_u16();
+    let traced = traced.clone();
+    let keys = keys.to_vec();
+    tokio::spawn(async move {
+        match read_body_capped(response).await {
+            Ok((body, false)) => note_body(Some(&traced), stage, status, &body, &keys),
+            Ok((body, true)) => {
+                // A partial body is not the body: the observation is counted as
+                // lost and the record says what arrived, why there is no more,
+                // and that the cap - not the upstream - is the reason. Passing
+                // a fragment off as the whole answer is never an option.
+                traced.note_content_lost();
+                traced.content(
+                    ContentKind::TransportError,
+                    ContentFormat::Json,
+                    diagnostic_json(
+                        &json!({
+                            "stage": json!(stage),
+                            "status": status,
+                            "body_incomplete": true,
+                            "observed_bytes": body.len(),
+                            "cap_bytes": OBSERVED_BODY_MAX_BYTES,
+                            "reason": "body_exceeds_cap",
+                        }),
+                        &keys,
+                    ),
+                );
+            }
+            Err(error) => {
+                // A body that could not be read at all is one more observation
+                // the archive does not have.
+                traced.note_content_lost();
+                traced.content(
+                    ContentKind::TransportError,
+                    ContentFormat::Text,
+                    transport_detail(&error, &keys),
+                );
+            }
+        }
+    });
+}
+
+/// The whole failure as text: the top message and every `std::error::Error::
+/// source()` behind it, in order. A top-level rendering such as `error decoding
+/// response body` hides the EOF or the timeout that actually happened; the
+/// chain does not. The text is not sanitized here - the caller redacts it, and
+/// the mask it applies covers every line the chain contributed.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+pub(crate) fn transport_chain_text(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str("\n  caused by: ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
+/// Every `source()` of one failure, each rendered and sanitized on its own, for
+/// the structured record: the pairs a reader needs when the top message is the
+/// only one that was rendered into `message`.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn error_causes(
+    error: &dyn std::error::Error,
+    url: Option<&str>,
+    keys: &[Arc<SecretKey>],
+) -> Vec<String> {
+    let mut causes = Vec::new();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let mut text = cause.to_string();
+        if let Some(url) = url {
+            text = text.replace(url, "[url]");
+        }
+        causes.push(diagnostic_text(&text, keys));
+        source = cause.source();
+    }
+    causes
+}
+
+/// One transport failure in full, for the archive: the whole source chain, with
+/// the request URL removed - that URL carries the key - and with every spelling
+/// of every key of the pinned ring redacted. No URL, no header and no key is
+/// ever part of it.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn transport_detail(error: &reqwest::Error, keys: &[Arc<SecretKey>]) -> String {
+    let mut text = transport_chain_text(error);
+    if let Some(url) = error.url() {
+        text = text.replace(url.as_str(), "[url]");
+    }
+    diagnostic_text(&text, keys)
 }
 
 /// Which way a transport that never reached a status failed. The rendered
@@ -685,14 +1034,35 @@ fn classify_transport_error(error: &reqwest::Error) -> ErrorClass {
 }
 
 /// Non-2xx from Google, carrying redacted diagnostics inside an authored reason.
+///
+/// The body is read exactly once, as it always was. A traced request also
+/// archives that whole body - not the 300-character slice the browser shows -
+/// together with the status and the stage it belongs to, and distinguishes a
+/// body that was read from one whose read failed: only a complete body becomes
+/// a `ProviderResponse`, while a failed read is counted as lost and recorded as
+/// an incomplete observation. The browser mapping is unchanged either way.
 async fn google_failure(
     response: reqwest::Response,
     action: MessageId,
     keys: &[Arc<SecretKey>],
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] traced: Option<&RequestTrace>,
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] stage: Stage,
 ) -> ApiError {
     let google_status = response.status().as_u16();
-    let body = response.text().await.unwrap_or_default();
-    google_failure_body(google_status, action, &body, keys)
+    // The body is read exactly once. A read that failed produced nothing, and
+    // the archive is told that explicitly instead of being handed an empty
+    // string as if the upstream had answered with no body at all.
+    let read = response.text().await;
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    match read.as_ref() {
+        Ok(body) => note_body(traced, stage, google_status, body.as_bytes(), keys),
+        Err(error) => note_body_unreadable(traced, stage, google_status, error, keys),
+    }
+    // The browser mapping is unchanged: an unreadable body is mapped exactly
+    // like the empty one it always was, and never becomes a `ProviderResponse`
+    // that claims the upstream answered with nothing.
+    let body = read.as_deref().unwrap_or_default();
+    google_failure_body(google_status, action, body, keys)
 }
 
 /// Classifies one non-2xx body. The thinking gate the unary
@@ -875,7 +1245,7 @@ fn upstream_error_message(payload: &Value) -> Option<&str> {
 /// `encodeURIComponent`: unreserved characters plus the ECMAScript extras
 /// (`- _ . ! ~ * ' ( )`) pass through; every other byte of the UTF-8 encoding
 /// becomes an uppercase percent triplet.
-fn encode_uri_component(value: &str) -> String {
+pub(crate) fn encode_uri_component(value: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut encoded = String::with_capacity(value.len());
     for &byte in value.as_bytes() {
@@ -1057,7 +1427,7 @@ mod tests {
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
     use crate::diagnostics::{
         BatchStage, Diagnostics, Event, Meta, Mode as DiagMode, Outcome, Owner, Policy, Route,
-        SessionKey,
+        SessionHandle, SessionKey,
     };
 
     /// One open take of this test's own, with the trace its request records
@@ -1200,14 +1570,38 @@ mod tests {
 
         // The body lands 200 ms later: consuming it is what ends the stage.
         let began = std::time::Instant::now();
-        let payload = read_stage_body(response, Some(&trace), Stage::Interaction).await;
+        let payload = read_stage_body(response, Some(&trace), Stage::Interaction, &[]).await;
         assert!(payload.is_none(), "a broken body is no payload");
         assert!(
             began.elapsed() >= Duration::from_millis(150),
             "the body really was awaited"
         );
 
-        let ended = stages(&diagnostics);
+        // The request really ended first, so its terminal is in the same drain
+        // as everything else it produced: one `take_meta`, one set of records.
+        trace.finish(Outcome::Error);
+        let drained = diagnostics.take_meta(64);
+        let ended: Vec<_> = drained
+            .iter()
+            .filter_map(|pending| match &pending.meta {
+                Meta::Event(Event::BatchStage(stage)) => Some(stage),
+                _ => None,
+            })
+            .collect();
+        let content: Vec<_> = drained
+            .iter()
+            .filter_map(|pending| match &pending.meta {
+                Meta::Content(queued) => Some(&queued.record),
+                _ => None,
+            })
+            .collect();
+        let end = drained
+            .iter()
+            .find_map(|pending| match &pending.meta {
+                Meta::Event(Event::RequestEnd(end)) => Some(end),
+                _ => None,
+            })
+            .expect("the request end, in the same drain");
         let interaction = ended
             .iter()
             .find(|stage| {
@@ -1220,11 +1614,244 @@ mod tests {
         assert!(!interaction.timeout);
         assert!(interaction.elapsed_us.is_some());
 
-        trace.finish(Outcome::Error);
-        let end = request_end(&diagnostics).expect("the request end");
+        // The body arrived *complete* and simply was not JSON: the archive
+        // keeps it whole, and none of it is a lost observation. `note_body`
+        // wraps the raw bytes in the record's own envelope, so the archived
+        // body is read back out of that envelope and compared exactly.
+        let answers: Vec<String> = content
+            .iter()
+            .filter(|record| matches!(record.kind, ContentKind::ProviderResponse))
+            .map(|record| {
+                let envelope: Value =
+                    serde_json::from_str(&record.body).expect("the record's own envelope");
+                assert_eq!(envelope["stage"], json!("interaction"));
+                assert_eq!(envelope["status"], json!(200));
+                envelope["body"]
+                    .as_str()
+                    .expect("the raw body inside the envelope")
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            answers,
+            vec!["{\"a\"".to_owned()],
+            "the complete body is archived exactly as it arrived"
+        );
+        assert!(
+            !content
+                .iter()
+                .any(|record| matches!(record.kind, ContentKind::TransportError)),
+            "a decode failure is not a lost observation: {content:?}"
+        );
+
         assert_eq!(end.error_class, Some(ErrorClass::Decode));
         assert_eq!(end.status, Some(200), "the headers' status still reaches the request end");
         assert_eq!(end.outcome, Outcome::Error);
+    }
+
+    /// A sink with its real writer, and one open Smart take in it: the journal
+    /// is the evidence here, so the records have to come from the writer rather
+    /// from the producer's queue. The handle and the key come back with the trace,
+    /// because a take is only written out once it has been ended explicitly - the
+    /// writer keeps servicing a take that has no terminal, and a take nobody ended
+    /// never reaches its `session_end`.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn storage_sink(
+        root: &std::path::Path,
+    ) -> (
+        Arc<Diagnostics>,
+        SessionHandle,
+        SessionKey,
+        RequestTrace,
+    ) {
+        let diagnostics = Diagnostics::for_test_with_storage(
+            root,
+            Policy {
+                max_age: Duration::from_secs(600),
+                max_bytes: 100_000_000,
+            },
+            std::time::SystemTime::now(),
+        );
+        let key = SessionKey {
+            owner: Owner::Dictation,
+            generation: 1,
+        };
+        let handle = diagnostics.begin(key, DiagMode::Smart).expect("an open take");
+        let trace = handle.request(Route::Smart).expect("a request slot");
+        (diagnostics, handle, key, trace)
+    }
+
+    /// Ends one take the way the shell ends it - the capture terminal, then the
+    /// take's own - and lets the writer seal and write it out. The fake clock is
+    /// advanced past the seal grace with the writer running, so the take is not
+    /// still waiting for a request the test has already dropped.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn end_take(
+        sink: &Arc<Diagnostics>,
+        handle: &SessionHandle,
+        key: SessionKey,
+        outcome: Outcome,
+    ) {
+        handle.end_capture(outcome);
+        sink.end(key, outcome);
+        // The longest a sealed candidate waits for a request to end is the sink's
+        // own seal grace; the extra millisecond is what makes it expired, not equal.
+        // Several writer passes, so the take is sealed, written and closed out.
+        sink.advance_clock(Duration::from_secs(2) + Duration::from_millis(1));
+        sink.worker_resume();
+        sink.worker_passes(6);
+    }
+
+    /// Every journal record written under `root`, the take's own directory
+    /// included, oldest segment first.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn journal_records(root: &std::path::Path) -> Vec<Value> {
+        let mut segments = Vec::new();
+        let Ok(takes) = std::fs::read_dir(root) else {
+            return Vec::new();
+        };
+        for take in takes.flatten() {
+            if !take.path().is_dir() {
+                continue;
+            }
+            let Ok(files) = std::fs::read_dir(take.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let name = file.file_name().to_string_lossy().to_string();
+                if name.starts_with("events-") && name.ends_with(".jsonl") {
+                    segments.push(file.path());
+                }
+            }
+        }
+        segments.sort();
+        let mut rows = Vec::new();
+        for segment in segments {
+            let Ok(text) = std::fs::read_to_string(&segment) else {
+                continue;
+            };
+            for line in text.lines() {
+                if let Ok(record) = serde_json::from_str::<Value>(line) {
+                    rows.push(record);
+                }
+            }
+        }
+        rows
+    }
+
+    /// One journal record of the given event name.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn journal_event<'a>(records: &'a [Value], event: &str) -> Option<&'a Value> {
+        records.iter().find(|record| record["event"] == event)
+    }
+
+    /// A truncated non-2xx body: the upstream declared more bytes than it
+    /// delivered and then closed. The read fails, so no complete copy exists -
+    /// the browser keeps the mapping an unreadable body always had, the archive
+    /// records the failure with its stage, status, class and source chain, no
+    /// `ProviderResponse` claims Google answered with nothing, and the lost
+    /// observation is counted.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    #[tokio::test]
+    async fn a_truncated_non_2xx_body_is_never_archived_as_a_complete_one() {
+        let root = std::env::temp_dir().join(format!(
+            "speechek-provider-truncated-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|since| since.as_nanos())
+                .unwrap_or(0)
+        ));
+        let delivered = "{\"error\":{\"message\":\"gone\"}}";
+        let port = head_then_body_server(
+            format!(
+                "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                delivered.len() + 64
+            ),
+            delivered.to_string(),
+            Duration::ZERO,
+        );
+        let provider = Provider::for_test("http://127.0.0.1:1", "ws://127.0.0.1:1");
+        let (diagnostics, handle, key, trace) = storage_sink(&root);
+        let request = provider
+            .http
+            .post(format!("http://127.0.0.1:{port}/v1beta/interactions"));
+        let failure = send_checked(
+            request,
+            MessageId::GoogleTranscriptionFailed,
+            &[],
+            Duration::from_secs(5),
+            Some(&trace),
+            Stage::Interaction,
+        )
+        .await
+        .expect_err("a 401 is a failure");
+        // The browser contract is exactly the one an unreadable body always had:
+        // a 401 still maps to the auth failure, its code and its own wording.
+        assert_eq!(failure.status, 502, "401 still maps to the auth failure");
+        assert_eq!(failure.code, "AUTH_FAILED");
+        assert_eq!(
+            failure.ui.key,
+            MessageId::GoogleTranscriptionAuthRejected,
+            "the auth wording, unchanged by the failed read"
+        );
+
+        trace.finish(Outcome::Error);
+        // The request's last clone goes with the trace, and the take is ended
+        // the way the shell ends it: only then does the writer seal it and
+        // write the `session_end` this test reads its lost count from. Reading
+        // the journal before that would see a take that is still open.
+        drop(trace);
+        end_take(&diagnostics, &handle, key, Outcome::Error);
+        let records = journal_records(&root);
+        let content: Vec<&Value> = records
+            .iter()
+            .filter(|record| record["event"] == "content")
+            .collect();
+        assert!(
+            content
+                .iter()
+                .all(|record| record["data"]["kind"] != "provider_response"),
+            "no response record claims a body that was never read: {content:?}"
+        );
+        let incomplete: Vec<&Value> = content
+            .iter()
+            .filter(|record| record["data"]["kind"] == "transport_error")
+            .copied()
+            .collect();
+        assert_eq!(
+            incomplete.len(),
+            1,
+            "one incomplete observation, one record: {incomplete:?}"
+        );
+        let body = incomplete[0]["data"]["body"]
+            .as_str()
+            .expect("the observation's body");
+        assert!(body.contains("\"body_incomplete\":true"), "{body}");
+        assert!(body.contains("\"reason\":\"body_unreadable\""), "{body}");
+        assert!(body.contains("\"stage\":\"interaction\""), "{body}");
+        assert!(
+            body.contains("\"status\":401"),
+            "the upstream's own status, not the mapped 502: {body}"
+        );
+        assert!(
+            body.contains("\"causes\":"),
+            "the source chain is recorded beside the message: {body}"
+        );
+        // The request's own terminal, read from the same one set of records:
+        // the failed read is a failed request, not a silent success.
+        let terminal = journal_event(&records, "request_end").expect("the request's terminal");
+        assert_eq!(terminal["data"]["outcome"], json!("error"), "{terminal}");
+        // And the lost observation really was counted, at the take's own end.
+        let end = journal_event(&records, "session_end").expect("the take's own end");
+        assert!(
+            end["data"]["dropped_events"].as_u64().unwrap_or(0) >= 1,
+            "the lost observation is counted: {end}"
+        );
+        // The archive was proven first; only now is the sink stopped, and only
+        // then is the root this test owns removed.
+        diagnostics.shutdown(Duration::from_millis(500));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A rejected upload records the status Google really sent; the browser's
@@ -1314,7 +1941,7 @@ mod tests {
         assert_eq!(open.len(), 1, "the stage is still open at the headers: {open:?}");
         assert!(matches!(open[0].phase, StagePhase::Begin));
 
-        let payload = read_stage_body(response, Some(&trace), Stage::UploadFinalize)
+        let payload = read_stage_body(response, Some(&trace), Stage::UploadFinalize, &[])
             .await
             .expect("the payload");
         assert_eq!(payload["file"]["name"], "files/abc");
@@ -1329,5 +1956,331 @@ mod tests {
             .expect("the stage ends at its body");
         assert_eq!(end.status, Some(200));
         assert!(end.elapsed_us.is_some());
+    }
+
+    /// The synthetic keys these tests echo into a body: constants of the test,
+    /// not secrets of any account, and exactly what the redaction assertions
+    /// look for. `SYNTHETIC_RING_KEY` also has a percent-encoded spelling of
+    /// its own, so a body cannot hide it behind `encodeURIComponent`.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    const SYNTHETIC_KEY: &str = "speechek-synthetic-key-9f3b7c1d";
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    const SYNTHETIC_RING_KEY: &str = "speechek/ring+key=2nd";
+
+    /// Every content record the sink has queued, drained in order.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn contents(diagnostics: &Diagnostics) -> Vec<crate::diagnostics::ContentRecord> {
+        diagnostics
+            .take_meta(64)
+            .into_iter()
+            .filter_map(|pending| match pending.meta {
+                Meta::Content(content) => Some(content.record),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The body of the archived provider response.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn archived_body(diagnostics: &Diagnostics) -> String {
+        contents(diagnostics)
+            .into_iter()
+            .find(|record| matches!(record.kind, ContentKind::ProviderResponse))
+            .expect("the response body is archived")
+            .body
+    }
+
+    /// A rejected stage keeps the whole body it answered with - past the
+    /// 300-character slice the browser is shown - with the status Google really
+    /// sent, and a key echoed inside that body is redacted rather than quoted.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    #[tokio::test]
+    async fn a_rejected_body_is_archived_in_full_with_its_actual_status() {
+        let key = Arc::new(SecretKey::new(SYNTHETIC_KEY.to_string()));
+        let ringed = Arc::new(SecretKey::new(SYNTHETIC_RING_KEY.to_string()));
+        let encoded = encode_uri_component(SYNTHETIC_RING_KEY);
+        assert_ne!(
+            encoded, SYNTHETIC_RING_KEY,
+            "the second key really has a distinct encoded spelling"
+        );
+        // Well past the 300 characters the browser-facing detail is cut to.
+        let tail = "x".repeat(400);
+        let body = json!({
+            "error": {
+                "message": format!(
+                    "rejected {SYNTHETIC_KEY} {SYNTHETIC_RING_KEY} {encoded} {tail}"
+                )
+            }
+        })
+        .to_string();
+        let port = head_then_body_server(
+            format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            ),
+            body,
+            Duration::ZERO,
+        );
+        let provider = Provider::for_test("http://127.0.0.1:1", "ws://127.0.0.1:1");
+        let (diagnostics, trace) = sink();
+        let request = provider
+            .http
+            .post(format!("http://127.0.0.1:{port}/v1beta/interactions"));
+        let failure = send_checked(
+            request,
+            MessageId::GoogleTranscriptionFailed,
+            &[Arc::clone(&key), Arc::clone(&ringed)],
+            Duration::from_secs(5),
+            Some(&trace),
+            Stage::Interaction,
+        )
+        .await
+        .expect_err("a 400 is a failure");
+
+        // The browser keeps exactly the redacted slice it always did.
+        assert_eq!(failure.status, 400);
+        assert!(!failure.message.contains(SYNTHETIC_KEY));
+        assert!(!failure.message.contains(SYNTHETIC_RING_KEY));
+        assert!(!failure.message.contains(&tail));
+
+        let archived = archived_body(&diagnostics);
+        assert!(
+            archived.contains("\"status\":400"),
+            "the status Google really sent: {archived}"
+        );
+        assert!(
+            archived.contains("\"stage\":\"interaction\""),
+            "the stage the body belongs to: {archived}"
+        );
+        assert!(
+            archived.contains(&tail),
+            "the whole body, not the 300-character detail: {archived}"
+        );
+        assert!(
+            !archived.contains(SYNTHETIC_KEY),
+            "a key echoed by the body is redacted: {archived}"
+        );
+        assert!(
+            !archived.contains(SYNTHETIC_RING_KEY),
+            "and so is a second key of the pinned ring: {archived}"
+        );
+        assert!(
+            !archived.contains(&encoded),
+            "the percent-encoded spelling of a key is redacted too: {archived}"
+        );
+    }
+
+    /// A long body that only holds unicode text is archived without a single
+    /// character being lost.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    #[tokio::test]
+    async fn a_long_unicode_body_is_archived_whole() {
+        let text = "привет-🌍-транскрипт-√".repeat(20);
+        let body = json!({ "output_text": text.clone() }).to_string();
+        let port = head_then_body_server(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            ),
+            body,
+            Duration::ZERO,
+        );
+        let provider = Provider::for_test("http://127.0.0.1:1", "ws://127.0.0.1:1");
+        let (diagnostics, trace) = sink();
+        let request = provider
+            .http
+            .post(format!("http://127.0.0.1:{port}/v1beta/interactions"));
+        let response = send_checked(
+            request,
+            MessageId::GoogleTranscriptionFailed,
+            &[],
+            Duration::from_secs(5),
+            Some(&trace),
+            Stage::Interaction,
+        )
+        .await
+        .expect("a 200");
+        let payload = read_stage_body(response, Some(&trace), Stage::Interaction, &[])
+            .await
+            .expect("the payload");
+        assert_eq!(extract_interaction_text(&payload), text);
+
+        let archived = archived_body(&diagnostics);
+        assert!(
+            archived.contains(&text),
+            "every character of the body is archived: {archived}"
+        );
+        assert!(
+            archived.contains("\"status\":200"),
+            "the stage's own status: {archived}"
+        );
+    }
+
+    /// A rejected stage whose body is larger than the renderer record limit is
+    /// still archived whole, with the status that came with it: the error path
+    /// has no cut-off of its own.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    #[tokio::test]
+    async fn a_large_ignored_body_is_archived_with_its_actual_status() {
+        let filler = "y".repeat(crate::diagnostics::RENDERER_CONTENT_MAX_BYTES + 4096);
+        let body = json!({ "error": { "message": filler.clone() } }).to_string();
+        let port = head_then_body_server(
+            format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            ),
+            body,
+            Duration::ZERO,
+        );
+        let provider = Provider::for_test("http://127.0.0.1:1", "ws://127.0.0.1:1");
+        let (diagnostics, trace) = sink();
+        let request = provider
+            .http
+            .post(format!("http://127.0.0.1:{port}/upload/v1beta/files"));
+        let failure = send_checked(
+            request,
+            MessageId::GoogleUploadStartFailed,
+            &[],
+            Duration::from_secs(5),
+            Some(&trace),
+            Stage::UploadStart,
+        )
+        .await
+        .expect_err("a 400 is a failure");
+        assert_eq!(failure.status, 400, "the browser keeps its own mapping");
+        // The whole error body is archived as it arrived, with the status
+        // Google really sent - not the browser's mapping and not a slice.
+        let archived = contents(&diagnostics)
+            .into_iter()
+            .find(|record| matches!(record.kind, ContentKind::ProviderResponse))
+            .expect("the error body is archived");
+        assert!(
+            archived.body.contains("\"status\":400"),
+            "the status that came with the body"
+        );
+        assert!(
+            archived.body.contains("\"stage\":\"upload_start\""),
+            "the stage the body belongs to"
+        );
+        assert!(
+            archived.body.contains(&filler),
+            "a body past the renderer record limit is archived whole: {} bytes",
+            archived.body.len()
+        );
+    }
+
+    /// Handing an ignored body to the archive never waits for it: the caller
+    /// returns while the body is still in flight, and the body - or the read
+    /// failure - is recorded afterwards.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    #[tokio::test]
+    async fn an_ignored_body_still_in_flight_never_blocks_its_caller() {
+        // Larger than the renderer record limit, so this also pins the
+        // observer's own cap at the sink's content budget.
+        let filler = "z".repeat(crate::diagnostics::RENDERER_CONTENT_MAX_BYTES + 4096);
+        let body = json!({ "file": { "name": "files/abc", "pad": filler } }).to_string();
+        let port = head_then_body_server(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            ),
+            body,
+            Duration::from_millis(1500),
+        );
+        let provider = Provider::for_test("http://127.0.0.1:1", "ws://127.0.0.1:1");
+        let (diagnostics, trace) = sink();
+        let request = provider
+            .http
+            .post(format!("http://127.0.0.1:{port}/upload/v1beta/files"));
+        let response = send_checked(
+            request,
+            MessageId::GoogleUploadStartFailed,
+            &[],
+            Duration::from_secs(5),
+            Some(&trace),
+            Stage::UploadStart,
+        )
+        .await
+        .expect("the headers arrive");
+
+        let began = std::time::Instant::now();
+        observe_body(response, Stage::UploadStart, &trace, &[]);
+        assert!(
+            began.elapsed() < Duration::from_millis(500),
+            "the caller does not wait for a body that is still in flight"
+        );
+
+        // The body lands long after the call returned; the observer is what
+        // picks it up, and the wait here is only the test's.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        let archived = contents(&diagnostics)
+            .into_iter()
+            .find(|record| record.body.contains("\"stage\":\"upload_start\""))
+            .expect("the late body is archived");
+        assert!(matches!(archived.kind, ContentKind::ProviderResponse));
+        assert!(archived.body.contains("files/abc"));
+        assert!(archived.body.contains("\"status\":200"));
+        assert!(
+            archived.body.len() > crate::diagnostics::RENDERER_CONTENT_MAX_BYTES,
+            "the observer's cap is the sink's content budget, not the renderer limit"
+        );
+    }
+
+    /// A body past the observer's cap cannot be the archive's copy of the
+    /// answer: the read stops, the observation is counted as lost, and the
+    /// record says what arrived, why there is no more and that the cap - not
+    /// the upstream - is the reason. A fragment is never passed off as the body.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    #[tokio::test]
+    async fn a_body_past_the_observer_cap_is_never_passed_off_as_the_body() {
+        let body = "z".repeat(crate::diagnostics::CONTENT_MAX_BYTES + 4096);
+        let port = head_then_body_server(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            ),
+            body,
+            Duration::ZERO,
+        );
+        let provider = Provider::for_test("http://127.0.0.1:1", "ws://127.0.0.1:1");
+        let (diagnostics, trace) = sink();
+        let request = provider
+            .http
+            .post(format!("http://127.0.0.1:{port}/upload/v1beta/files"));
+        let response = send_checked(
+            request,
+            MessageId::GoogleUploadStartFailed,
+            &[],
+            Duration::from_secs(5),
+            Some(&trace),
+            Stage::UploadStart,
+        )
+        .await
+        .expect("the headers arrive");
+        observe_body(response, Stage::UploadStart, &trace, &[]);
+
+        // The observer's record lands after the caller returned; the wait here
+        // is only the test's.
+        let mut archived = None;
+        for _ in 0..400 {
+            if let Some(record) = contents(&diagnostics)
+                .into_iter()
+                .find(|record| matches!(record.kind, ContentKind::TransportError))
+            {
+                archived = Some(record);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let archived = archived.expect("the incomplete observation is archived");
+        assert!(archived.body.contains("\"body_incomplete\":true"));
+        assert!(archived.body.contains("\"reason\":\"body_exceeds_cap\""));
+        assert!(archived.body.contains("\"stage\":\"upload_start\""));
+        assert!(archived.body.contains("\"status\":200"));
+        assert!(archived.body.contains("\"observed_bytes\":"));
+        assert!(
+            !archived.body.contains("zzzz"),
+            "no fragment of the body is presented as the body: {archived:?}"
+        );
     }
 }

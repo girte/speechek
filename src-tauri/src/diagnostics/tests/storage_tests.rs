@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 
 use parking_lot::Mutex;
 
-use super::super::storage::{ArchiveIo, ListedEntry, Manifest, RealIo, SESSION_RESERVE};
+use super::super::storage::{ArchiveIo, ListedEntry, Manifest, RealIo, SESSION_RESERVE, SNAPSHOT};
 use super::super::*;
 
 // ---------------------------------------------------------------------------
@@ -442,7 +442,7 @@ fn a_first_take_opens_a_private_bundle_with_a_compact_manifest() {
     assert!(parts[5].parse::<u64>().is_ok());
 
     let manifest = manifest_of(&dirs[0]).expect("a manifest");
-    assert_eq!(manifest.schema_version, 1);
+    assert_eq!(manifest.schema_version, 2);
     assert_eq!(manifest.owner, Owner::Dictation);
     assert_eq!(manifest.generation, 7);
     assert_eq!(manifest.mode, Mode::Smart);
@@ -460,7 +460,7 @@ fn a_first_take_opens_a_private_bundle_with_a_compact_manifest() {
         .into_iter()
         .find(|record| record["event"] == "session_begin")
         .expect("a session_begin record");
-    assert_eq!(record["schemaVersion"], 1);
+    assert_eq!(record["schemaVersion"], 2);
     assert_eq!(record["owner"], "dictation");
     assert_eq!(record["generation"], 7);
     assert_eq!(record["requestId"], serde_json::Value::Null);
@@ -671,6 +671,10 @@ fn a_manifest_left_open_by_an_earlier_run_is_rewritten_as_abandoned() {
     manifest = manifest_of(&dir).expect("a manifest");
     assert_eq!(manifest.outcome, Some(Outcome::Abandoned));
     assert_eq!(manifest.diagnostic_error, Some(DiagnosticCode::MissingTerminal));
+    assert_eq!(
+        manifest.schema_version, 2,
+        "the run that rewrote the manifest owns the schema it now carries"
+    );
     assert!(manifest.ended_utc_ms.is_some());
     assert!(!manifest.verified, "a partial is never verified by recovery");
     assert_eq!(manifest.audio_status, AudioStatus::Incomplete);
@@ -2940,5 +2944,481 @@ fn a_dropped_short_final_frame_is_the_tail_hole_and_pays_only_its_own_samples() 
         &surviving,
     )
     .expect("the two surviving bursts, sample for sample");
+    sink.shutdown(Duration::from_secs(2));
+}
+
+// ---------------------------------------------------------------------------
+// Content records
+// ---------------------------------------------------------------------------
+//
+// One queue, one writer and one journal carry the content a producer archives
+// beside the numeric events. Every test below drives the real sink: the bodies
+// are the ones a redacting producer would hand over, and an assertion is about
+// what a reader of the bundle finds on disk.
+
+/// The content records of one bundle, in journal order.
+fn content_records(dir: &Path) -> Vec<serde_json::Value> {
+    journal_records(dir)
+        .into_iter()
+        .filter(|record| record["event"] == "content")
+        .collect()
+}
+
+/// The bundle one owner and generation opened: the fourth field of the session
+/// directory name is the owner, the fifth the generation.
+fn bundle_of(logs: &Path, owner: &str, generation: u64) -> PathBuf {
+    session_dirs(logs)
+        .into_iter()
+        .find(|dir| {
+            let parts = session_name_parts(dir);
+            parts[3] == owner && parts[4] == generation.to_string()
+        })
+        .expect("the take's bundle")
+}
+
+#[test]
+fn a_content_body_far_past_the_bounded_record_size_is_saved_exactly() {
+    let scratch = Scratch::new("content-exact");
+    let logs = scratch.logs();
+    let cap = 1_000_000u64;
+    let sink = Diagnostics::for_test_with_storage(
+        &logs,
+        policy(Duration::from_secs(86_400), cap),
+        epoch(),
+    );
+    let handle = sink.begin(key(1), Mode::Smart).unwrap();
+
+    // Every shape a JSON string has to survive: multi-byte characters, both
+    // escapes, a newline and a tab, and the punctuation a URL carries. The
+    // body is far past the bound a report is held to, so a record that was
+    // shortened anywhere would not come back as itself.
+    let mut body = String::from("{\"text\":\"");
+    while body.len() < 12_000 {
+        body.push_str("éЖ🙂 \"quoted\" back\\slash %41 a&b<c>d\n\ttab ");
+    }
+    body.push_str("\"}");
+    assert!(
+        body.len() > RENDERER_REPORT_MAX_BYTES,
+        "the body is past the bounded record size"
+    );
+
+    assert!(
+        handle.content(ContentKind::RuntimeContext, ContentFormat::Text, body.clone()),
+        "the record is queued"
+    );
+    sink.worker_passes(4);
+
+    let dir = bundle(&logs, 1);
+    let records = content_records(&dir);
+    assert_eq!(records.len(), 1, "one record for the one body");
+    let record = &records[0];
+    assert_eq!(record["schemaVersion"], 2);
+    assert_eq!(record["source"], "shell", "a runtime context is the shell's");
+    assert_eq!(record["requestId"], serde_json::Value::Null);
+    assert_eq!(record["data"]["kind"], "runtime_context");
+    assert_eq!(record["data"]["format"], "text");
+    assert_eq!(record["data"]["route"], serde_json::Value::Null);
+    assert_eq!(
+        record["data"]["body"].as_str(),
+        Some(body.as_str()),
+        "the body is saved whole and comes back as itself"
+    );
+    assert!(record["data"]["observedUtcMs"].as_u64().is_some());
+    assert!(record["data"]["observedElapsedUs"].as_u64().is_some());
+    assert!(disk_total(&logs) <= cap, "the quota stayed bounded");
+    sink.shutdown(Duration::from_secs(2));
+}
+
+#[test]
+fn queue_pressure_counts_dropped_content_and_never_writes_part_of_a_body() {
+    let scratch = Scratch::new("content-pressure");
+    let logs = scratch.logs();
+    let sink = Diagnostics::for_test_with_storage(
+        &logs,
+        policy(Duration::from_secs(86_400), 10_000_000),
+        epoch(),
+    );
+    // The writer is held, so the shared queue really backs up and overflows.
+    sink.worker_pause();
+    let handle = sink.begin(key(1), Mode::Smart).unwrap();
+    let entry = sink.entry_for(key(1)).unwrap();
+
+    let extra = 20usize;
+    let mut bodies: Vec<String> = Vec::new();
+    let mut refused = 0u64;
+    for index in 0..(META_QUEUE + extra) {
+        let body = format!("content-record-{index}-{}", "p".repeat(300));
+        if !handle.content(ContentKind::CaptureContext, ContentFormat::Json, body.clone()) {
+            refused += 1;
+        }
+        bodies.push(body);
+    }
+    // The take's own begin record shares this queue, so the exact number of
+    // refusals is the queue's business; what this pins is that the queue really
+    // overflowed and that every refusal was counted as the drop it is.
+    assert!(refused > 0, "the queue really overflowed");
+    assert_eq!(
+        entry.dropped_events(),
+        refused,
+        "every record the queue refused is counted as the drop it is"
+    );
+
+    sink.worker_resume();
+    sink.worker_passes(24);
+
+    let dir = bundle(&logs, 1);
+    let written: Vec<String> = content_records(&dir)
+        .into_iter()
+        .map(|record| record["data"]["body"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert_eq!(
+        written.len() as u64,
+        META_QUEUE as u64 + extra as u64 - refused,
+        "exactly the records the queue took were written"
+    );
+    for body in &written {
+        assert!(
+            bodies.contains(body),
+            "a body was written in part: {} bytes",
+            body.len()
+        );
+    }
+
+    finish_take(&sink, &handle, Outcome::Success);
+    let manifest = manifest_of(&bundle(&logs, 1)).expect("a manifest");
+    assert_eq!(
+        manifest.dropped_events, refused,
+        "the drops the queue counted are in the manifest"
+    );
+    sink.shutdown(Duration::from_secs(2));
+}
+
+#[test]
+fn the_content_of_a_cancelled_take_is_preserved() {
+    let scratch = Scratch::new("content-cancelled");
+    let logs = scratch.logs();
+    let sink = Diagnostics::for_test_with_storage(
+        &logs,
+        policy(Duration::from_secs(86_400), 1_000_000),
+        epoch(),
+    );
+    let handle = sink.begin(key(1), Mode::Live).unwrap();
+    let interim = "the interim of a dictation that was cancelled".to_owned();
+    assert!(handle.content(ContentKind::LiveOutput, ContentFormat::Json, interim.clone()));
+
+    // The terminal rises while the record is still queued: the take is not
+    // closed over content it has not written yet, and a cancellation takes
+    // nothing that was already produced away.
+    finish_take(&sink, &handle, Outcome::Cancelled);
+
+    let dir = bundle(&logs, 1);
+    let manifest = manifest_of(&dir).expect("a manifest");
+    assert_eq!(manifest.outcome, Some(Outcome::Cancelled));
+    let records = content_records(&dir);
+    assert_eq!(records.len(), 1, "the cancelled take kept its content");
+    assert_eq!(records[0]["data"]["kind"], "live_output");
+    assert_eq!(records[0]["source"], "relay");
+    assert_eq!(records[0]["data"]["body"].as_str(), Some(interim.as_str()));
+    assert!(has_journal_event(&dir, "session_end"));
+    sink.shutdown(Duration::from_secs(2));
+}
+
+#[test]
+fn the_content_of_a_failed_take_is_preserved() {
+    let scratch = Scratch::new("content-failed");
+    let logs = scratch.logs();
+    let sink = Diagnostics::for_test_with_storage(
+        &logs,
+        policy(Duration::from_secs(86_400), 1_000_000),
+        epoch(),
+    );
+    let handle = sink.begin(key(1), Mode::Smart).unwrap();
+    let trace = handle.request(Route::Smart).unwrap();
+    let sent = format!("{{\"setup\": {{\"model\": \"{}\"}}}}", "m".repeat(5_000));
+    assert!(trace.content(ContentKind::ProviderRequest, ContentFormat::Json, sent.clone()));
+    trace.cause(RequestCause::UpstreamError);
+    trace.finish(Outcome::Error);
+    let request_id = trace.request_id();
+    drop(trace);
+    finish_take(&sink, &handle, Outcome::Error);
+
+    let dir = bundle(&logs, 1);
+    let manifest = manifest_of(&dir).expect("a manifest");
+    assert_eq!(manifest.outcome, Some(Outcome::Error));
+    assert!(
+        has_journal_event(&dir, "session_end"),
+        "the failed take closed its own journal"
+    );
+    let records = content_records(&dir);
+    assert_eq!(records.len(), 1, "the failed take kept its content");
+    assert_eq!(records[0]["source"], "provider");
+    assert_eq!(records[0]["data"]["kind"], "provider_request");
+    assert_eq!(records[0]["data"]["route"], "smart");
+    assert_eq!(records[0]["requestId"].as_u64(), Some(request_id));
+    assert_eq!(records[0]["data"]["body"].as_str(), Some(sent.as_str()));
+    sink.shutdown(Duration::from_secs(2));
+}
+
+#[test]
+fn an_archive_that_cannot_rewrite_its_manifest_counts_the_content_it_cannot_write() {
+    let scratch = Scratch::new("content-refused");
+    let logs = scratch.logs();
+    let io = ScriptedIo::new();
+    let sink = Diagnostics::with_io(
+        &logs,
+        policy(Duration::from_secs(86_400), 10_000_000),
+        epoch(),
+        io.clone(),
+    );
+    let handle = sink.begin(key(1), Mode::Smart).unwrap();
+    let entry = sink.entry_for(key(1)).unwrap();
+    let kept = "the request that was already archived".to_owned();
+    assert!(handle.content(ContentKind::ProviderRequest, ContentFormat::Json, kept.clone()));
+    sink.worker_passes(2);
+    let dir = bundle(&logs, 1);
+    assert!(has_journal_event(&dir, "content"), "the record is on disk");
+
+    // From here the manifest cannot be rewritten, exactly like a disk that
+    // refuses the replacement. The archive closes itself rather than claim a
+    // snapshot it could not write, and nothing that follows is written or
+    // silently reported as written.
+    io.fault(|faults| faults.replace_error = true);
+    sink.advance_clock(SNAPSHOT + Duration::from_millis(1));
+    sink.worker_passes(2);
+    assert_eq!(sink.error(), Some(DiagnosticCode::Io));
+    assert!(sink.is_enabled(), "the take failed, not the sink");
+
+    // A closed archive is not a fake success: whichever side refuses these -
+    // the take that will not queue them, or the sink that cannot write them -
+    // the count below is what the take is owed.
+    let dropped = 5u64;
+    for index in 0..dropped {
+        let _ = handle.content(
+            ContentKind::ProviderResponse,
+            ContentFormat::Text,
+            format!("later-answer-{index}"),
+        );
+    }
+    sink.worker_passes(4);
+    assert_eq!(
+        entry.dropped_events(),
+        dropped,
+        "every record the closed archive could not take is counted"
+    );
+    let records = content_records(&dir);
+    assert_eq!(records.len(), 1, "nothing later was written");
+    assert_eq!(records[0]["data"]["body"].as_str(), Some(kept.as_str()));
+    sink.shutdown(Duration::from_secs(2));
+}
+
+#[test]
+fn two_takes_and_their_requests_keep_their_content_apart() {
+    let scratch = Scratch::new("content-separate");
+    let logs = scratch.logs();
+    let sink = Diagnostics::for_test_with_storage(
+        &logs,
+        policy(Duration::from_secs(86_400), 10_000_000),
+        epoch(),
+    );
+    let dictation = sink.begin(key(1), Mode::Comparison).unwrap();
+    let lab = sink.begin(lab(1), Mode::Comparison).unwrap();
+    // Two routes of one comparison are two requests on one capture: each has
+    // its own trace, its own request id and its own content.
+    let live = dictation.request(Route::Live).unwrap();
+    let smart = dictation.request(Route::Smart).unwrap();
+
+    let live_body = "the frame the live relay received".to_owned();
+    let smart_body = "the answer the smart route received".to_owned();
+    let lab_body = "the laboratory's own context".to_owned();
+    assert!(live.content(ContentKind::LiveMessage, ContentFormat::Json, live_body.clone()));
+    assert!(smart.content(ContentKind::ProviderResponse, ContentFormat::Json, smart_body.clone()));
+    assert!(lab.content(ContentKind::RuntimeContext, ContentFormat::Text, lab_body.clone()));
+    sink.worker_passes(6);
+
+    let dictation_records = content_records(&bundle_of(&logs, "dictation", 1));
+    let lab_records = content_records(&bundle_of(&logs, "lab", 1));
+    assert_eq!(dictation_records.len(), 2, "two routes, two records");
+    assert_eq!(lab_records.len(), 1, "the lab's own take, its own record");
+
+    let carrying = |records: &[serde_json::Value], body: &str| -> serde_json::Value {
+        records
+            .iter()
+            .find(|record| record["data"]["body"].as_str() == Some(body))
+            .unwrap_or_else(|| panic!("no record of this bundle carries {body}"))
+            .clone()
+    };
+    let live_record = carrying(&dictation_records, &live_body);
+    assert_eq!(live_record["data"]["kind"], "live_message");
+    assert_eq!(live_record["data"]["route"], "live");
+    assert_eq!(live_record["source"], "relay");
+    assert_eq!(live_record["requestId"].as_u64(), Some(live.request_id()));
+
+    let smart_record = carrying(&dictation_records, &smart_body);
+    assert_eq!(smart_record["data"]["kind"], "provider_response");
+    assert_eq!(smart_record["data"]["route"], "smart");
+    assert_eq!(smart_record["source"], "provider");
+    assert_eq!(smart_record["requestId"].as_u64(), Some(smart.request_id()));
+    assert_ne!(live.request_id(), smart.request_id());
+
+    // The lab's record is in the lab's bundle only, and it belongs to no
+    // request at all.
+    let lab_record = carrying(&lab_records, &lab_body);
+    assert_eq!(lab_record["source"], "shell");
+    assert_eq!(lab_record["requestId"], serde_json::Value::Null);
+    assert_eq!(
+        manifest_of(&bundle_of(&logs, "lab", 1)).expect("a manifest").mode,
+        Mode::Comparison
+    );
+    sink.shutdown(Duration::from_secs(2));
+}
+
+#[test]
+fn raw_provider_text_is_archived_whole_and_classified_by_its_route() {
+    let scratch = Scratch::new("content-provider");
+    let logs = scratch.logs();
+    let sink = Diagnostics::for_test_with_storage(
+        &logs,
+        policy(Duration::from_secs(86_400), 10_000_000),
+        epoch(),
+    );
+    let handle = sink.begin(key(1), Mode::Comparison).unwrap();
+    let smart = handle.request(Route::Smart).unwrap();
+    let live = handle.request(Route::Live).unwrap();
+
+    // A malformed answer and a non-2xx body, both past the report bound: what
+    // the provider really sent is what has to be readable afterwards.
+    let malformed = format!("{{\"candidates\": [{{\"content\": \"{}\"", "x".repeat(6_000));
+    let rejected = format!("<html>429 {} </html>", "y".repeat(6_000));
+    let relay_error = "the live socket dropped".to_owned();
+    assert!(smart.content(
+        ContentKind::ProviderResponse,
+        ContentFormat::Json,
+        malformed.clone()
+    ));
+    assert!(smart.content(
+        ContentKind::TransportError,
+        ContentFormat::Text,
+        "the smart transport failed".to_owned()
+    ));
+    assert!(live.content(
+        ContentKind::ProviderResponse,
+        ContentFormat::Json,
+        rejected.clone()
+    ));
+    assert!(live.content(
+        ContentKind::TransportError,
+        ContentFormat::Text,
+        relay_error.clone()
+    ));
+    sink.worker_passes(6);
+
+    let dir = bundle(&logs, 1);
+    let records = content_records(&dir);
+    assert_eq!(records.len(), 4, "one record per body");
+    let carrying = |body: &str| -> serde_json::Value {
+        records
+            .iter()
+            .find(|record| record["data"]["body"].as_str() == Some(body))
+            .unwrap_or_else(|| panic!("no record carries {} bytes", body.len()))
+            .clone()
+    };
+
+    let bad = carrying(&malformed);
+    assert_eq!(bad["data"]["kind"], "provider_response");
+    assert_eq!(bad["data"]["format"], "json");
+    assert_eq!(bad["data"]["route"], "smart");
+    assert_eq!(bad["source"], "provider");
+    assert_eq!(bad["requestId"].as_u64(), Some(smart.request_id()));
+    assert_eq!(bad["data"]["body"].as_str(), Some(malformed.as_str()));
+
+    let refused = carrying(&rejected);
+    assert_eq!(refused["data"]["kind"], "provider_response");
+    assert_eq!(refused["data"]["body"].as_str(), Some(rejected.as_str()));
+
+    // A transport error follows the route it was produced on: the live relay's
+    // is the relay's, and everything else is the provider's.
+    let relay = carrying(&relay_error);
+    assert_eq!(relay["data"]["kind"], "transport_error");
+    assert_eq!(relay["source"], "relay");
+    assert_eq!(relay["requestId"].as_u64(), Some(live.request_id()));
+    let provider_side = carrying("the smart transport failed");
+    assert_eq!(provider_side["data"]["kind"], "transport_error");
+    assert_eq!(provider_side["source"], "provider");
+    sink.shutdown(Duration::from_secs(2));
+}
+
+#[test]
+fn the_servers_final_result_is_stored_whole_past_the_report_bound() {
+    let scratch = Scratch::new("content-result");
+    let logs = scratch.logs();
+    let sink = Diagnostics::for_test_with_storage(
+        &logs,
+        policy(Duration::from_secs(86_400), 10_000_000),
+        epoch(),
+    );
+    let take = sink.begin(lab(1), Mode::Comparison).unwrap();
+
+    // The wrapper's own technical report: a long final transcription and one
+    // error the script reported beside it. The result is the whole object the
+    // wrapper sends - all three mode maps - and it is past the 4096 bytes a
+    // report's numbers are held to.
+    let final_text = "final transcription ".repeat(400);
+    let result_body =
+        format!("{{\"results\":{{\"live\":\"{final_text}\"}},\"errors\":{{}},\"errorDetails\":{{}}}}");
+    let error_body = "{\"mode\":\"live\",\"message\":\"the socket closed early\"}";
+    let mut report = super::report(lab(1), 1);
+    report.result = Some(serde_json::from_str(&result_body).expect("the wrapper's result"));
+    report.errors = vec![serde_json::from_str(error_body).expect("the wrapper's error")];
+    assert_eq!(
+        sink.admit_renderer_report(report),
+        ReportAdmission::Accepted,
+        "the report is queued and its index committed"
+    );
+    sink.worker_passes(6);
+
+    let dir = bundle_of(&logs, "lab", 1);
+    let records = content_records(&dir);
+    let result = records
+        .iter()
+        .find(|record| record["data"]["kind"] == "recorder_result")
+        .expect("the result record");
+    assert_eq!(result["schemaVersion"], 2);
+    assert_eq!(result["source"], "renderer");
+    assert_eq!(result["data"]["format"], "json");
+    assert_eq!(result["data"]["route"], serde_json::Value::Null);
+    assert_eq!(result["requestId"], serde_json::Value::Null);
+    let stored = result["data"]["body"].as_str().expect("a body");
+    let stored_value: serde_json::Value =
+        serde_json::from_str(stored).expect("the stored result is JSON");
+    let expected: serde_json::Value =
+        serde_json::from_str(&result_body).expect("the wrapper's result");
+    assert_eq!(
+        stored_value, expected,
+        "the whole result is stored exactly as it was sanitized"
+    );
+    assert!(
+        stored.len() > RENDERER_REPORT_MAX_BYTES,
+        "the result is past the numeric report bound"
+    );
+    assert!(
+        stored.contains(&final_text),
+        "the long final transcription is intact"
+    );
+
+    let error = records
+        .iter()
+        .find(|record| record["data"]["kind"] == "recorder_error")
+        .expect("the error record");
+    let stored_error = error["data"]["body"].as_str().expect("a body");
+    let stored_error: serde_json::Value =
+        serde_json::from_str(stored_error).expect("the stored error is JSON");
+    let expected_error: serde_json::Value =
+        serde_json::from_str(error_body).expect("the wrapper's error");
+    assert_eq!(
+        stored_error, expected_error,
+        "the wrapper's error is stored whole"
+    );
+    assert_eq!(error["source"], "renderer");
+    assert_eq!(take.key(), lab(1));
     sink.shutdown(Duration::from_secs(2));
 }

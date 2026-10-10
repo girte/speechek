@@ -48,9 +48,9 @@ use super::flac::{self, FlacEncoder, FrameCommit};
 
 use super::{
     system_millis, ArchiveError, AudioGap, AudioPacket, AudioStatus, AudioVerified,
-    CaptureCounters, CaptureSnapshot, Clock, ClockAdjusted, DiagnosticCode, Event, Meta, Mode,
-    Outcome, Owner, PendingEvent, Policy, Registry, SessionBegin, SessionEnd, SessionEntry,
-    SessionKey,
+    CaptureCounters, CaptureSnapshot, Clock, ClockAdjusted, ContentFormat, ContentKind,
+    ContentRecord, DiagnosticCode, Event, Meta, Mode, Outcome, Owner, PendingEvent, Policy,
+    Registry, RendererReport, Route, SessionBegin, SessionEnd, SessionEntry, SessionKey,
 };
 
 // ---------------------------------------------------------------------------
@@ -310,7 +310,7 @@ impl FrameCommit for FileCommit<'_> {
 /// How often the worker looks at its queues.
 const WAKE: Duration = Duration::from_millis(100);
 /// How often an open take's counters reach its journal.
-const SNAPSHOT: Duration = Duration::from_secs(1);
+pub(crate) const SNAPSHOT: Duration = Duration::from_secs(1);
 /// How often retention and the quota sweep the tree.
 const SWEEP: Duration = Duration::from_secs(60);
 /// Metadata records one pass takes from the shared queue outside shutdown.
@@ -322,8 +322,11 @@ pub(crate) const SESSION_RESERVE: u64 = 8_192;
 const FINAL_RECORD_MAX: usize = 4_096;
 /// The largest manifest the reserve has to cover.
 const MANIFEST_MAX_BYTES: usize = 2_048;
-/// Schema version of `session.json` and of every journal record.
-const SCHEMA_VERSION: u32 = 1;
+/// Schema version of `session.json` and of every journal record. Version 2 is
+/// version 1 plus the content records ([`record_content_line`]): the envelope
+/// is the one version 1 wrote, so a bundle an earlier run left behind still
+/// decodes and recovers, and only what a take writes now carries 2.
+const SCHEMA_VERSION: u32 = 2;
 /// A journal segment is rotated before a record would pass this length.
 const JSONL_MAX_BYTES: u64 = 1_000_000;
 
@@ -925,6 +928,30 @@ fn source_of(event: &Event) -> Source {
     }
 }
 
+/// The side of one take a content record came from. Most kinds say it outright;
+/// the two that follow the traffic - a transport error and the close of a
+/// socket - are read from the route the record was produced on, and a
+/// transport error with no route never reached a relay at all.
+fn source_of_content(kind: ContentKind, route: Option<Route>) -> Source {
+    match kind {
+        ContentKind::RuntimeContext
+        | ContentKind::PasteRequested
+        | ContentKind::PasteResult => Source::Shell,
+        ContentKind::CaptureContext => Source::Capture,
+        ContentKind::LiveSetup | ContentKind::LiveMessage | ContentKind::LiveOutput => Source::Relay,
+        ContentKind::SocketClose => Source::Relay,
+        ContentKind::ProviderRequest | ContentKind::ProviderResponse => Source::Provider,
+        ContentKind::RecorderResult | ContentKind::RecorderError => Source::Renderer,
+        ContentKind::TransportError => {
+            if matches!(route, Some(Route::Live)) {
+                Source::Relay
+            } else {
+                Source::Provider
+            }
+        }
+    }
+}
+
 /// One typed envelope flattened with the event's `event` and `data` fields.
 /// Serializes borrowed identifiers directly, without intermediate maps or values.
 #[allow(clippy::too_many_arguments)]
@@ -970,6 +997,78 @@ fn record_line(
     let mut line = serde_json::to_vec(&record).map_err(|_| DiagnosticCode::Io)?;
     line.push(b'\n');
     Ok(line)
+}
+
+/// The tag of the one event a content record carries.
+const CONTENT_EVENT: &str = "content";
+
+/// One content record: the same envelope [`record_line`] writes, with the
+/// `content` event and the record's own fields beside it. The record is
+/// borrowed and serialized as it stands - a body is never shortened, re-encoded
+/// or inspected here, and a record too large for the quota is counted as lost
+/// rather than written in part.
+#[allow(clippy::too_many_arguments)]
+fn record_content_line(
+    run_id: &str,
+    session_id: &str,
+    key: SessionKey,
+    sequence: u64,
+    request_id: Option<u64>,
+    utc_ms: u64,
+    elapsed_us: u64,
+    record: &ContentRecord,
+) -> Result<Vec<u8>, DiagnosticCode> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Envelope<'a> {
+        schema_version: u32,
+        sequence: u64,
+        run_id: &'a str,
+        session_id: &'a str,
+        owner: Owner,
+        generation: u64,
+        request_id: Option<u64>,
+        utc_ms: u64,
+        elapsed_us: u64,
+        source: Source,
+        event: &'static str,
+        data: &'a ContentRecord,
+    }
+    let envelope = Envelope {
+        schema_version: SCHEMA_VERSION,
+        sequence,
+        run_id,
+        session_id,
+        owner: key.owner,
+        generation: key.generation,
+        request_id,
+        utc_ms,
+        elapsed_us,
+        source: source_of_content(record.kind, record.route),
+        event: CONTENT_EVENT,
+        data: record,
+    };
+    let mut line = serde_json::to_vec(&envelope).map_err(|_| DiagnosticCode::Io)?;
+    line.push(b'\n');
+    Ok(line)
+}
+
+/// One content record of an admitted renderer report: the value exactly as it
+/// was sanitized before the report was queued, with the times the report was
+/// observed rather than the time it is written.
+fn report_content(
+    report: &RendererReport,
+    kind: ContentKind,
+    value: &serde_json::Value,
+) -> ContentRecord {
+    ContentRecord {
+        kind,
+        route: None,
+        format: ContentFormat::Json,
+        body: value.to_string(),
+        observed_utc_ms: report.observed_utc_ms,
+        observed_elapsed_us: report.observed_elapsed_us,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,6 +1307,46 @@ impl Active {
             elapsed_us,
             event,
         )?;
+        self.append_record(state, &dir, line)
+    }
+
+    /// The same append for a content record: one envelope, one rotation and one
+    /// admission with the typed events, and a body that is never shortened to
+    /// make it fit. A record the archive cannot take is counted as the lost
+    /// record it is, exactly like an event that could not be written.
+    fn emit_content(
+        &mut self,
+        state: &mut State,
+        request_id: Option<u64>,
+        record: &ContentRecord,
+        utc_ms: u64,
+        elapsed_us: u64,
+    ) -> Result<(), DiagnosticCode> {
+        let Some(dir) = self.dir.clone() else {
+            return Err(DiagnosticCode::Quota);
+        };
+        let line = record_content_line(
+            &state.run_id,
+            &self.session_id,
+            self.key,
+            self.sequence + 1,
+            request_id,
+            utc_ms,
+            elapsed_us,
+            record,
+        )?;
+        self.append_record(state, &dir, line)
+    }
+
+    /// The one append both record kinds share: the segment is rotated before a
+    /// record would pass its limit, the exact growth is admitted and the whole
+    /// line is written or the record is counted as lost.
+    fn append_record(
+        &mut self,
+        state: &mut State,
+        dir: &Path,
+        line: Vec<u8>,
+    ) -> Result<(), DiagnosticCode> {
         if self.jsonl.is_some() && self.jsonl_len + line.len() as u64 > JSONL_MAX_BYTES {
             if let Some(file) = self.jsonl.as_mut() {
                 let _ = state.io.sync(file);
@@ -1216,7 +1355,7 @@ impl Active {
             self.jsonl_index += 1;
             self.jsonl_len = 0;
         }
-        let path = self.jsonl_path(&dir);
+        let path = self.jsonl_path(dir);
         if self.jsonl.is_none() {
             let file = state.io.create_file(&path)?;
             state.ledger.note_file(&path, 0);
@@ -1978,6 +2117,9 @@ impl State {
         if next.package_version != env!("CARGO_PKG_VERSION") {
             next.package_version = env!("CARGO_PKG_VERSION").to_owned();
         }
+        // The run that rewrites a manifest is the run whose schema the file
+        // follows: the journal beside it may gain a record this run shapes.
+        next.schema_version = SCHEMA_VERSION;
         let Ok(bytes) = next.encode() else {
             return;
         };
@@ -2307,11 +2449,38 @@ impl State {
                     self.record_lost(key);
                     return;
                 }
+                // The report itself is sanitized on the producer side. Its
+                // result and its errors are written beside the snapshot, one
+                // record at a time and in that order, and the lease the report
+                // holds stays held until the last of them is on disk: it is
+                // dropped here, after the writes, and never taken out of the
+                // report early. Nothing is collected first - the report is the
+                // writer's own value, so each record is serialized once, as it
+                // is emitted.
                 let snapshot = Event::RendererSnapshot(report.snapshot());
                 self.emit_event(key, None, &snapshot);
                 for boundary in &report.events {
                     self.emit_event(key, None, &Event::RendererBoundary(*boundary));
                 }
+                if let Some(result) = report.result.as_ref() {
+                    let record = report_content(&report, ContentKind::RecorderResult, result);
+                    self.emit_content(key, None, &record);
+                }
+                for error in &report.errors {
+                    let record = report_content(&report, ContentKind::RecorderError, error);
+                    self.emit_content(key, None, &record);
+                }
+            }
+            Meta::Content(queued) => {
+                if !self.sessions.contains_key(&key) {
+                    self.record_lost(key);
+                    return;
+                }
+                // The whole record is written or the record is counted lost:
+                // a body is never shortened to fit a segment or the quota. The
+                // queue's own lease is held for exactly as long as its record
+                // is being written and released when `queued` falls here.
+                self.emit_content(key, pending.request_id, &queued.record);
             }
         }
     }
@@ -2328,6 +2497,27 @@ impl State {
             return;
         }
         let result = active.emit(self, request_id, event, utc_ms, elapsed_us);
+        self.sessions.insert(key, active);
+        if let Err(code) = result {
+            self.disable_take(key, code);
+        }
+    }
+
+    /// The content half of [`Self::emit_event`], with the same take state, the
+    /// same admission and the same rotation: one queue, one writer and one
+    /// journal for both kinds, and the record's own times are the write's.
+    fn emit_content(&mut self, key: SessionKey, request_id: Option<u64>, record: &ContentRecord) {
+        let utc_ms = self.utc_ms();
+        let elapsed_us = self.elapsed_us();
+        let Some(mut active) = self.sessions.remove(&key) else {
+            return;
+        };
+        if active.dir.is_none() || active.disable_writes {
+            self.sessions.insert(key, active);
+            self.record_lost(key);
+            return;
+        }
+        let result = active.emit_content(self, request_id, record, utc_ms, elapsed_us);
         self.sessions.insert(key, active);
         if let Err(code) = result {
             self.disable_take(key, code);

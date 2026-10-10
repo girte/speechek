@@ -65,6 +65,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::i18n::{MessageId, UiError, UiMessage};
 
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+use crate::diagnostics::{ContentFormat, ContentKind, SessionHandle};
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+use serde_json::json;
+
 /// The transcript is not left as a promise forever: after this long without a
 /// decision the promise becomes ordinary text whether or not anyone read it.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -251,6 +256,188 @@ enum Startup {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Development diagnostics                                                     */
+/* -------------------------------------------------------------------------- */
+// Every item in this block is compiled out of a build without the diagnostics
+// feature: no argument, no snapshot, no serialization, nothing allocated. What
+// these records carry is observation, never identity — the numbers a
+// transaction already had and the closed labels of its own stages. The
+// transcript, the target window's class and title, the shell's own failure
+// sentences and any credential never travel through here.
+
+/// The address of a window as a number: the handle a caller already had, never
+/// the window's name.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn hwnd_address(hwnd: HWND) -> u64 {
+    hwnd.0 as usize as u64
+}
+
+/// Records how a transaction's target was decided. `target` exists exactly when
+/// the foreground was attributable and was not this process's window, so
+/// `selected` and `own_process` cannot be confused with a window whose process
+/// Windows refused to name, and `own_process_id` is never read as the target's.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_target(
+    diagnostics: Option<&SessionHandle>,
+    own_process: u32,
+    observed: Option<(HWND, Option<u32>)>,
+    target: Option<HWND>,
+) {
+    let Some(session) = diagnostics else {
+        return;
+    };
+    let (decision, target_pid) = match observed {
+        // No window owned the foreground: there was nothing to exclude.
+        None => ("no_foreground", None),
+        // The foreground was attributable and not ours: this transaction has a
+        // target.
+        Some((_, Some(process))) if target.is_some() => ("selected", Some(process)),
+        // The foreground was speechek's own window: it is excluded on purpose,
+        // and this number is why.
+        Some((_, Some(process))) if process == own_process => ("own_process", Some(process)),
+        // Windows named no process for the foreground window, so no chord may
+        // ever be trusted to it.
+        Some((_, process)) => ("unknown_pid", process),
+    };
+    let _ = session.content(
+        ContentKind::PasteRequested,
+        ContentFormat::Json,
+        json!({
+            "origin": "native",
+            "stage": "target",
+            "decision": decision,
+            "excluded": decision == "own_process",
+            // The process the caller named as its own; never the target's.
+            "own_process_id": own_process,
+            "target_pid": target_pid,
+            // Where the foreground was, and what it was asked to receive.
+            "foreground_hwnd": observed.map(|(hwnd, _)| hwnd_address(hwnd)).unwrap_or(0),
+            "target_hwnd": target.map(hwnd_address).unwrap_or(0),
+        })
+        .to_string(),
+    );
+}
+
+/// The transaction's small fields, read while `Job.tx` is held and nothing
+/// else: no record is built, sent or looked up until the guard is dropped.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+struct NativeSnapshot {
+    chord: &'static str,
+    injected: bool,
+    reads: usize,
+    read_after_chord: bool,
+    foreground_held: bool,
+    taken_over: bool,
+    cancelled: bool,
+    settled: bool,
+    own_sequence: u32,
+    elapsed_ms: u64,
+}
+
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+impl NativeSnapshot {
+    fn of(tx: &Tx) -> Self {
+        Self {
+            chord: match tx.chord {
+                Chord::Pending => "pending",
+                Chord::Sent => "sent",
+                Chord::Failed => "failed",
+                Chord::Skipped => "skipped",
+            },
+            injected: tx.injected_at.is_some(),
+            reads: tx.reads.len(),
+            read_after_chord: tx.last_read().is_some(),
+            foreground_held: tx.foreground_held,
+            taken_over: tx.taken_over,
+            cancelled: tx.cancelled,
+            settled: tx.settled,
+            own_sequence: tx.own_sequence,
+            elapsed_ms: tx.published_at.elapsed().as_millis() as u64,
+        }
+    }
+}
+
+/// The body both stages share, so the same observation carries the same name
+/// wherever it appears; a stage adds its own fields to this object.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn native_body(stage: &'static str, snapshot: &NativeSnapshot) -> Value {
+    json!({
+        "origin": "native",
+        "stage": stage,
+        "chord": snapshot.chord,
+        "injected": snapshot.injected,
+        "reads": snapshot.reads,
+        "read_after_chord": snapshot.read_after_chord,
+        "foreground_held": snapshot.foreground_held,
+        "taken_over": snapshot.taken_over,
+        "cancelled": snapshot.cancelled,
+        "settled": snapshot.settled,
+        "own_sequence": snapshot.own_sequence,
+        "elapsed_ms": snapshot.elapsed_ms,
+    })
+}
+
+/// What the transaction did with the chord, just after the caller decided. The
+/// reads are counted here even though they are not yet quiet, which is what
+/// tells a slow target apart from one that never read at all.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_chord(diagnostics: Option<&SessionHandle>, job: &Job, target: Option<HWND>) {
+    let Some(session) = diagnostics else {
+        return;
+    };
+    // The fields are read under the transaction's lock, and the guard is
+    // dropped at the end of this block: nothing is built or sent while it is
+    // held.
+    let snapshot = {
+        let tx = job.tx.lock();
+        NativeSnapshot::of(&tx)
+    };
+    let mut body = native_body("chord", &snapshot);
+    body["target_hwnd"] = json!(target.map(hwnd_address).unwrap_or(0));
+    let _ = session.content(ContentKind::PasteRequested, ContentFormat::Json, body.to_string());
+}
+
+/// The outcome the caller is about to receive, with the state that produced it:
+/// the chord as it ended, the reads, whether the foreground held, the sequence,
+/// and whether the clipboard was materialized. `code` is one of the stable
+/// `&'static str` codes that already cross the command boundary, never the
+/// shell's sentence for the failure.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_settled(
+    diagnostics: Option<&SessionHandle>,
+    job: &Job,
+    outcome: &'static str,
+    code: &'static str,
+    materialized: bool,
+) {
+    let Some(session) = diagnostics else {
+        return;
+    };
+    let snapshot = {
+        let tx = job.tx.lock();
+        NativeSnapshot::of(&tx)
+    };
+    let mut body = native_body("settled", &snapshot);
+    body["outcome"] = json!(outcome);
+    body["code"] = json!(code);
+    body["materialized"] = json!(materialized);
+    let _ = session.content(ContentKind::PasteResult, ContentFormat::Json, body.to_string());
+}
+
+/// The outcome as one closed label, the stable code, and whether the clipboard
+/// was materialized. Inserted and `CopiedFallback` are exactly the two ways
+/// `materialize` succeeds, so a materialized flag is never reported for a
+/// failure.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn native_result(result: &Result<Settlement, UiError>) -> (&'static str, &'static str, bool) {
+    match result {
+        Ok(Settlement::Inserted) => ("inserted", "ok", true),
+        Ok(Settlement::CopiedFallback) => ("copied_fallback", "ok", true),
+        Err(error) => ("failed", error.code, false),
+    }
+}
+
+/* -------------------------------------------------------------------------- */
 /* Public entry points                                                         */
 /* -------------------------------------------------------------------------- */
 
@@ -286,7 +473,17 @@ fn window_process(hwnd: HWND) -> Option<u32> {
 ///
 /// Blocking: waits for the read receipt, the quiet period, and at most
 /// [`SETTLE_TIMEOUT`]. Never run it on a thread that has to answer messages.
-pub fn transact(text: Arc<String>, target: Option<HWND>) -> Result<Settlement, UiError> {
+///
+/// The `diagnostics` argument is compiled out of every build without the
+/// diagnostics feature. Where it exists it carries the take's session, on which
+/// the transaction records what it observed of itself — its chord, its reads,
+/// its sequence and its outcome, as numbers and closed labels only.
+pub fn transact(
+    text: Arc<String>,
+    target: Option<HWND>,
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    diagnostics: Option<&SessionHandle>,
+) -> Result<Settlement, UiError> {
     let job = Arc::new(Job {
         tx: Mutex::new(Tx::new()),
         text,
@@ -301,10 +498,29 @@ pub fn transact(text: Arc<String>, target: Option<HWND>) -> Result<Settlement, U
 
     match ready_rx.recv() {
         Ok(Ok(Startup::Published)) => {}
-        Ok(Ok(Startup::Settled(settlement))) => return Ok(settlement),
-        Ok(Ok(Startup::Unavailable(error))) => return Err(error),
-        Ok(Err(error)) => return Err(error),
-        Err(_) => return Err(failure(PASTE_FAILED, MessageId::PasteWorkerStoppedEarly)),
+        Ok(Ok(Startup::Settled(settlement))) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            {
+                let (outcome, code, materialized) = native_result(&Ok(settlement));
+                note_settled(diagnostics, &job, outcome, code, materialized);
+            }
+            return Ok(settlement);
+        }
+        Ok(Ok(Startup::Unavailable(error))) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_settled(diagnostics, &job, "failed", error.code, false);
+            return Err(error);
+        }
+        Ok(Err(error)) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_settled(diagnostics, &job, "failed", error.code, false);
+            return Err(error);
+        }
+        Err(_) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_settled(diagnostics, &job, "failed", PASTE_FAILED, false);
+            return Err(failure(PASTE_FAILED, MessageId::PasteWorkerStoppedEarly));
+        }
     }
 
     // The chord: only a target that owns the foreground may get one, and only if
@@ -337,9 +553,23 @@ pub fn transact(text: Arc<String>, target: Option<HWND>) -> Result<Settlement, U
         }
     }
 
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    note_chord(diagnostics, &job, target);
+
     match settled_rx.recv() {
-        Ok(result) => result,
-        Err(_) => Err(failure(PASTE_FAILED, MessageId::PasteWorkerStoppedUnsettled)),
+        Ok(result) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            {
+                let (outcome, code, materialized) = native_result(&result);
+                note_settled(diagnostics, &job, outcome, code, materialized);
+            }
+            result
+        }
+        Err(_) => {
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_settled(diagnostics, &job, "lost", PASTE_FAILED, false);
+            Err(failure(PASTE_FAILED, MessageId::PasteWorkerStoppedUnsettled))
+        }
     }
 }
 
@@ -350,10 +580,34 @@ pub fn transact(text: Arc<String>, target: Option<HWND>) -> Result<Settlement, U
 /// A window whose process cannot be established is not trusted with a chord
 /// either; like `own_process` itself and a missing foreground, it leaves the
 /// transcript in the clipboard alone.
-pub fn transact_foreground(text: Arc<String>, own_process: u32) -> Result<Settlement, UiError> {
-    let target = foreground_window()
-        .filter(|hwnd| window_process(*hwnd).is_some_and(|process| process != own_process));
-    transact(text, target)
+///
+/// The `diagnostics` argument is compiled out of every build without the
+/// diagnostics feature. Where it exists it carries the take's session, on which
+/// the decision this function just made is recorded — the two process numbers,
+/// the foreground window's address and the closed label of the decision, never
+/// the window's name and never the transcript.
+pub fn transact_foreground(
+    text: Arc<String>,
+    own_process: u32,
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    diagnostics: Option<&SessionHandle>,
+) -> Result<Settlement, UiError> {
+    // The foreground is read once: the same observation picks the target and is
+    // what the diagnostics report, so a record can never name a window the
+    // chord did not come from. The process Windows names for that window is
+    // what the exclusion compares; it is never read as the target's own.
+    let observed = foreground_window().map(|hwnd| (hwnd, window_process(hwnd)));
+    let target = observed
+        .filter(|(_, process)| process.is_some_and(|process| process != own_process))
+        .map(|(hwnd, _)| hwnd);
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    note_target(diagnostics, own_process, observed, target);
+    transact(
+        text,
+        target,
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        diagnostics,
+    )
 }
 
 /* -------------------------------------------------------------------------- */

@@ -27,11 +27,16 @@
 //! producer side never touches a file: it queues a number or a record and the
 //! worker writes it.
 //!
-//! Everything a producer hands over is a number, a boolean, a fixed enum or a
-//! generated [`MessageId`]; no free-form string, no device name, no URL, no
-//! header, no body and no transcript can travel through these types.
+//! Counter events remain a closed numeric vocabulary. Development content
+//! records also preserve full provider, recorder and paste evidence, redacted
+//! at the boundary before it enters this same bounded writer.
 mod flac;
 mod storage;
+mod content;
+pub(crate) mod redaction;
+pub use content::{ContentFormat, ContentKind, ContentRecord};
+pub(crate) use content::{QueuedContent, CONTENT_MAX_BYTES};
+use content::{ContentBudget, ContentLease};
 
 
 #[cfg(all(test, debug_assertions, feature = "dev-diagnostics"))]
@@ -64,6 +69,8 @@ const MAX_OPEN_SESSIONS: usize = 64;
 pub(crate) const RENDERER_EVENTS_MAX: usize = 16;
 /// Serialized size of one accepted renderer report.
 pub(crate) const RENDERER_REPORT_MAX_BYTES: usize = 4096;
+/// Full recorder results share the route but can exceed the technical envelope.
+pub(crate) const RENDERER_CONTENT_MAX_BYTES: usize = 1024 * 1024;
 /// How long a sealed candidate waits for the last request to end.
 const SEAL_GRACE: Duration = Duration::from_secs(2);
 /// How long a take whose capture has ended, with no live request, waits for a
@@ -887,6 +894,7 @@ struct AudioPacket {
 pub(crate) enum Meta {
     Event(Event),
     Renderer(RendererReport),
+    Content(QueuedContent),
 }
 
 #[derive(Clone, Debug)]
@@ -916,8 +924,8 @@ fn fill_pool(free: &SyncSender<Vec<u8>>) {
 // The session record
 // ---------------------------------------------------------------------------
 
-/// Everything the shell, the capture, the relay and the writer share about one
-/// take. Nothing here is a path, a secret or a string.
+/// Shared take state. Redaction handles stay in memory; only sanitized evidence
+/// reaches the bounded writer, which alone owns paths and files.
 struct SessionEntry {
     key: SessionKey,
     mode: Mode,
@@ -930,6 +938,9 @@ struct SessionEntry {
     free_tx: SyncSender<Vec<u8>>,
     capture_pool: Mutex<Option<Receiver<Vec<u8>>>>,
     meta_tx: SyncSender<PendingEvent>,
+    content_budget: Arc<ContentBudget>,
+    /// Borrowed secret handles from every request revision of this take; never serialized.
+    redaction_keys: Mutex<Vec<Arc<crate::secrets::SecretKey>>>,
     capture: CaptureAtomics,
     /// This take's own failure class, readable even when its record cannot be
     /// written. The sink keeps its own copy for the operator.
@@ -986,6 +997,7 @@ impl SessionEntry {
         started_utc_ms: u64,
         session_counter: u64,
         meta_tx: SyncSender<PendingEvent>,
+        content_budget: Arc<ContentBudget>,
     ) -> Self {
         let now = clock.instant();
         let (audio_tx, audio_rx) = sync_channel(AUDIO_QUEUE);
@@ -1003,6 +1015,8 @@ impl SessionEntry {
             free_tx,
             capture_pool: Mutex::new(Some(free_rx)),
             meta_tx,
+            content_budget,
+            redaction_keys: Mutex::new(Vec::new()),
             capture: CaptureAtomics::default(),
             error: Mutex::new(None),
             requests: Mutex::new(HashMap::new()),
@@ -1151,6 +1165,40 @@ impl SessionEntry {
         event: Event,
     ) -> bool {
         if self.push_meta_relay(request_id, relay, Meta::Event(event)) {
+            return true;
+        }
+        self.note_dropped_event();
+        false
+    }
+
+    fn push_content(
+        &self,
+        request_id: Option<u64>,
+        route: Option<Route>,
+        kind: ContentKind,
+        format: ContentFormat,
+        body: String,
+    ) -> bool {
+        if self.is_sealed() || !self.archive_enabled() {
+            self.note_dropped_event();
+            return false;
+        }
+        let Some(lease) = self.content_budget.claim(body.capacity() as u64) else {
+            self.note_dropped_event();
+            return false;
+        };
+        let queued = QueuedContent {
+            record: ContentRecord {
+                kind,
+                route,
+                format,
+                body,
+                observed_utc_ms: system_millis(self.clock.system()),
+                observed_elapsed_us: self.elapsed_us(),
+            },
+            _lease: lease,
+        };
+        if self.push_meta(request_id, Meta::Content(queued)) {
             return true;
         }
         self.note_dropped_event();
@@ -1405,6 +1453,40 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// Lab requests may use different revisions; keep their redactors until sealing.
+    pub(crate) fn remember_keys(&self, keys: &[Arc<crate::secrets::SecretKey>]) {
+        let mut known = self.entry.redaction_keys.lock();
+        for key in keys {
+            if !known.iter().any(|old| Arc::ptr_eq(old, key)) {
+                known.push(Arc::clone(key));
+            }
+        }
+    }
+
+    pub(crate) fn redact_renderer_content(&self, report: &mut RendererReport) {
+        let keys = self.entry.redaction_keys.lock();
+        if let Some(result) = report.result.as_mut() {
+            crate::backend::diagnostic_redact_value(result, &keys);
+        }
+        for error in &mut report.errors {
+            crate::backend::diagnostic_redact_value(error, &keys);
+        }
+    }
+
+    /// Native producers use the same take's remembered request revisions.
+    pub fn redacted_content_json(&self, kind: ContentKind, body: &serde_json::Value) -> bool {
+        let rendered = {
+            let keys = self.entry.redaction_keys.lock();
+            crate::backend::diagnostic_json(body, &keys)
+        };
+        self.entry.push_content(None, None, kind, ContentFormat::Json, rendered)
+    }
+
+    /// The caller must redact credentials using the take's pinned boundary.
+    pub fn content(&self, kind: ContentKind, format: ContentFormat, body: String) -> bool {
+        self.entry.push_content(None, None, kind, format, body)
+    }
+
     #[cfg(all(test, debug_assertions, feature = "dev-diagnostics"))]
     pub fn key(&self) -> SessionKey {
         self.entry.key
@@ -1664,6 +1746,16 @@ pub struct RequestTrace {
 }
 
 impl RequestTrace {
+    /// Full, already-redacted evidence owned by this request and mode.
+    pub fn content(&self, kind: ContentKind, format: ContentFormat, body: String) -> bool {
+        self.state.entry.push_content(Some(self.state.id), Some(self.state.route), kind, format, body)
+    }
+
+    /// An observation was not captured whole; do not present its archive as complete.
+    pub fn note_content_lost(&self) {
+        self.state.entry.note_dropped_event();
+    }
+
 
     #[cfg(all(test, debug_assertions, feature = "dev-diagnostics"))]
     pub fn request_id(&self) -> u64 {
@@ -1985,6 +2077,16 @@ pub struct RendererReport {
     #[serde(default)]
     pub terminal_outcome: Option<RendererTerminal>,
     pub events: Vec<RendererBoundary>,
+    #[serde(default)]
+    pub result: Option<serde_json::Value>,
+    #[serde(default)]
+    pub errors: Vec<serde_json::Value>,
+    #[serde(skip)]
+    pub(crate) observed_utc_ms: u64,
+    #[serde(skip)]
+    pub(crate) observed_elapsed_us: u64,
+    #[serde(skip)]
+    _content_lease: Option<ContentLease>,
 }
 
 impl RendererReport {
@@ -2032,6 +2134,11 @@ impl RendererReport {
             }
         }
         if self.events.len() > RENDERER_EVENTS_MAX {
+            return Err(DiagnosticCode::InvalidReport);
+        }
+        if self.result.as_ref().is_some_and(|result| !content::valid_result(result))
+            || self.errors.iter().any(|error| !content::valid_error(error))
+        {
             return Err(DiagnosticCode::InvalidReport);
         }
         for event in &self.events {
@@ -2126,6 +2233,7 @@ pub struct Diagnostics {
     registry: Arc<Mutex<Registry>>,
     meta_tx: SyncSender<PendingEvent>,
     meta_rx: Arc<Mutex<Receiver<PendingEvent>>>,
+    content_budget: Arc<ContentBudget>,
     next_session: AtomicU64,
     closed: AtomicBool,
     error: Arc<Mutex<Option<DiagnosticCode>>>,
@@ -2220,6 +2328,7 @@ impl Diagnostics {
                     registry: Arc::new(Mutex::new(Registry::default())),
                     meta_tx,
                     meta_rx: Arc::new(Mutex::new(meta_rx)),
+                    content_budget: Arc::new(ContentBudget::default()),
                     next_session: AtomicU64::new(0),
                     closed: AtomicBool::new(false),
                     error: Arc::new(Mutex::new(None)),
@@ -2275,6 +2384,7 @@ impl Diagnostics {
             registry,
             meta_tx,
             meta_rx,
+            content_budget: Arc::new(ContentBudget::default()),
             next_session: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             error,
@@ -2367,6 +2477,7 @@ impl Diagnostics {
             now_utc_ms,
             counter,
             self.meta_tx.clone(),
+            Arc::clone(&self.content_budget),
         ));
         registry.sessions.insert(key, entry.clone());
         entry.push_event(
@@ -2434,7 +2545,7 @@ impl Diagnostics {
     /// Admits one renderer report. The whole report is queued before its index
     /// is committed, so a queue that is full costs a retry of the same index
     /// and never a gap in the sequence.
-    pub fn admit_renderer_report(&self, report: RendererReport) -> ReportAdmission {
+    pub fn admit_renderer_report(&self, mut report: RendererReport) -> ReportAdmission {
         if !self.enabled || self.is_sink_disabled() {
             return ReportAdmission::Unavailable;
         }
@@ -2455,6 +2566,14 @@ impl Diagnostics {
             } else if index <= admission.accepted_report_index {
                 return ReportAdmission::StaleReport;
             } else {
+                let bytes = report.result.as_ref().map_or(0, content::value_bytes)
+                    .saturating_add(report.errors.iter().fold(0_u64, |sum, error| sum.saturating_add(content::value_bytes(error))));
+                let Some(lease) = self.content_budget.claim(bytes) else {
+                    return ReportAdmission::QueueFull;
+                };
+                report._content_lease = Some(lease);
+                report.observed_utc_ms = system_millis(self.clock.system());
+                report.observed_elapsed_us = entry.elapsed_us();
                 // The gate is already held here, so the record's place is
                 // claimed inline instead of through `push_meta`.
                 let pending = PendingEvent {
@@ -2671,6 +2790,53 @@ mod tests {
         development_smoke::development_archive_smoke_body();
     }
 
+    #[test]
+    fn consuming_a_large_content_record_releases_room_for_another_take() {
+        let (diagnostics, key) = sink();
+        let first = diagnostics.begin(key, Mode::Smart).unwrap();
+        let second_key = SessionKey { owner: Owner::Lab, generation: 2 };
+        let second = diagnostics.begin(second_key, Mode::Comparison).unwrap();
+        assert!(first.content(ContentKind::ProviderResponse, ContentFormat::Text,
+            "a".repeat(5 * 1024 * 1024)));
+        assert!(!second.content(ContentKind::RecorderResult, ContentFormat::Text,
+            "b".repeat(4 * 1024 * 1024)));
+        assert_eq!(diagnostics.entry_for(second_key).unwrap().dropped_events(), 1);
+        // Removing a record from the queue is not enough: the writer owns its
+        // payload until the observation itself is dropped after writing.
+        let held = diagnostics.take_meta(META_QUEUE);
+        assert!(!second.content(ContentKind::RecorderResult, ContentFormat::Text,
+            "b".repeat(4 * 1024 * 1024)));
+        drop(held);
+        assert!(second.content(ContentKind::RecorderResult, ContentFormat::Text,
+            "b".repeat(4 * 1024 * 1024)));
+        assert_eq!(diagnostics.entry_for(second_key).unwrap().dropped_events(), 2);
+    }
+
+    #[test]
+    fn content_pressure_never_commits_a_lab_terminal_before_its_result() {
+        let (diagnostics, key) = sink();
+        let first = diagnostics.begin(key, Mode::Live).unwrap();
+        assert!(first.content(ContentKind::LiveMessage, ContentFormat::Text,
+            "a".repeat(7 * 1024 * 1024)));
+        let lab_key = SessionKey { owner: Owner::Lab, generation: 2 };
+        let lab = diagnostics.begin(lab_key, Mode::Comparison).unwrap();
+        let mut terminal = report(lab_key, 1);
+        terminal.terminal_outcome = Some(RendererTerminal::Success);
+        terminal.result = Some(json!({
+            "results": { "smart": "текст".repeat(40_000) },
+            "errors": {}, "errorDetails": {}
+        }));
+        assert_eq!(diagnostics.admit_renderer_report(terminal.clone()), ReportAdmission::QueueFull);
+        let entry = diagnostics.entry_for(lab_key).unwrap();
+        assert_eq!(entry.terminal(), None);
+        assert_eq!(entry.admission.lock().accepted_report_index, 0);
+        drop(diagnostics.take_meta(META_QUEUE));
+        assert_eq!(diagnostics.admit_renderer_report(terminal), ReportAdmission::Accepted);
+        assert_eq!(entry.terminal(), Some(Outcome::Success));
+        assert_eq!(entry.admission.lock().accepted_report_index, 1);
+        drop(lab);
+    }
+
     fn sink() -> (Arc<Diagnostics>, SessionKey) {
         let root = std::env::temp_dir().join(format!(
             "speechek-diagnostics-test-{}-{}",
@@ -2722,6 +2888,11 @@ mod tests {
             last_receive_ms: None,
             terminal_outcome: None,
             events: Vec::new(),
+            result: None,
+            errors: Vec::new(),
+            observed_utc_ms: 0,
+            observed_elapsed_us: 0,
+            _content_lease: None,
         }
     }
 
