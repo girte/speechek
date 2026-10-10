@@ -41,7 +41,9 @@ use tokio_tungstenite::tungstenite::protocol::Message as UpstreamMessage;
 
 use crate::backend::{redact, redact_ui};
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
-use crate::backend::{diagnostic_json, diagnostic_text};
+use crate::backend::{diagnostic_bytes, diagnostic_json, diagnostic_text};
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+use base64::Engine as _;
 use crate::i18n::{render, Language, MessageId, UiMessage};
 use crate::provider::Provider;
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
@@ -315,6 +317,21 @@ fn note_deadline(state: &Relay, timer: DeadlineTimer) {
     }
 }
 
+/// One packet that arrived but never became a message: a frame this relay could
+/// not decode or parse still crossed the socket, so it moves the receive
+/// counters exactly once, as the `other` class. A frame that does become a
+/// message is counted where it is parsed instead; this is only for the paths
+/// that used to leave the packet uncounted.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_received_other(state: &Relay) {
+    if let Some(trace) = state.trace.as_ref() {
+        trace.received(ReceiveFlags {
+            other: true,
+            ..ReceiveFlags::default()
+        });
+    }
+}
+
 /// One upstream message, classified into every class it carried: a composite
 /// `serverContent` sets each of its flags, and a message that is none of the
 /// known shapes is `other` so it still moves the receive counters.
@@ -443,31 +460,82 @@ fn send_pcm_bytes(payload: &Value) -> u64 {
 /// One frame from the upstream, archived as the exact text that arrived and
 /// before the relay parses, uses or discards it: `setupComplete`, usage, an
 /// unknown shape, an error payload and a frame that is not JSON at all are all
-/// evidence, and a malformed frame is exactly the one worth keeping.
+/// evidence, and a malformed frame is exactly the one worth keeping. A frame
+/// this relay could not parse is recorded as text, not as a JSON value: the
+/// bytes that arrived are the body, whatever they are.
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
 fn note_upstream_frame(state: &Relay, raw: &str) {
     let Some(trace) = state.trace.as_ref() else {
         return;
     };
-    let body = match serde_json::from_str::<Value>(raw) {
-        Ok(value) => diagnostic_json(&value, state.ring.keys()),
-        Err(_) => diagnostic_text(raw, state.ring.keys()),
-    };
-    trace.content(ContentKind::LiveMessage, ContentFormat::Json, body);
+    match serde_json::from_str::<Value>(raw) {
+        Ok(value) => {
+            trace.content(
+                ContentKind::LiveMessage,
+                ContentFormat::Json,
+                diagnostic_json(&value, state.ring.keys()),
+            );
+        }
+        Err(_) => {
+            trace.content(
+                ContentKind::LiveMessage,
+                ContentFormat::Text,
+                diagnostic_text(raw, state.ring.keys()),
+            );
+        }
+    }
 }
 
-/// One frame from the upstream that is not UTF-8 text: what went wrong is the
-/// encoding, so the record names the byte count instead of inventing text.
+/// One frame from the upstream that is not UTF-8 text. What went wrong is the
+/// encoding, so the record carries the exact bytes that arrived rather than a
+/// byte count: they are redacted where they are valid UTF-8 - using the same
+/// pinned ring as every other record - and then base64-encoded, because the
+/// bytes as a whole are not text and must not be offered as if they were.
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
-fn note_undecodable_frame(state: &Relay, bytes: usize) {
+fn note_undecodable_frame(state: &Relay, bytes: &[u8]) {
     let Some(trace) = state.trace.as_ref() else {
         return;
     };
     trace.content(
         ContentKind::LiveMessage,
         ContentFormat::Json,
-        format!("{{\"non_utf8_bytes\":{bytes}}}"),
+        opaque_bytes_record("binary", bytes, state.ring.keys()),
     );
+}
+
+/// One control frame's payload, archived as its own kind: a `ping`/`pong`
+/// carries bytes too, and they are evidence of what the socket layer exchanged.
+/// Small by construction, redacted and encoded exactly like an undecodable
+/// frame. Observing it never sends anything back.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn note_control_frame(state: &Relay, kind: &str, payload: &[u8]) {
+    let Some(trace) = state.trace.as_ref() else {
+        return;
+    };
+    trace.content(
+        ContentKind::LiveMessage,
+        ContentFormat::Json,
+        opaque_bytes_record(kind, payload, state.ring.keys()),
+    );
+}
+
+/// The one shape every byte-carrying observation uses: the frame's kind, the
+/// transport encoding and the redacted bytes as base64, with the original
+/// length beside them. The bytes are redacted before they are encoded, so a key
+/// that was valid UTF-8 inside them is masked while an octet that is not text
+/// at all survives exactly. The record is serialized directly - never put
+/// through the JSON redactor a second time, which could mask an encoded span by
+/// coincidence.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+fn opaque_bytes_record(kind: &str, bytes: &[u8], keys: &[Arc<SecretKey>]) -> String {
+    let safe = diagnostic_bytes(bytes, keys);
+    json!({
+        "frame": kind,
+        "encoding": "base64",
+        "data": base64::engine::general_purpose::STANDARD.encode(safe.as_ref()),
+        "bytes": bytes.len(),
+    })
+    .to_string()
 }
 
 /// One message the relay wrote to the browser, archived as the exact JSON text
@@ -979,6 +1047,9 @@ async fn end(socket: &mut WebSocket, upstream: &mut Option<Upstream>, state: &mu
 /* -------------------------------------------------------------------------- */
 
 /// Handles one message or close from the Live socket.
+///
+/// The control frames' payloads are bound here only to feed the archive, so a
+/// build without development diagnostics has nothing to read them.
 async fn handle_upstream(
     socket: &mut WebSocket,
     upstream: &mut Option<Upstream>,
@@ -1023,8 +1094,9 @@ async fn handle_upstream(
         Some(Ok(UpstreamMessage::Binary(data))) => {
             // Binary frames are decoded as UTF-8 and parsed the same way;
             // undecodable bytes are not JSON either, so they are dropped. The
-            // archive keeps the text when there is any, and the byte count when
-            // there is not - either way the frame is not silently gone.
+            // archive keeps the text when there is any, and the exact bytes -
+            // redacted and encoded - when there is not, so the frame is never
+            // silently gone and never reduced to a length.
             match std::str::from_utf8(&data) {
                 Ok(raw) => {
                     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
@@ -1034,13 +1106,19 @@ async fn handle_upstream(
                 }
                 Err(_) => {
                     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
-                    note_undecodable_frame(state, data.len());
+                    note_undecodable_frame(state, &data);
+                    // The packet crossed the socket even though it is not
+                    // decodable text, so it counts as one off-shape receive.
+                    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+                    note_received_other(state);
                 }
             }
         }
         // Ping/Pong are answered by the socket layer, but they are still
-        // traffic from the upstream and are counted as such.
-        Some(Ok(UpstreamMessage::Ping(_))) => {
+        // traffic from the upstream: they are counted, and their payload is
+        // archived as the bytes it is. Observing them changes nothing about how
+        // the socket answers them.
+        Some(Ok(UpstreamMessage::Ping(_payload))) => {
             #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
             if let Some(trace) = state.trace.as_ref() {
                 trace.received(ReceiveFlags {
@@ -1048,8 +1126,10 @@ async fn handle_upstream(
                     ..ReceiveFlags::default()
                 });
             }
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_control_frame(state, "ping", _payload.as_ref());
         }
-        Some(Ok(UpstreamMessage::Pong(_))) => {
+        Some(Ok(UpstreamMessage::Pong(_payload))) => {
             #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
             if let Some(trace) = state.trace.as_ref() {
                 trace.received(ReceiveFlags {
@@ -1057,8 +1137,13 @@ async fn handle_upstream(
                     ..ReceiveFlags::default()
                 });
             }
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_control_frame(state, "pong", _payload.as_ref());
         }
-        Some(Ok(UpstreamMessage::Frame(_))) => {
+        // The message crate documents `Frame` as a value the read path does not
+        // produce; the arm exists for the counter, and if one ever does arrive
+        // its payload is archived as the bytes it is rather than dropped.
+        Some(Ok(UpstreamMessage::Frame(_frame))) => {
             #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
             if let Some(trace) = state.trace.as_ref() {
                 trace.received(ReceiveFlags {
@@ -1066,6 +1151,8 @@ async fn handle_upstream(
                     ..ReceiveFlags::default()
                 });
             }
+            #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+            note_control_frame(state, "frame", _frame.payload());
         }
         Some(Err(error)) => {
             #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
@@ -1114,10 +1201,21 @@ async fn handle_upstream_message(
     state: &mut Relay,
     raw: &str,
 ) {
-    if state.done || raw.is_empty() {
+    if state.done {
+        return;
+    }
+    if raw.is_empty() {
+        // An empty frame is still a packet that arrived: it is archived, and
+        // counted once, even though no message comes out of it.
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        note_received_other(state);
         return;
     }
     let Some(message) = parse_json_object(raw) else {
+        // Not JSON: the frame did arrive, so it is counted once as off-shape -
+        // exactly the receive the parsed path below would have counted.
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        note_received_other(state);
         return;
     };
 
@@ -1667,7 +1765,6 @@ mod relay_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::SystemTime;
 
-    use base64::Engine as _;
     use tokio::sync::mpsc;
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
     use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -2465,6 +2562,195 @@ mod relay_tests {
         assert!(
             terminal(&records).is_none(),
             "a malformed frame is not a terminal: {records:?}"
+        );
+        cleanup(diagnostics, &root);
+    }
+
+    /// A binary frame the relay cannot decode as UTF-8 is archived as the exact
+    /// bytes it carried: the key inside it is masked where it is valid UTF-8,
+    /// the octets that are not text survive, and the frame still counts as one
+    /// off-shape receive instead of vanishing from the counters.
+    #[tokio::test]
+    async fn a_non_utf8_upstream_frame_is_archived_as_its_exact_bytes() {
+        let root = scratch("binary-bytes");
+        let (diagnostics, trace) = take(&root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let upstream_port = listener.local_addr().expect("an address").port();
+        let mut payload = format!("{{\"raw\":\"{SYNTHETIC_KEY}\"").into_bytes();
+        payload.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x80]);
+        let answer = payload.clone();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let _ = ws.next().await;
+            if ws
+                .send(WsMessage::text(json!({ "setupComplete": {} }).to_string()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let _ = ws.send(WsMessage::binary(answer)).await;
+            // The socket stays open: the relay must survive the frame.
+            while ws.next().await.is_some() {}
+        });
+        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+
+        let mut client = client(port).await;
+        client
+            .send(WsMessage::text(json!({ "type": "start", "mode": "smart" }).to_string()))
+            .await
+            .expect("the start frame");
+        assert!(client.next().await.expect("a frame").expect("text")
+            .to_text()
+            .expect("text")
+            .contains("ready"));
+
+        // The writer's snapshot is gated on the sink's own clock, and this
+        // fixture's clock is frozen: advance it past the one-second gate so the
+        // periodic relay snapshot carrying the counter is written too. The wait
+        // then needs both the byte record and that snapshot.
+        diagnostics.advance_clock(Duration::from_secs(2));
+        let records = journal_when(&root, 300, |rows| {
+            content_bodies(rows, "live_message")
+                .iter()
+                .any(|body| body.contains("\"encoding\":\"base64\""))
+                && counter(rows, "received_messages") == Some(2)
+        })
+        .await;
+        let frames = content_bodies(&records, "live_message");
+        let record = frames
+            .iter()
+            .find(|body| body.contains("\"encoding\":\"base64\""))
+            .expect("the undecodable frame is archived as bytes");
+        let envelope: Value =
+            serde_json::from_str(record).expect("the record's own envelope");
+        assert_eq!(envelope["frame"], json!("binary"));
+        assert_eq!(envelope["bytes"], json!(payload.len()));
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(envelope["data"].as_str().expect("the encoded bytes"))
+            .expect("valid base64");
+        let expected = {
+            let mut expected = format!("{{\"raw\":\"[redacted]\"").into_bytes();
+            expected.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x80]);
+            expected
+        };
+        assert_eq!(
+            decoded, expected,
+            "the exact bytes arrive, with only the key masked"
+        );
+        assert!(
+            !String::from_utf8_lossy(&decoded).contains(SYNTHETIC_KEY),
+            "the key is not anywhere in the archived bytes"
+        );
+        // The packet crossed the socket: the setup and this frame, once each.
+        assert_eq!(
+            counter(&records, "received_messages"),
+            Some(2),
+            "the setup and the undecodable frame, counted once each: {records:?}"
+        );
+        assert!(
+            terminal(&records).is_none(),
+            "an undecodable frame is not a terminal: {records:?}"
+        );
+        cleanup(diagnostics, &root);
+    }
+
+    /// A control frame's payload is archived as its own kind, redacted and
+    /// encoded the same way, and the ping is still counted as traffic - the
+    /// observation never sends anything back.
+    #[tokio::test]
+    async fn a_control_frame_payload_is_archived_as_bytes() {
+        let root = scratch("ping-bytes");
+        let (diagnostics, trace) = take(&root);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let upstream_port = listener.local_addr().expect("an address").port();
+        let mut payload = SYNTHETIC_KEY.as_bytes().to_vec();
+        payload.extend_from_slice(&[0xFE, 0x01]);
+        let answer = payload.clone();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let _ = ws.next().await;
+            if ws
+                .send(WsMessage::text(json!({ "setupComplete": {} }).to_string()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let _ = ws
+                .send(WsMessage::Ping(answer.into()))
+                .await;
+            while ws.next().await.is_some() {}
+        });
+        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+
+        let mut client = client(port).await;
+        client
+            .send(WsMessage::text(json!({ "type": "start", "mode": "smart" }).to_string()))
+            .await
+            .expect("the start frame");
+        assert!(client.next().await.expect("a frame").expect("text")
+            .to_text()
+            .expect("text")
+            .contains("ready"));
+
+        // Advance the frozen clock past the snapshot gate, then wait for the
+        // byte record and the periodic snapshot that carries the counters.
+        diagnostics.advance_clock(Duration::from_secs(2));
+        let records = journal_when(&root, 300, |rows| {
+            content_bodies(rows, "live_message")
+                .iter()
+                .any(|body| body.contains("\"frame\":\"ping\""))
+                && counter(rows, "received_messages") == Some(2)
+        })
+        .await;
+        let frames = content_bodies(&records, "live_message");
+        let record = frames
+            .iter()
+            .find(|body| body.contains("\"frame\":\"ping\""))
+            .expect("the ping payload is archived");
+        let envelope: Value =
+            serde_json::from_str(record).expect("the record's own envelope");
+        assert_eq!(envelope["encoding"], json!("base64"));
+        assert_eq!(envelope["bytes"], json!(payload.len()));
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(envelope["data"].as_str().expect("the encoded bytes"))
+            .expect("valid base64");
+        let expected = {
+            let mut expected = b"[redacted]".to_vec();
+            expected.extend_from_slice(&[0xFE, 0x01]);
+            expected
+        };
+        assert_eq!(
+            decoded, expected,
+            "the payload arrives with only the key masked"
+        );
+        assert!(
+            !String::from_utf8_lossy(&decoded).contains(SYNTHETIC_KEY),
+            "the key is not anywhere in the archived payload"
+        );
+        assert_eq!(
+            counter(&records, "received_messages"),
+            Some(2),
+            "the setup and the ping are both counted: {records:?}"
+        );
+        assert!(
+            terminal(&records).is_none(),
+            "a control frame is not a terminal: {records:?}"
         );
         cleanup(diagnostics, &root);
     }

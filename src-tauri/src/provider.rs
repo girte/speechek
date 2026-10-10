@@ -58,7 +58,9 @@ use serde_json::{json, Value};
 
 use crate::backend::{redact, ApiError};
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
-use crate::backend::{diagnostic_json, diagnostic_text};
+use crate::backend::{diagnostic_bytes, diagnostic_json, diagnostic_text};
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+use base64::Engine as _;
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
 use crate::diagnostics::{
     ContentFormat, ContentKind, ErrorClass, RequestCause, RequestTrace, Stage, StagePhase,
@@ -817,8 +819,10 @@ fn note_stage(
 /// implementation, so the record can never drift from the stage record and the
 /// manifest. Nothing here truncates: the sink owns the queued-content budget,
 /// and a record it cannot hold is a counted, diagnosable drop rather than a
-/// shortened body. A body that is not text at all is recorded as such - its
-/// byte count and nothing else - so the missing text is visible too.
+/// shortened body. A body that is not text at all is not thrown away as a
+/// length either: its valid UTF-8 spans are redacted with the request's ring,
+/// the bytes are base64-encoded, and the record says which transport encoding
+/// they carry and how many there were.
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
 fn note_body(
     traced: Option<&RequestTrace>,
@@ -831,23 +835,40 @@ fn note_body(
         return;
     };
     let stage = json!(stage);
-    let record = match std::str::from_utf8(body) {
-        Ok(text) => json!({
-            "status": status,
-            "stage": stage,
-            "body": text,
-        }),
-        Err(_) => json!({
-            "status": status,
-            "stage": stage,
-            "non_utf8_bytes": body.len(),
-        }),
-    };
-    traced.content(
-        ContentKind::ProviderResponse,
-        ContentFormat::Json,
-        diagnostic_json(&record, keys),
-    );
+    match std::str::from_utf8(body) {
+        Ok(text) => {
+            traced.content(
+            ContentKind::ProviderResponse,
+            ContentFormat::Json,
+            diagnostic_json(
+                &json!({
+                    "status": status,
+                    "stage": stage,
+                    "body": text,
+                }),
+                keys,
+            ),
+            );
+        }
+        Err(_) => {
+            // Byte evidence is redacted before it is encoded and serialized
+            // directly: the JSON redactor must not be handed an already-encoded
+            // span, where a known key could match the base64 by coincidence.
+            let safe = diagnostic_bytes(body, keys);
+            traced.content(
+                ContentKind::ProviderResponse,
+                ContentFormat::Json,
+                json!({
+                    "status": status,
+                    "stage": stage,
+                    "encoding": "base64",
+                    "data": base64::engine::general_purpose::STANDARD.encode(safe.as_ref()),
+                    "bytes": body.len(),
+                })
+                .to_string(),
+            );
+        }
+    }
 }
 
 /// One body the archive does not have at all: the read failed before any
@@ -1465,6 +1486,13 @@ mod tests {
     /// from the body is what makes a stage's header/body boundary observable.
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
     fn head_then_body_server(head: String, body: String, body_delay: Duration) -> u16 {
+        head_then_bytes_server(head, body.into_bytes(), body_delay)
+    }
+
+    /// The same one-shot server for a body that is not text at all: a body can
+    /// carry octets no string can, so the fixture takes the bytes themselves.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    fn head_then_bytes_server(head: String, body: Vec<u8>, body_delay: Duration) -> u16 {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
@@ -1493,7 +1521,7 @@ mod tests {
             let _ = stream.write_all(head.as_bytes());
             let _ = stream.flush();
             std::thread::sleep(body_delay);
-            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.write_all(&body);
             let _ = stream.flush();
         });
         port
@@ -2282,5 +2310,108 @@ mod tests {
             !archived.body.contains("zzzz"),
             "no fragment of the body is presented as the body: {archived:?}"
         );
+    }
+
+    /// A body that is not UTF-8 at all is still archived as itself: its valid
+    /// UTF-8 spans are redacted, the bytes are carried base64 with their own
+    /// length, the octets that are not text survive exactly, and the
+    /// recognition path is untouched - the payload still comes back `None`
+    /// with the decode class, exactly as before.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    #[tokio::test]
+    async fn a_non_utf8_body_is_archived_as_its_exact_bytes() {
+        // The request's own pinned ring: with a key in it, the redaction of the
+        // body's valid UTF-8 span is really exercised, exactly as it is in a
+        // real request.
+        let keys = vec![Arc::new(SecretKey::new(SYNTHETIC_KEY.to_owned()))];
+        let mut raw = format!("{{\"error\":\"{SYNTHETIC_KEY}\"").into_bytes();
+        raw.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x9F]);
+        let port = head_then_bytes_server(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                raw.len()
+            ),
+            raw.clone(),
+            Duration::ZERO,
+        );
+        let provider = Provider::for_test("http://127.0.0.1:1", "ws://127.0.0.1:1");
+        let (diagnostics, trace) = sink();
+        let request = provider
+            .http
+            .post(format!("http://127.0.0.1:{port}/v1beta/interactions"));
+        let response = send_checked(
+            request,
+            MessageId::GoogleTranscriptionFailed,
+            &keys,
+            Duration::from_secs(5),
+            Some(&trace),
+            Stage::Interaction,
+        )
+        .await
+        .expect("the headers arrive");
+        // The recognition path is exactly what it was: no payload, decode class.
+        let payload = read_stage_body(response, Some(&trace), Stage::Interaction, &keys)
+            .await;
+        assert!(payload.is_none(), "non-UTF-8 is not a payload");
+
+        // The request really ended before the one drain this test makes: the
+        // records, the byte evidence and the terminal all come from it.
+        trace.finish(Outcome::Error);
+        let drained = diagnostics.take_meta(64);
+        let content: Vec<_> = drained
+            .iter()
+            .filter_map(|pending| match &pending.meta {
+                Meta::Content(queued) => Some(&queued.record),
+                _ => None,
+            })
+            .collect();
+        let end = drained
+            .iter()
+            .find_map(|pending| match &pending.meta {
+                Meta::Event(Event::RequestEnd(end)) => Some(end),
+                _ => None,
+            })
+            .expect("the request end, in the same drain");
+        let archived = content
+            .iter()
+            .find(|record| matches!(record.kind, ContentKind::ProviderResponse))
+            .expect("the byte evidence is archived");
+        let envelope: Value =
+            serde_json::from_str(&archived.body).expect("the record's own envelope");
+        assert_eq!(envelope["encoding"], json!("base64"));
+        assert_eq!(envelope["status"], json!(200));
+        assert_eq!(envelope["stage"], json!("interaction"));
+        assert_eq!(envelope["bytes"], json!(raw.len()));
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(envelope["data"].as_str().expect("the encoded bytes"))
+            .expect("valid base64");
+        // Byte for byte: the redacted prefix and the exact non-text tail. A
+        // lossy comparison could hide a changed octet, so the whole buffer is
+        // compared as bytes.
+        let mut expected = format!("{{\"error\":\"[redacted]\"").into_bytes();
+        expected.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x9F]);
+        assert_eq!(
+            decoded, expected,
+            "the exact bytes arrive, with only the key masked"
+        );
+        assert_eq!(
+            &decoded[decoded.len() - 4..],
+            &[0xFF, 0xFE, 0x00, 0x9F],
+            "the octets that are not text survive exactly"
+        );
+        assert!(
+            !String::from_utf8_lossy(&decoded).contains(SYNTHETIC_KEY),
+            "the key is not anywhere in the archived bytes"
+        );
+        // A complete body that is not text is not a lost observation, and the
+        // recognition path is exactly what it was.
+        assert!(
+            !content
+                .iter()
+                .any(|record| matches!(record.kind, ContentKind::TransportError)),
+            "a complete body is not content loss: {content:?}"
+        );
+        assert_eq!(end.error_class, Some(ErrorClass::Decode));
+        assert_eq!(end.status, Some(200));
     }
 }

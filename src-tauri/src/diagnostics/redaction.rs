@@ -86,7 +86,20 @@ pub(crate) fn diagnostic_text(message: &str, keys: &[Arc<SecretKey>]) -> String 
 /// cleaned as text: the rendering is what the writer would have written anyway,
 /// and no member of the caller's value is copied.
 pub(crate) fn diagnostic_json(value: &Value, keys: &[Arc<SecretKey>]) -> String {
-    diagnostic_text(&value.to_string(), keys)
+    redact_owned(value.to_string(), keys)
+}
+
+/// Opaque evidence may have many tiny UTF-8 spans. Borrow the clean ones rather
+/// than allocating a string for every byte run in a malformed frame.
+pub(crate) fn diagnostic_fragment<'a>(text: &'a str, keys: &[Arc<SecretKey>]) -> std::borrow::Cow<'a, str> {
+    if let Some(stripped) = strip_credential_fields(text) {
+        return std::borrow::Cow::Owned(redact_owned(stripped, keys));
+    }
+    if !needs_key_scan(text, keys) {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(redact_keys(text, keys))
+    }
 }
 
 /// Redacts one owned value in place: every string it holds, every member name

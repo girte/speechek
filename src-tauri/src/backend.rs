@@ -155,6 +155,41 @@ fn redact_string(text: &mut String, keys: &[Arc<SecretKey>]) {
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
 pub(crate) use crate::diagnostics::redaction::{diagnostic_json, diagnostic_redact_value, diagnostic_text};
 
+/// Keep undecodable bytes intact, redacting their valid UTF-8 spans before
+/// producers encode the evidence as base64. A secret is itself valid UTF-8 and
+/// therefore cannot straddle an invalid byte. No copy is retained when clean.
+#[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+pub(crate) fn diagnostic_bytes<'a>(input: &'a [u8], keys: &[Arc<SecretKey>]) -> std::borrow::Cow<'a, [u8]> {
+    let mut output: Option<Vec<u8>> = None;
+    let mut at = 0;
+    while at < input.len() {
+        let (valid, invalid) = match std::str::from_utf8(&input[at..]) {
+            Ok(text) => (text, 0),
+            Err(error) => (
+                std::str::from_utf8(&input[at..at + error.valid_up_to()]).expect("validated UTF-8 prefix"),
+                error.error_len().unwrap_or(input.len() - at - error.valid_up_to()),
+            ),
+        };
+        let safe = crate::diagnostics::redaction::diagnostic_fragment(valid, keys);
+        if safe.as_bytes() != valid.as_bytes() {
+            let bytes = output.get_or_insert_with(|| {
+                let mut bytes = Vec::with_capacity(input.len());
+                bytes.extend_from_slice(&input[..at]);
+                bytes
+            });
+            bytes.extend_from_slice(safe.as_bytes());
+        } else if let Some(bytes) = output.as_mut() {
+            bytes.extend_from_slice(valid.as_bytes());
+        }
+        at += valid.len();
+        if let Some(bytes) = output.as_mut() {
+            bytes.extend_from_slice(&input[at..at + invalid]);
+        }
+        at += invalid;
+    }
+    output.map_or(std::borrow::Cow::Borrowed(input), std::borrow::Cow::Owned)
+}
+
 /// Redacts one descriptor in place: every string argument, however deeply nested
 /// behind a nested `UiMessage`, is cleaned against the same ring the message's
 /// own HTTP or WebSocket boundary selected. Numbers and identifiers are left
