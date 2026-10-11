@@ -115,6 +115,8 @@ On the very first start Speechek picks the language you chose in the installer. 
 
 **Recognition mode.** Live Smart, Smart or Verbatim; see [the table above](#recognition-modes-and-the-lab).
 
+**Dictation language.** **Auto-detect** (the default) suits most cases. If you dictate in one language, choose it: Gemini gets a hint that helps it recognize speech more accurately. If you mix two, for example Russian speech with English terms, choose the second one in the picker that appears next to the first. Dictate in the language you chose. The setting works in Live Smart, Smart and Verbatim and in the lab, applies from the next recording, and a dictation already running keeps the languages it started with.
+
 **Hotkey.** Type a key or a combination, for example `F2` or `Ctrl+Shift+Space`, then press Enter or click elsewhere. It applies immediately.
 
 - You can use a letter (A–Z), a digit (0–9), F1–F24 except F12, Space, Enter, Tab, the arrows, Home/End, PageUp/PageDown, Insert, Delete or Backspace. Add `Ctrl`, `Alt`, `Shift` or `Super` (the Windows key) in front if you like.
@@ -131,6 +133,8 @@ On the very first start Speechek picks the language you chose in the installer. 
 **Start Speechek when signing in to Windows.** The same autostart setting as the installer's checkbox. If you disabled Speechek in Windows startup apps, turning this on enables it again. If Speechek can't read its autostart entry (for example, another program's entry has the same name), the switch is greyed out and says so instead of guessing.
 
 **Local port.** The port Speechek's windows use internally. Default `4173`; you'll rarely need to touch it. A new value is saved immediately but applies after a restart. If the port is busy at startup, Speechek borrows a free one for that session and tells you.
+
+**Custom vocabulary.** Words and phrases you want recognition to lean toward: names, brands, terms and abbreviations as they should be spelled, one per line. It works in Live Smart, Smart and Verbatim and in the lab, and it biases recognition instead of replacing text. The list is saved when you leave the field or press Ctrl+Enter (a plain Enter starts a new line); there is no separate button. It applies from the next recording, and you can edit it during a dictation — the recording already running keeps the list it started with. The field shows the saved list, with empty lines and exact, case-sensitive repeats removed; `Speechek` and `speechek` are two different terms. Up to 1000 terms after that, and a longer list is refused with an error while the previous vocabulary stays in use. Above 100 terms Speechek suggests a shorter list: that is Google's own recommendation for recognition.
 
 ### API keys
 
@@ -149,6 +153,8 @@ You never have to edit files by hand, since the settings window covers everythin
 - It's plain JSON. Comments are allowed only as whole lines starting with `//`. Trailing commas aren't allowed.
 - `hotkey` and `mode` must appear exactly once. Other fields can be left out; then the defaults apply.
 - When Speechek saves settings, it changes only its own values and keeps your comments and any other text in the file.
+- Hand-editing isn't required, but if you write `custom_vocabulary` yourself, whitespace around a term, empty lines and exact repeats are removed exactly as they are in the field. A value that isn't a list of strings, a term containing a line break, or more than 1000 terms stops Speechek at startup with an error naming `custom_vocabulary`.
+- `dictation_languages` is checked strictly: an unknown code, a different spelling (`ru-ru` instead of `ru-RU`), a repeat or more than two codes stops Speechek at startup with an error naming `dictation_languages`.
 
 | Field | Values | Default |
 |---|---|---|
@@ -158,6 +164,8 @@ You never have to edit files by hand, since the settings window covers everythin
 | `port` | A whole number from 1 to 65535 | `4173` |
 | `input_device` | A microphone ID as Windows reports it, or `null` for the system default | `null` |
 | `language` | `"en"` or `"ru"` | Picked on first start, see [Interface language](#interface-language) |
+| `custom_vocabulary` | A list of words and phrases that recognition leans toward; an empty list turns the vocabulary off | `[]` |
+| `dictation_languages` | Up to two different language codes from Gemini's list, for example `["ru-RU"]` or `["ru-RU", "en-US"]`; an empty list means Auto-detect | `[]` |
 
 API keys are never in this file. They're stored encrypted in `secrets.bin` in the same folder.
 
@@ -181,6 +189,7 @@ Speechek writes `settings.json` and `secrets.bin` one after the other. If someth
 - A normal (Production) Speechek build saves no audio files, keeps no journals and writes no recognized text. Only a separate debug Development build with the explicit `dev-diagnostics` flag writes a local archive; see [Building from source](#building-from-source).
 - For Smart and Verbatim, the recording is uploaded to Gemini temporarily and deleted after recognition. Speechek also asks Gemini not to store the request.
 - Live Smart streams the audio to Gemini while you speak.
+- A custom vocabulary, if you set one, is sent to Google with every recording, in all three modes. It's plain text in `settings.json`, never in `secrets.bin`.
 
 **Limits**
 
@@ -254,3 +263,4 @@ The portable **Development** debug build can keep a local archive of its own tak
 - **Incomplete takes.** If the byte cap is reached or a write fails, a take records only what was saved and advertises itself as incomplete: dropped content, audio gaps and disk errors are counted, never presented as a complete take.
 - **Retention.** Files are removed after 10 days or earlier if the archive outgrows a total cap of 100,000,000 bytes (decimal 100 MB) across audio, journals, content records, partial files and staging. Partial files and staging copies count toward the cap, as does the space reserved to finish an active take. Cleanup runs at startup, once a minute while Development runs and when a take closes; with the app closed, the files stay until the next launch.
 - **Privacy.** The FLAC is plaintext personal audio and the archived content is plaintext recognized text — not encryption. Both are readable by your Windows user and SYSTEM (protected DACL), and therefore by any software running as you. Nothing is uploaded automatically and nothing in the archive is sent anywhere; it never contains API keys, authorization headers or its own WebSocket connection URL. The archived text is ordinary content, so a URL you dictated, or one Google returns in a reply, is kept like any other words. Use synthetic data only in automated checks; never use real keys or real speech.
+- **Custom vocabulary.** A take never stores the terms themselves: the archived setup records only how many terms the vocabulary had.

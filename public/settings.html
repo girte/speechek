@@ -58,6 +58,18 @@
             </div>
           </div>
 
+          <div class="settings-field">
+            <div class="settings-block-head">
+              <label class="settings-field-title" for="dictation-language-primary" data-i18n="SettingsDictationLanguageLabel">Dictation language</label>
+              <button type="button" class="settings-help" aria-label="Help: dictation language" data-i18n-aria-label="SettingsDictationLanguageHelpAria" aria-expanded="false" aria-controls="help-dictation-language" aria-describedby="help-dictation-language">?</button>
+              <div class="settings-help-panel" role="tooltip" id="help-dictation-language" hidden data-i18n="SettingsDictationLanguageHelp">Auto-detect suits most cases. If you dictate in one language, choose it: Gemini gets a hint that helps it recognize speech more accurately. Add a second language if you mix two, for example Russian speech with English terms. Dictate in the language you chose.</div>
+            </div>
+            <div class="settings-dictation-languages">
+              <select class="settings-device-select" id="dictation-language-primary"></select>
+              <select class="settings-device-select" id="dictation-language-secondary" aria-label="Second dictation language" data-i18n-aria-label="SettingsDictationLanguageSecondAria" hidden></select>
+            </div>
+          </div>
+
           <div class="error" id="general-error" role="alert" hidden></div>
 
           <div class="settings-field">
@@ -111,6 +123,17 @@
             <input type="text" class="settings-port-input" id="port-input" inputmode="numeric" autocomplete="off" spellcheck="false" placeholder="4173" aria-describedby="port-notice port-error">
             <p class="settings-port-notice" id="port-notice" role="status" aria-live="polite"></p>
             <div class="error" id="port-error" role="alert" hidden></div>
+          </div>
+
+          <div class="settings-field">
+            <div class="settings-block-head">
+              <label class="settings-field-title" for="vocabulary-text" data-i18n="SettingsVocabularyLabel">Custom vocabulary</label>
+              <button type="button" class="settings-help" aria-label="Help: custom vocabulary" data-i18n-aria-label="SettingsVocabularyHelpAria" aria-expanded="false" aria-controls="help-vocabulary" aria-describedby="help-vocabulary">?</button>
+              <div class="settings-help-panel" role="tooltip" id="help-vocabulary" hidden data-i18n="SettingsVocabularyHelp">One word or phrase per line: names, brands, terms and abbreviations as they should be spelled. The list helps recognition in all three modes; it does not replace text. It is sent to Google with every recording, and on the free tier Google may use it to improve its products. Saved when you leave the field or press Ctrl+Enter; applies from the next recording. Up to 1000 terms; up to 100 usually work best.</div>
+            </div>
+            <textarea id="vocabulary-text" class="settings-textarea" rows="6" spellcheck="false" autocomplete="off" autocapitalize="off" aria-describedby="vocabulary-notice vocabulary-error"></textarea>
+            <p class="settings-vocabulary-notice" id="vocabulary-notice" role="status" aria-live="polite"></p>
+            <div class="error" id="vocabulary-error" role="alert" hidden></div>
           </div>
         </section>
 

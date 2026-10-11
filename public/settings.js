@@ -58,6 +58,7 @@ const CMD = {
   updateGeneral: 'settings_update_general',
   listInputDevices: 'settings_list_input_devices',
   updateHotkey: 'settings_update_hotkey',
+  updateVocabulary: 'settings_update_vocabulary',
   hotkeyCapture: 'settings_hotkey_capture',
   setKeys: 'settings_set_keys',
   reveal: 'settings_reveal_keys',
@@ -85,6 +86,11 @@ const PORT_INVALID_MESSAGE = msg('SettingsPortInvalid');
  * registration it would have to change.
  */
 const AUTOSTART_UNKNOWN = msg('SettingsAutostartUnknown');
+/**
+ * The term count above which Google's own guidance says a vocabulary stops
+ * helping: the field still accepts it, the notice just recommends less.
+ */
+const VOCABULARY_RECOMMENDED = 100;
 
 
 const tauri = globalThis.__TAURI__;
@@ -110,6 +116,11 @@ const portError = el('port-error');
 const deviceSelect = el('input-device');
 const deviceNotice = el('device-notice');
 const deviceError = el('device-error');
+const dictationPrimary = el('dictation-language-primary');
+const dictationSecondary = el('dictation-language-secondary');
+const vocabularyText = el('vocabulary-text');
+const vocabularyNotice = el('vocabulary-notice');
+const vocabularyError = el('vocabulary-error');
 const keysSummary = el('keys-summary');
 const keysError = el('keys-error');
 const keyReveal = el('keys-reveal');
@@ -181,6 +192,9 @@ function translateSettings(language) {
   // Reflect committed language only when no picker intent is outstanding.
   if (pendingLanguage === null && runtimeLanguage !== null) languageSelect.value = runtimeLanguage;
   applyTranslations();
+  // The language names sort in the interface language: a switch re-sorts both
+  // pickers and keeps the choice on screen.
+  if (view !== null) renderDictationLanguages(selectedDictationLanguages());
   for (const [node, state] of retainedText) {
     if (!node.isConnected) {
       retainedText.delete(node);
@@ -286,6 +300,23 @@ let pendingPort = null;
  * and the running document's language travels instead.
  */
 let pendingLanguage = null;
+/**
+ * The vocabulary field's own state: its own command, its own intent counter and
+ * its own snapshot in the queue, like the chord field — but, unlike the chord,
+ * it may be edited while a dictation runs, because a session already running
+ * keeps the snapshot it began with.
+ */
+let vocabularyIntent = 0;
+/** True while the field holds text the shell has not taken; a view never erases it. */
+let vocabularyDirty = false;
+/** The last snapshot handed to the queue: { value, intent, fieldEpoch, pending }. */
+let vocabularySubmit = null;
+/** Grows on every keystroke in the vocabulary field, so a late answer cannot claim it. */
+let vocabularyFieldEpoch = 0;
+/** The wording of a refused vocabulary, kept under the field until the user edits. */
+let vocabularyFailure = '';
+/** The text last handed to the queue; a blur of it is the same gesture. */
+let vocabularyChangeBaseline = null;
 /**
  * The device picker holds a choice the shell has not confirmed yet. Like the
  * port, it travels with every later general change until an answer reports it;
@@ -519,7 +550,13 @@ function renderControls() {
   hotkeyInput.disabled = !usable || dictationActive;
   if (hotkeyWasHeld && hotkeyInput.disabled) signalHotkeyField(false);
   portInput.disabled = !usable;
+  // The vocabulary is editable even during a dictation: the session that is
+  // already running holds the snapshot it began with, so only the next
+  // recording can be affected by a change made here.
+  vocabularyText.disabled = !usable;
   deviceSelect.disabled = !usable;
+  dictationPrimary.disabled = !usable;
+  dictationSecondary.disabled = !usable;
   languageSelect.disabled = !usable;
 }
 
@@ -533,6 +570,65 @@ function renderHotkey() {
   if (!hotkeyDirty && hotkeyInput.value !== hotkey) hotkeyInput.value = hotkey;
   const native = view?.hotkeyErrorUi ? { ui: view.hotkeyErrorUi } : view?.hotkeyError ? { message: view.hotkeyError } : '';
   setError(hotkeyError, native || hotkeyFailure);
+}
+
+/**
+ * The vocabulary field. Like the chord, it belongs to the user while it holds
+ * text the shell has not taken, so a view never erases an edit; and a send
+ * that lands repaints it from the reported list, so the user sees the
+ * normalization the shell applied — trimmed terms, dropped empty lines and
+ * repeats — instead of the text that was typed.
+ *
+ * The line under the field is its own, like the port's: the term count, plus
+ * Google's recommendation once the list grows past it. An empty vocabulary
+ * paints no line at all.
+ */
+function renderVocabulary() {
+  const reported = view?.settings && Array.isArray(view.settings.custom_vocabulary) ? view.settings.custom_vocabulary : null;
+  const terms = reported === null ? [] : reported.filter((term) => typeof term === 'string');
+  const text = terms.join('\n');
+  if (!vocabularyDirty && vocabularyText.value !== text) vocabularyText.value = text;
+  if (terms.length === 0) setText(vocabularyNotice, '');
+  else if (terms.length <= VOCABULARY_RECOMMENDED) setText(vocabularyNotice, msg('SettingsVocabularyCount', { count: terms.length }));
+  else setText(vocabularyNotice, msg('SettingsVocabularyCountOverRecommended', { count: terms.length, recommended: VOCABULARY_RECOMMENDED }));
+  setError(vocabularyError, vocabularyFailure);
+}
+
+/** The dictation-language hints the pickers show: `[]` is Auto-detect. */
+function selectedDictationLanguages() {
+  const primary = dictationPrimary.value;
+  if (primary === '') return [];
+  const secondary = dictationSecondary.value;
+  return secondary !== '' && secondary !== primary ? [primary, secondary] : [primary];
+}
+
+/**
+ * Rebuilds both dictation-language pickers for `chosen`, sorted by the names
+ * the interface language gives them. The second picker shows only beside a
+ * chosen first language and never offers that language again.
+ */
+function renderDictationLanguages(chosen) {
+  const reported = Array.isArray(view?.dictationLanguageOptions) ? view.dictationLanguageOptions : [];
+  const options = reported.filter((option) => typeof option?.code === 'string' && typeof option?.label === 'string');
+  const collator = new Intl.Collator(runtimeLanguage ?? 'en', { sensitivity: 'base' });
+  options.sort((a, b) => collator.compare(displayText(msg(a.label)), displayText(msg(b.label))));
+  const known = new Set(options.map((option) => option.code));
+  const codes = Array.isArray(chosen) ? chosen.filter((code) => known.has(code)) : [];
+  const [primary = '', secondary = ''] = codes;
+  const fill = (select, empty, skip) => {
+    clearChildren(select);
+    for (const [value, label] of [['', empty], ...options.filter((option) => option.code !== skip).map((option) => [option.code, msg(option.label)])]) {
+      const node = document.createElement('option');
+      node.value = value;
+      setText(node, label);
+      select.appendChild(node);
+    }
+  };
+  fill(dictationPrimary, msg('SettingsDictationLanguageAuto'), null);
+  fill(dictationSecondary, msg('SettingsDictationLanguageNoSecond'), primary);
+  dictationPrimary.value = primary;
+  dictationSecondary.value = primary === '' || secondary === primary ? '' : secondary;
+  dictationSecondary.hidden = primary === '';
 }
 
 function renderGeneral() {
@@ -564,6 +660,7 @@ function renderGeneral() {
   }
   if (!portDirty) setError(portError, '');
   renderPortNotice();
+  renderDictationLanguages(view?.settings?.dictation_languages);
   renderDevices();
   // A painted native view is the truth about the controls: a complaint about an
   // earlier attempt has been answered by it.
@@ -795,6 +892,7 @@ function applyView(next, { reopen = false, repaintGeneral } = {}) {
   // here: the line about the applied chord belongs to the next event to clear.
   if (dictationActive) setText(hotkeyState, DICTATION_HINT);
   renderHotkey();
+  renderVocabulary();
   // The decision belongs to this moment, not to the moment a caller's own await
   // began: a predicate is evaluated here, so an interaction that happened while
   // that await was in flight still wins. Without a caller's word, no other view
@@ -1217,15 +1315,17 @@ function onGeneralChange() {
   generalIntent = intent;
   // The chord is not part of this command: an old WebView view must not be able
   // to send a launcher key back, and a general change never touches the keys.
-  // The mute switch, the port, the chosen device and the language live in this
-  // section, so their own current values travel: the change takes effect from
-  // the next dictation, while a new port only after the next restart.
+  // The mute switch, the port, the chosen device, the language and the
+  // dictation languages live in this section, so their own current values
+  // travel: the change takes effect from the next dictation, while a new port
+  // only after the next restart.
   const settings = {
     mode: selectedMode(),
     mute_during_recording: muteToggle.checked,
     port: desiredPort(),
     input_device: currentInputDevice(),
     language: generalLanguage(),
+    dictation_languages: selectedDictationLanguages(),
   };
   const draftId = view.draftId;
   // Counted until its answer lands: while a general send is outstanding, no
@@ -1552,6 +1652,161 @@ function showHotkeyError(message) {
   hotkeyFailure = message;
   setError(hotkeyError, message);
   setText(hotkeyState, appliedHotkey === '' ? '' : msg('SettingsCurrentHotkey', { hotkey: appliedHotkey }));
+  setStatus(message);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Custom vocabulary                                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The vocabulary field. Text is typed and never sent per keystroke: only a
+ * completed string — Ctrl+Enter, or leaving the field — becomes a command, and
+ * it travels through the same serial queue as every other command, so a
+ * vocabulary send cannot overtake a general or a key send.
+ *
+ * A plain Enter is a line break, not a gesture: the list is one term per line.
+ * Dedup is by gesture like the chord's: Ctrl+Enter and the blur it causes are
+ * one intent, but a deliberate repeat is never swallowed, and the field is not
+ * locked by a running dictation — the session that began keeps its own
+ * snapshot, so an edit here only affects the next recording.
+ */
+function submitVocabulary(source) {
+  if (view === null || closed || busy) return;
+  const value = vocabularyText.value;
+  const fieldEpoch = vocabularyFieldEpoch;
+  // The blur that follows Ctrl+Enter carries the text Ctrl+Enter just handed
+  // over: that is one gesture, not a second intent.
+  if (source === 'blur' && value === vocabularyChangeBaseline) return;
+  // The very same snapshot is already waiting in line.
+  if (vocabularySubmit !== null && vocabularySubmit.value === value && vocabularySubmit.fieldEpoch === fieldEpoch && vocabularySubmit.pending) {
+    return;
+  }
+  const intent = vocabularyIntent + 1;
+  vocabularyIntent = intent;
+  const submit = { value, intent, fieldEpoch, pending: true };
+  vocabularySubmit = submit;
+  vocabularyChangeBaseline = value;
+  vocabularyFailure = '';
+  setError(vocabularyError, '');
+  setStatus(msg('SettingsApplyingVocabulary'));
+  void enqueue(() => sendVocabulary(submit));
+}
+
+/**
+ * Sends the completed list the field is holding, when the shell does not have
+ * it yet. Lifecycle steps — a tab switch, the comparison lab, a close or a quit
+ * — call it before they freeze or hide the page: a native close or menu action
+ * may never cause the blur that would otherwise submit the text. A list the
+ * queue already has is not sent twice, and a field nobody edited holds exactly
+ * what the shell already has.
+ */
+function flushVocabulary() {
+  if (view === null || closed || busy) return;
+  if (!vocabularyDirty) return;
+  if (vocabularyText.value === vocabularyChangeBaseline) return;
+  submitVocabulary('flush');
+}
+
+/**
+ * Sends one snapshotted list. The revision travels from the newest accepted
+ * view at the moment this runs; the answer may only report for the newest
+ * intent, and never for text typed after the snapshot was taken. The text is
+ * handed over exactly as typed, newlines and all: splitting, trimming, dropping
+ * empty lines and repeats is the shell's job, so the field shows the list the
+ * shell really stored once an answer lands.
+ */
+async function sendVocabulary(submit) {
+  try {
+    if (view === null || closed) return;
+    const draftId = view.draftId;
+    try {
+      const revision = view.revision;
+      const result = await invoke(CMD.updateVocabulary, { draftId, revision, text: submit.value });
+      if (result && result.view) applyView(result.view);
+      if (submit.intent !== vocabularyIntent) return;
+      // Newer text appeared while the command was in flight: it stays on
+      // screen, the applied list is named, and the newer text is not called
+      // sent.
+      if (vocabularyFieldEpoch !== submit.fieldEpoch) {
+        const applied = result?.applied === true;
+        setStatus(
+          applied
+            ? msg('SettingsVocabularyAppliedNewText')
+            : msg('SettingsVocabularyTextChanged'),
+        );
+        return;
+      }
+      if (result?.applied !== true) {
+        // Nothing was applied, so no gesture of this text is spent: the field
+        // keeps the list and the next Ctrl+Enter or blur may try it again.
+        vocabularyChangeBaseline = null;
+        if (!draftLive(draftId)) return;
+        // The newest view is read first: the failure line under the field must
+        // never name a list the shell does not have.
+        await resync();
+        showVocabularyError(msg('SettingsSaveNotApplied'));
+        return;
+      }
+      // A draft that is gone (closed, or replaced by a newer one) must not be
+      // painted from an answer to a question it never asked.
+      if (!draftLive(draftId)) return;
+      // The field now holds exactly what the shell reports, so the blur of this
+      // very text is the tail of the gesture that applied it.
+      vocabularyDirty = false;
+      const applied = view?.settings && Array.isArray(view.settings.custom_vocabulary)
+        ? view.settings.custom_vocabulary.join('\n')
+        : submit.value;
+      vocabularyText.value = applied;
+      submit.value = applied;
+      vocabularyChangeBaseline = applied;
+      vocabularyFailure = '';
+      setError(vocabularyError, '');
+      const warning = result?.warningUi ? { ui: result.warningUi } : typeof result?.warning === 'string' && result.warning !== '' ? { message: result.warning } : '';
+      if (warning !== '') {
+        setStatus(warning);
+        show(partialWarning);
+        setText(partialWarning, warning);
+      } else {
+        setStatus(msg('SettingsVocabularyApplied'));
+      }
+    } catch (cause) {
+      const error = errorOf(cause);
+      if (error.code === 'STALE_DRAFT') {
+        vocabularyChangeBaseline = null;
+        if (draftLive(draftId)) {
+          await resync();
+          if (submit.intent === vocabularyIntent && vocabularyFieldEpoch === submit.fieldEpoch) {
+            setStatus(msg('SettingsVocabularyStale'));
+          }
+        }
+        return;
+      }
+      if (submit.intent !== vocabularyIntent) return;
+      // A refused list is not spent: the same text may be sent again, and the
+      // list the shell already has keeps working meanwhile.
+      vocabularyChangeBaseline = null;
+      if (!draftLive(draftId)) return;
+      // The newest view is read first: it is what says which list still works,
+      // so the reason is never painted from an older answer than the one that
+      // refused this send.
+      await resync();
+      showVocabularyError(messageOf(error));
+    }
+  } finally {
+    if (vocabularySubmit === submit) vocabularySubmit.pending = false;
+  }
+}
+
+/**
+ * Names the reason under the field. The wording is kept until the user edits
+ * the field, so a later view that paints a general or key answer does not
+ * silently drop it; the text stays where it is, because the vocabulary the
+ * shell already has keeps working meanwhile.
+ */
+function showVocabularyError(message) {
+  vocabularyFailure = message;
+  setError(vocabularyError, message);
   setStatus(message);
 }
 
@@ -1922,6 +2177,17 @@ function forgetDraft() {
   setError(portError, '');
   setPortNotice('');
   portInput.value = '';
+  // The vocabulary field belongs to the draft that just went away too: nothing
+  // typed for it may still be sent, and the next open paints a fresh field.
+  vocabularyIntent += 1;
+  vocabularySubmit = null;
+  vocabularyFieldEpoch += 1;
+  vocabularyChangeBaseline = null;
+  vocabularyDirty = false;
+  vocabularyFailure = '';
+  setError(vocabularyError, '');
+  setText(vocabularyNotice, '');
+  vocabularyText.value = '';
   // The device choice belongs to the draft that went away too, and a read still
   // on its way must not paint the next one.
   deviceEpoch += 1;
@@ -1932,6 +2198,9 @@ function forgetDraft() {
   paintDeviceError();
   setText(deviceNotice, '');
   clearChildren(deviceSelect);
+  clearChildren(dictationPrimary);
+  clearChildren(dictationSecondary);
+  dictationSecondary.hidden = true;
   invalidateReveal();
   resetCheckReport();
   setText(keysSummary, '');
@@ -1974,6 +2243,7 @@ async function resolveClose() {
   // instead of being missed in a window that is about to hide.
   flushHotkey();
   flushPort();
+  flushVocabulary();
   // The editor is flushed first: it decides whether there is anything to apply,
   // and a refused send leaves the text on screen for the dialog below.
   const draftId = view.draftId;
@@ -2176,6 +2446,7 @@ async function openLab() {
   if (view === null || dictationActive) return;
   flushHotkey();
   flushPort();
+  flushVocabulary();
   if (!(await flushOrHold(msg('SettingsKeySendRetry')))) return;
   invalidateReveal();
   await runLab();
@@ -2196,6 +2467,7 @@ async function switchSection(name, { focus = false } = {}) {
   // Enter or the blur that already sent the same text.
   flushHotkey();
   flushPort();
+  flushVocabulary();
   // The intent to reveal dies before anything can hide the field, and the
   // field's text is taken before it is cleared, so a switch can never lose a
   // keystroke that had not reached the shell yet — and an untouched blank
@@ -2316,7 +2588,7 @@ function onHotkeyKey(event) {
 function disableForm(message) {
   formDisabled = true;
   const hotkeyWasHeld = hotkeyFieldHoldsKeyboard();
-  for (const node of [languageSelect, keyReveal, keyApply, keyClear, keyCheck, actionLab, hotkeyInput, portInput, deviceSelect, muteToggle, autostartToggle]) {
+  for (const node of [languageSelect, keyReveal, keyApply, keyClear, keyCheck, actionLab, hotkeyInput, portInput, deviceSelect, dictationPrimary, dictationSecondary, muteToggle, autostartToggle]) {
     node.disabled = true;
   }
   if (hotkeyWasHeld) signalHotkeyField(false);
@@ -2519,6 +2791,25 @@ function wire() {
   });
   portInput.addEventListener('change', () => submitPort());
 
+  // The vocabulary is typed like the chord, but a plain Enter is a line break:
+  // the list is one term per line, so only Ctrl+Enter completes it — plus the
+  // blur that leaving the field causes, which may follow a native action that
+  // never blurred it. An edit is a new gesture and takes the complaint about
+  // the previous list away.
+  vocabularyText.addEventListener('input', () => {
+    vocabularyDirty = true;
+    vocabularyFieldEpoch += 1;
+    vocabularyChangeBaseline = null;
+    vocabularyFailure = '';
+    setError(vocabularyError, '');
+  });
+  vocabularyText.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || !event.ctrlKey || event.isComposing) return;
+    event.preventDefault();
+    submitVocabulary('enter');
+  });
+  vocabularyText.addEventListener('change', () => submitVocabulary('blur'));
+
   // The picker is a completed gesture too: one selection is one general change,
   // and the value is read from the control itself when it is sent.
   deviceSelect.addEventListener('change', () => {
@@ -2527,6 +2818,19 @@ function wire() {
     pendingDevice = deviceSelect.value === '' ? null : deviceSelect.value;
     deviceFailure = '';
     paintDeviceError();
+    onGeneralChange();
+  });
+
+  // Auto-detect drops the second language, and a first language equal to the
+  // second one takes it out of the second picker: the pickers are rebuilt from
+  // the choice before it is sent.
+  dictationPrimary.addEventListener('change', () => {
+    if (view === null || closed || busy) return;
+    renderDictationLanguages(selectedDictationLanguages());
+    onGeneralChange();
+  });
+  dictationSecondary.addEventListener('change', () => {
+    if (view === null || closed || busy) return;
     onGeneralChange();
   });
 

@@ -887,13 +887,19 @@ async fn handle(
         };
         let provider = Arc::clone(&state.provider);
         let ring = Arc::clone(&request.snapshot.keys);
+        // The vocabulary of the revision this socket is bound to: a dictation
+        // keeps the terms it started with, like its keys and its mode.
+        let vocabulary = Arc::clone(&request.snapshot.settings.custom_vocabulary);
+        // The dictation-language hints of the same revision: a dictation keeps
+        // the languages it started with.
+        let languages = Arc::clone(&request.snapshot.settings.dictation_languages);
         #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
         let trace = diagnostic_trace(state, uri, request.session, Route::Live, request.keys());
         return Ok(upgrade
             .max_message_size(MAX_WS_PAYLOAD)
             .on_upgrade(move |socket| async move {
                 live::serve(
-                    socket, provider, key, ring,
+                    socket, provider, key, ring, vocabulary, languages,
                     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
                     trace,
                 ).await;
@@ -1109,7 +1115,8 @@ async fn handle_transcribe(
         trace.batch_audio(bytes.len() as u64, Duration::from_secs_f64(duration));
     }
     let result = state.provider.transcribe(
-        &key, request.keys(), &mode, bytes,
+        &key, request.keys(), &mode, &request.snapshot.settings.custom_vocabulary,
+        &request.snapshot.settings.dictation_languages, bytes,
         #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
         trace.clone(),
     ).await;
@@ -1674,6 +1681,8 @@ mod tests {
                 port: 4175,
                 input_device: None,
                 language,
+                custom_vocabulary: Arc::default(),
+                dictation_languages: Arc::default(),
             },
             keys: Arc::new(keys),
             revision,

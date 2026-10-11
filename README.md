@@ -110,10 +110,12 @@ Want a different key? Type it in **Settings → General settings → Hotkey**, f
 The language switch at the top of the settings window (English or Русский) changes the interface instantly, without a restart. The **General settings** tab applies right away too:
 
 - **Recognition mode**: Live Smart, Smart or Verbatim.
+- **Dictation language**: Auto-detect (default), or one or two languages Gemini should expect — for example Russian plus English (US) for Russian speech with English terms. It's a recognition hint, not a translation; it works in all three modes and in the lab and applies from the next recording.
 - **Microphone**: the system default or a specific device.
 - **Mute sound while recording**: silences Windows playback while the microphone is on and restores it afterwards. Off by default.
 - **Start Speechek when signing in to Windows.**
 - **Hotkey.**
+- **Custom vocabulary**: words and phrases recognition should lean toward — names, brands, terms and abbreviations as they should be spelled, one per line. It works in Live Smart, Smart and Verbatim and in the lab, and it biases recognition rather than replacing text. Leaving the field or pressing Ctrl+Enter (plain Enter adds a line) saves the list; it applies from the next recording and can be edited during a dictation. Up to 1000 terms, and Google recommends keeping the list at 100 or fewer.
 
 The only exception is the local port, which you'll hardly ever need: it applies after a restart.
 
@@ -129,10 +131,11 @@ API keys are different: they take effect only after you click **Apply keys**.
 ## Privacy and limits
 
 > [!IMPORTANT]
-> Speechek works through the cloud: your speech is sent to Google for recognition. On the Free Tier, Google may use what you send to improve its products, and that includes human review. Don't dictate anything confidential.
+> Speechek works through the cloud: your speech — and the custom vocabulary list, if you set one — is sent to Google for recognition. On the Free Tier, Google may use what you send to improve its products, and that includes human review. Don't dictate anything confidential.
 
 - You need an internet connection, a microphone and a country where the [Gemini API is available](https://ai.google.dev/gemini-api/docs/available-regions). There is no offline mode.
 - Your API keys are encrypted with Windows DPAPI for your user account and stored in `%APPDATA%\Speechek\secrets.bin`, never as plain text. The installed app writes no audio and no recognized text to disk; only a separate debug Development build with the explicit `dev-diagnostics` feature can keep a local archive of the audio and the full recognition content, see [Development diagnostics](#development-diagnostics-debug-builds-only).
+- The custom vocabulary is plain text in `settings.json`, never in `secrets.bin`, and it is sent to Google with every recording, in all three modes.
 - The Free Tier, quotas and available models are up to Google and can change. On a paid project, requests may be billed.
 - Several keys don't make a failed request succeed: if Gemini rejects a key, Speechek doesn't retry on another one.
 
@@ -215,6 +218,7 @@ The portable **Development** debug build can keep a local archive of its own tak
 - **Incomplete takes.** If the byte cap is reached or a write fails, a take records only what was saved and advertises itself as incomplete: dropped content, audio gaps and disk errors are counted, never presented as a complete take.
 - **Retention.** Files are removed after 10 days or earlier if the archive outgrows a total cap of 100,000,000 bytes (decimal 100 MB) across audio, journals, content records, partial files and staging. Partial files and staging copies count toward the cap, as does the space reserved to finish an active take. Cleanup runs at startup, once a minute while Development runs and when a take closes; with the app closed, the files stay until the next launch.
 - **Privacy.** The FLAC is plaintext personal audio and the archived content is plaintext recognized text — not encryption. Both are readable by your Windows user and SYSTEM (protected DACL), and therefore by any software running as you. Nothing is uploaded automatically and nothing in the archive is sent anywhere; it never contains API keys, authorization headers or its own WebSocket connection URL. The archived text is ordinary content, so a URL you dictated, or one Google returns in a reply, is kept like any other words. Use synthetic data only in automated checks; never use real keys or real speech.
+- **Custom vocabulary.** A take never stores the terms themselves: the archived setup records only how many terms the vocabulary had.
 
 ## License
 

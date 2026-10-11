@@ -150,7 +150,8 @@ impl std::error::Error for SettingsUiError {}
 
 /// What the settings page draws, for one draft revision. The nested `settings`
 /// keeps the document's own names: `hotkey`, `mode`, `mute_during_recording`,
-/// `port` and `input_device`. Its `port` is the value the next start will use -
+/// `port`, `input_device`, `language`, `custom_vocabulary` and
+/// `dictation_languages`. Its `port` is the value the next start will use -
 /// editable, saved immediately, applied by a restart - while `startup_port`,
 /// `running_port` and `port_fallback` describe the socket this run already
 /// owns and never follow an edit.
@@ -219,6 +220,8 @@ pub struct SettingsView {
     /// `null` when the registration cannot be read or the value name belongs to
     /// another program.
     pub autostart_enabled: Option<bool>,
+    /// The languages the dictation-language pickers offer, with their catalog keys.
+    pub dictation_language_options: &'static [crate::dictation_language::DictationLanguage],
 }
 
 /// One input device the settings window may choose between. `id` is the
@@ -431,12 +434,14 @@ impl KeyPlan {
 /// contract fixes it, and the page never passes it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ApplyScope {
-    /// The general form: the recognition mode and the mute switch.
+    /// The general form: mode, mute, port, device, language, dictation languages.
     General,
     /// The chord the page typed in the hotkey field.
     Hotkey,
     /// The key list the page typed, through its explicit apply only.
     Keys,
+    /// The custom vocabulary the page typed in its vocabulary field.
+    Vocabulary,
 }
 
 /// The page's editing session. Owned by [`PreferencesState`]; every command
@@ -708,6 +713,7 @@ impl PreferencesState {
             dictation_active: crate::phase_of(&crate::inner(app)).is_active(),
             partial_persistence: self.partial_persistence(),
             autostart_enabled: crate::autostart::state(),
+            dictation_language_options: crate::dictation_language::DICTATION_LANGUAGES,
             selected_section,
         }
     }
@@ -824,6 +830,9 @@ pub struct GeneralSettings {
     /// spelling. Required: a payload that omits it is refused, so an old page
     /// can never write a language it never showed.
     pub language: Language,
+    /// The dictation-language hints the page shows, in its order; `[]` is
+    /// Auto-detect. Required like the other general values.
+    pub dictation_languages: Vec<String>,
 }
 
 /// Reads the general form's `input_device`: `null` is the system default
@@ -883,6 +892,34 @@ fn usable_port(port: u16) -> Result<u16, SettingsUiError> {
     Ok(port)
 }
 
+/// The vocabulary field's text as the document will carry it: one term per
+/// line, trimmed, without blank lines or exact repeats. A list longer than the
+/// API accepts is refused with its count, never cut short.
+fn usable_vocabulary(text: &str) -> Result<Arc<[String]>, SettingsUiError> {
+    settings::vocabulary_from_text(text).map_err(|count| {
+        SettingsUiError::field(
+            "VOCABULARY_TOO_LARGE",
+            UiMessage::new(MessageId::VocabularyTooLarge)
+                .with_arg("count", serde_json::json!(count))
+                .with_arg("max", serde_json::json!(settings::MAX_CUSTOM_VOCABULARY)),
+            "custom_vocabulary",
+        )
+    })
+}
+
+/// The general form's dictation languages, checked with the rule the document
+/// is read with: at most two different supported codes, in the page's order.
+fn usable_dictation_languages(codes: Vec<String>) -> Result<Arc<[String]>, SettingsUiError> {
+    if crate::dictation_language::is_valid_list(&codes) {
+        return Ok(codes.into());
+    }
+    Err(SettingsUiError::field(
+        "DICTATION_LANGUAGES_INVALID",
+        UiMessage::new(MessageId::DictationLanguagesInvalid),
+        "dictation_languages",
+    ))
+}
+
 /// The general form's device, checked with the same rule the settings document
 /// is read with: `None` is the system default device, and an id has to be one
 /// `cpal::DeviceId` can parse back. A choice the next read would refuse can
@@ -935,6 +972,7 @@ fn update_general_blocking(
     // the files or the runtime.
     let port = usable_port(request.port)?;
     let input_device = usable_input_device(request.input_device)?;
+    let dictation_languages = usable_dictation_languages(request.dictation_languages)?;
     let snapshot = inner.runtime.snapshot();
     let planned = Settings {
         hotkey: snapshot.settings.hotkey.clone(),
@@ -943,6 +981,8 @@ fn update_general_blocking(
         port,
         input_device,
         language: request.language,
+        custom_vocabulary: Arc::clone(&snapshot.settings.custom_vocabulary),
+        dictation_languages,
     };
     let mut slot = state.draft.lock();
     let draft = slot.as_mut().ok_or_else(SettingsUiError::stale_draft)?;
@@ -1064,6 +1104,8 @@ fn update_hotkey_blocking(
         port: snapshot.settings.port,
         input_device: snapshot.settings.input_device.clone(),
         language: snapshot.settings.language,
+        custom_vocabulary: Arc::clone(&snapshot.settings.custom_vocabulary),
+        dictation_languages: Arc::clone(&snapshot.settings.dictation_languages),
     };
     let mut slot = state.draft.lock();
     let draft = slot.as_mut().ok_or_else(SettingsUiError::stale_draft)?;
@@ -1071,6 +1113,47 @@ fn update_hotkey_blocking(
         return Err(SettingsUiError::stale_draft());
     }
     apply_locked(app, &state, draft, planned, ApplyScope::Hotkey, false)
+}
+
+/// Applies the text the page typed into its vocabulary field: normalizes and
+/// checks it before anything is planned, writes the document and reads it
+/// back, and publishes the runtime revision the next recording resolves. Every
+/// other value is the running one. A dictation already under way keeps its
+/// pinned snapshot, so the change is served during a take.
+#[tauri::command]
+pub async fn settings_update_vocabulary(
+    window: WebviewWindow,
+    app: AppHandle,
+    draft_id: u64,
+    revision: u64,
+    text: String,
+) -> Result<SaveResult, SettingsUiError> {
+    check_window(&window)?;
+    run_blocking(move || update_vocabulary_blocking(&app, draft_id, revision, &text)).await
+}
+
+fn update_vocabulary_blocking(
+    app: &AppHandle,
+    draft_id: u64,
+    revision: u64,
+    text: &str,
+) -> Result<SaveResult, SettingsUiError> {
+    let state = app.state::<PreferencesState>();
+    let inner = crate::inner(app);
+    let _session = inner.session.lock();
+    ensure_running(&state)?;
+    let custom_vocabulary = usable_vocabulary(text)?;
+    let snapshot = inner.runtime.snapshot();
+    let planned = Settings {
+        custom_vocabulary,
+        ..snapshot.settings.clone()
+    };
+    let mut slot = state.draft.lock();
+    let draft = slot.as_mut().ok_or_else(SettingsUiError::stale_draft)?;
+    if draft.id != draft_id || draft.revision != revision {
+        return Err(SettingsUiError::stale_draft());
+    }
+    apply_locked(app, &state, draft, planned, ApplyScope::Vocabulary, false)
 }
 
 /// Turns this executable's launch-at-logon registration on or off. The change
@@ -1752,8 +1835,14 @@ fn planned_for_scope(
             port: planned.port,
             input_device: planned.input_device,
             language: planned.language,
+            custom_vocabulary: Arc::clone(&snapshot.custom_vocabulary),
+            dictation_languages: planned.dictation_languages,
         },
         ApplyScope::Keys => snapshot.clone(),
+        ApplyScope::Vocabulary => Settings {
+            custom_vocabulary: planned.custom_vocabulary,
+            ..snapshot.clone()
+        },
         ApplyScope::Hotkey => Settings {
             hotkey: settings::validate_hotkey(&planned.hotkey, config_path).map_err(|_| {
                 SettingsUiError::field(
@@ -1767,6 +1856,8 @@ fn planned_for_scope(
             port: snapshot.port,
             input_device: snapshot.input_device.clone(),
             language: snapshot.language,
+            custom_vocabulary: Arc::clone(&snapshot.custom_vocabulary),
+            dictation_languages: Arc::clone(&snapshot.dictation_languages),
         },
     })
 }
@@ -1894,9 +1985,10 @@ fn apply_locked(
                 }
             }
         },
-        // A mode or chord applies the running ring, or the write a previous
-        // failure owed the disk. The typed list is not a desired state here.
-        ApplyScope::General | ApplyScope::Hotkey => {
+        // A mode, chord or vocabulary applies the running ring, or the write a
+        // previous failure owed the disk. The typed list is not a desired state
+        // here.
+        ApplyScope::General | ApplyScope::Hotkey | ApplyScope::Vocabulary => {
             if reconcile_secrets {
                 repair_plan(&previous_vault, snapshot.keys.keys().to_vec())
             } else {
@@ -2002,7 +2094,7 @@ fn apply_locked(
     // launcher exactly as it is, including one that could not start.
     let mut candidate = match scope {
         ApplyScope::Hotkey => crate::prepare_settings_hotkey(app, &planned.hotkey)?,
-        ApplyScope::General | ApplyScope::Keys => None,
+        ApplyScope::General | ApplyScope::Keys | ApplyScope::Vocabulary => None,
     };
 
     // The file transaction itself: container first, then the document, both
@@ -2498,6 +2590,8 @@ mod tests {
             port: settings::DEFAULT_PORT,
             input_device: None,
             language: Language::En,
+            custom_vocabulary: Arc::default(),
+            dictation_languages: Arc::default(),
         }
     }
 
@@ -2607,7 +2701,7 @@ mod tests {
         // Zero is the only port a `u16` accepts that is not a port, so it is the
         // value this check is for.
         let zero: GeneralSettings = serde_json::from_str(
-            r#"{"mode":"smart","mute_during_recording":true,"port":0,"input_device":null,"language":"en"}"#,
+            r#"{"mode":"smart","mute_during_recording":true,"port":0,"input_device":null,"language":"en","dictation_languages":[]}"#,
         )
         .expect("zero is a u16");
         let error = usable_port(zero.port).expect_err("zero is not a port");
@@ -2617,10 +2711,10 @@ mod tests {
         // A value that is not a whole number in range never becomes a parsed
         // payload: the command is refused before its body runs.
         for payload in [
-            r#"{"mode":"smart","mute_during_recording":true,"port":65536,"input_device":null,"language":"en"}"#,
-            r#"{"mode":"smart","mute_during_recording":true,"port":-1,"input_device":null,"language":"en"}"#,
-            r#"{"mode":"smart","mute_during_recording":true,"port":"4173","input_device":null,"language":"en"}"#,
-            r#"{"mode":"smart","mute_during_recording":true,"port":4173.5,"input_device":null,"language":"en"}"#,
+            r#"{"mode":"smart","mute_during_recording":true,"port":65536,"input_device":null,"language":"en","dictation_languages":[]}"#,
+            r#"{"mode":"smart","mute_during_recording":true,"port":-1,"input_device":null,"language":"en","dictation_languages":[]}"#,
+            r#"{"mode":"smart","mute_during_recording":true,"port":"4173","input_device":null,"language":"en","dictation_languages":[]}"#,
+            r#"{"mode":"smart","mute_during_recording":true,"port":4173.5,"input_device":null,"language":"en","dictation_languages":[]}"#,
         ] {
             assert!(
                 serde_json::from_str::<GeneralSettings>(payload).is_err(),
@@ -2674,6 +2768,8 @@ mod tests {
             port: 43118,
             input_device: Some("wasapi:card-one".to_owned()),
             language: Language::En,
+            custom_vocabulary: Arc::default(),
+            dictation_languages: Arc::default(),
         };
         let path = Path::new("settings.json");
 
@@ -2686,6 +2782,8 @@ mod tests {
                 port: 43119,
                 input_device: None,
                 language: Language::Ru,
+                custom_vocabulary: Arc::default(),
+                dictation_languages: Arc::default(),
             },
             &running,
             path,
@@ -2712,6 +2810,8 @@ mod tests {
             port: 43119,
             input_device: None,
             language: Language::En,
+            custom_vocabulary: Arc::default(),
+            dictation_languages: Arc::default(),
         };
         let keys = planned_for_scope(ApplyScope::Keys, page_copy.clone(), &running, path)
             .expect("a keys plan");
@@ -2740,6 +2840,91 @@ mod tests {
         );
     }
 
+    /// Only the vocabulary command owns the vocabulary: a general, chord or key
+    /// change keeps the running list whatever the page holds, and a vocabulary
+    /// change keeps every running value except the list. A list over the API
+    /// limit is refused on the vocabulary field before anything is planned.
+    #[test]
+    fn only_the_vocabulary_scope_changes_the_vocabulary() {
+        let running = Settings {
+            custom_vocabulary: Arc::from(vec!["Speechek".to_owned()]),
+            ..settings_of("smart")
+        };
+        let page_copy = Settings {
+            custom_vocabulary: Arc::from(vec!["Other".to_owned()]),
+            hotkey: "Ctrl+Shift+F9".to_owned(),
+            ..settings_of("verbatim")
+        };
+        let path = Path::new("settings.json");
+
+        for scope in [ApplyScope::General, ApplyScope::Hotkey, ApplyScope::Keys] {
+            let plan = planned_for_scope(scope, page_copy.clone(), &running, path).expect("a plan");
+            assert_eq!(&*plan.custom_vocabulary, ["Speechek"]);
+        }
+
+        let vocabulary = planned_for_scope(ApplyScope::Vocabulary, page_copy, &running, path)
+            .expect("a vocabulary plan");
+        assert_eq!(&*vocabulary.custom_vocabulary, ["Other"]);
+        assert_eq!(vocabulary.mode, "smart", "the running mode stays");
+        assert_eq!(vocabulary.hotkey, running.hotkey, "the running chord stays");
+
+        let over = (0..=settings::MAX_CUSTOM_VOCABULARY)
+            .map(|n| format!("term{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = usable_vocabulary(&over).expect_err("one term too many");
+        assert_eq!(error.code, "VOCABULARY_TOO_LARGE");
+        assert_eq!(error.field.as_deref(), Some("custom_vocabulary"));
+    }
+
+    /// Only the general command owns the dictation languages: a chord, key or
+    /// vocabulary change keeps the running list whatever the page holds. The
+    /// general form's list is required and checked with the document's rule
+    /// before anything is planned.
+    #[test]
+    fn only_the_general_scope_changes_the_dictation_languages() {
+        let running = Settings {
+            dictation_languages: Arc::from(vec!["ru-RU".to_owned()]),
+            ..settings_of("smart")
+        };
+        let page_copy = Settings {
+            dictation_languages: Arc::from(vec!["de-DE".to_owned(), "en-US".to_owned()]),
+            ..settings_of("verbatim")
+        };
+        let path = Path::new("settings.json");
+
+        for scope in [ApplyScope::Hotkey, ApplyScope::Keys, ApplyScope::Vocabulary] {
+            let plan = planned_for_scope(scope, page_copy.clone(), &running, path).expect("a plan");
+            assert_eq!(&*plan.dictation_languages, ["ru-RU"]);
+        }
+        let general = planned_for_scope(ApplyScope::General, page_copy, &running, path)
+            .expect("a general plan");
+        assert_eq!(&*general.dictation_languages, ["de-DE", "en-US"]);
+
+        assert_eq!(
+            &*usable_dictation_languages(vec!["ru-RU".to_owned(), "en-US".to_owned()])
+                .expect("two different supported codes"),
+            ["ru-RU", "en-US"]
+        );
+        for refused in [
+            vec!["xx-XX"],
+            vec!["ru-ru"],
+            vec!["ru-RU", "ru-RU"],
+            vec!["ru-RU", "en-US", "de-DE"],
+        ] {
+            let error = usable_dictation_languages(refused.iter().map(|code| (*code).to_owned()).collect())
+                .expect_err("a list the document reader would refuse");
+            assert_eq!(error.code, "DICTATION_LANGUAGES_INVALID");
+            assert_eq!(error.field.as_deref(), Some("dictation_languages"));
+        }
+
+        let without = r#"{"mode":"smart","mute_during_recording":false,"port":43118,"input_device":null,"language":"ru"}"#;
+        assert!(
+            serde_json::from_str::<GeneralSettings>(without).is_err(),
+            "an omitted list is refused, not read as Auto-detect"
+        );
+    }
+
     /// The general form's payload is a contract: the language is required, and
     /// a payload that omits it, spells one the interface does not ship or
     /// repeats it is refused before anything is planned.
@@ -2751,24 +2936,25 @@ mod tests {
             "port": 43118,
             "input_device": null,
             "language": "ru",
+            "dictation_languages": [],
         }))
         .expect("a complete general payload");
         assert_eq!(complete.language, Language::Ru);
 
         let missing =
-            r#"{"mode":"smart","mute_during_recording":false,"port":43118,"input_device":null}"#;
+            r#"{"mode":"smart","mute_during_recording":false,"port":43118,"input_device":null,"dictation_languages":[]}"#;
         assert!(
             serde_json::from_str::<GeneralSettings>(missing).is_err(),
             "an omitted language is refused, not defaulted"
         );
 
-        let unsupported = r#"{"mode":"smart","mute_during_recording":false,"port":43118,"input_device":null,"language":"de"}"#;
+        let unsupported = r#"{"mode":"smart","mute_during_recording":false,"port":43118,"input_device":null,"language":"de","dictation_languages":[]}"#;
         assert!(
             serde_json::from_str::<GeneralSettings>(unsupported).is_err(),
             "a language the interface does not ship is refused"
         );
 
-        let duplicate = r#"{"mode":"smart","mute_during_recording":false,"port":43118,"input_device":null,"language":"ru","language":"en"}"#;
+        let duplicate = r#"{"mode":"smart","mute_during_recording":false,"port":43118,"input_device":null,"language":"ru","language":"en","dictation_languages":[]}"#;
         assert!(
             serde_json::from_str::<GeneralSettings>(duplicate).is_err(),
             "a duplicated language is refused, not coerced"
@@ -2840,6 +3026,8 @@ mod tests {
             port: 43118,
             input_device: None,
             language: Language::En,
+            custom_vocabulary: Arc::default(),
+            dictation_languages: Arc::default(),
         };
         let context = FileContext {
             config_path: &config,
@@ -2867,7 +3055,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&config).expect("the written document"),
-            "\u{feff}{\r\n  // режим\r\n  \"mute_during_recording\": true,\r\n  \"port\": 43118,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"verbatim\"\r\n  \r\n}\r\n",
+            "\u{feff}{\r\n  // режим\r\n  \"mute_during_recording\": true,\r\n  \"port\": 43118,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"verbatim\"\r\n  \r\n}\r\n",
             "the retired property is gone and every other byte survived"
         );
     }

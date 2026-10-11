@@ -84,6 +84,8 @@ fn snapshot_with_keys(keys: &[&str], revision: u64) -> Arc<RuntimeSnapshot> {
             port: 4175,
             input_device: None,
             language: Language::En,
+            custom_vocabulary: Arc::default(),
+            dictation_languages: Arc::default(),
         },
         keys: Arc::new(KeyRing::new(
             keys.iter()

@@ -151,6 +151,13 @@ struct Relay {
     /// included - is what each outgoing message is redacted against, so an
     /// upstream error that quotes a key cannot reach the browser.
     ring: Arc<KeyRing>,
+    /// The custom vocabulary of the revision this socket was bound to: the
+    /// terms the upstream setup frame biases recognition toward. Empty means
+    /// the setup frame carries no vocabulary field at all.
+    vocabulary: Arc<[String]>,
+    /// The dictation-language hints of the bound revision; empty means the
+    /// setup frame carries no `languageCodes` field.
+    languages: Arc<[String]>,
     mode: Option<Mode>,
     started: bool,
     end_requested: bool,
@@ -186,6 +193,8 @@ impl Relay {
     fn new(
         key: Arc<SecretKey>,
         ring: Arc<KeyRing>,
+        vocabulary: Arc<[String]>,
+        languages: Arc<[String]>,
         #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] trace: Option<RequestTrace>,
     ) -> Self {
         #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
@@ -199,6 +208,8 @@ impl Relay {
             #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
             armed_final: None,
             ring,
+            vocabulary,
+            languages,
             mode: None,
             started: false,
             end_requested: false,
@@ -558,18 +569,29 @@ fn note_browser_message(state: &Relay, payload: &Value) {
 /// socket bound - a 1-based ordinal and the ring's key count, never the key
 /// itself. The send is already counted numerically; this is the configuration
 /// those counts belong to, and the entry a 401/429 on this socket came from.
+/// The terms of the custom vocabulary are never archived: the frame keeps only
+/// how many of them the setup carried, because a term is user text. The
+/// dictation-language hints (`languageCodes`) are configuration and stay.
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
 fn note_setup(state: &Relay, setup: &Value) {
     let Some(trace) = state.trace.as_ref() else {
         return;
     };
+    let mut frame = setup.clone();
+    if let Some(config) = frame
+        .pointer_mut("/setup/inputAudioTranscription")
+        .and_then(Value::as_object_mut)
+    {
+        config.remove("customVocabulary");
+    }
     let ring = state.ring.keys();
     trace.content(
         ContentKind::LiveSetup,
         ContentFormat::Json,
         diagnostic_json(
             &json!({
-                "frame": setup,
+                "frame": frame,
+                "custom_vocabulary_terms": state.vocabulary.len(),
                 "key_ordinal": key_ordinal(&state.key, ring),
                 "ring_keys": ring.len(),
             }),
@@ -661,6 +683,8 @@ pub async fn serve(
     provider: Arc<Provider>,
     key: Arc<SecretKey>,
     ring: Arc<KeyRing>,
+    vocabulary: Arc<[String]>,
+    languages: Arc<[String]>,
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] trace: Option<RequestTrace>,
 ) {
     // Redaction is only ever as complete as the ring: the socket's own key has to
@@ -675,6 +699,8 @@ pub async fn serve(
     let mut state = Relay::new(
         key,
         ring,
+        vocabulary,
+        languages,
         #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
         trace,
     );
@@ -875,7 +901,7 @@ async fn open_upstream(
     // it is awaited, so a setup write that never returns is visible too. The
     // payload is built once here, so the configuration the archive keeps is the
     // exact one this send writes.
-    let setup = setup_payload(mode);
+    let setup = setup_payload(mode, &state.vocabulary, &state.languages);
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
     note_setup(state, &setup);
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
@@ -1668,14 +1694,24 @@ fn warn(keys: &[Arc<SecretKey>], message: &str) {
 /* Payloads and JSON narrowing                                                */
 /* -------------------------------------------------------------------------- */
 
-/// The exact setup frame the Live API expects, field for field.
-fn setup_payload(mode: Mode) -> Value {
+/// The exact setup frame the Live API expects, field for field. A non-empty
+/// `vocabulary` rides in `inputAudioTranscription` as `customVocabulary` and
+/// non-empty dictation-language hints as `languageCodes`; empty ones leave the
+/// frame exactly as it was before either existed (automatic detection).
+fn setup_payload(mode: Mode, vocabulary: &[String], languages: &[String]) -> Value {
+    let mut transcription = json!({ "mode": mode.live_value() });
+    if !vocabulary.is_empty() {
+        transcription["customVocabulary"] = json!(vocabulary);
+    }
+    if !languages.is_empty() {
+        transcription["languageCodes"] = json!(languages);
+    }
     json!({
         "setup": {
             "model": format!("models/{LIVE_MODEL}"),
             "generationConfig": { "responseModalities": ["TEXT"] },
             "realtimeInputConfig": { "automaticActivityDetection": { "disabled": true } },
-            "inputAudioTranscription": { "mode": mode.live_value() },
+            "inputAudioTranscription": transcription,
         }
     })
 }
@@ -1931,6 +1967,7 @@ mod relay_tests {
     /// backend reaches it.
     async fn relay(
         upstream_port: u16,
+        vocabulary: Arc<[String]>,
         trace: Option<RequestTrace>,
     ) -> (u16, Arc<SecretKey>, Arc<KeyRing>) {
         let provider = Arc::new(Provider::for_test(
@@ -1946,16 +1983,19 @@ mod relay_tests {
         let port = listener.local_addr().expect("an address").port();
         let serve_key = Arc::clone(&key);
         let serve_ring = Arc::clone(&ring);
+        let serve_vocabulary = vocabulary;
         let app = axum::Router::new().route(
             "/api/live",
             axum::routing::any(move |upgrade: axum::extract::ws::WebSocketUpgrade| {
                 let provider = Arc::clone(&provider);
                 let key = Arc::clone(&serve_key);
                 let ring = Arc::clone(&serve_ring);
+                let vocabulary = Arc::clone(&serve_vocabulary);
                 let trace = trace.clone();
                 async move {
                     upgrade.on_upgrade(move |socket| async move {
-                        serve(socket, provider, key, ring, trace).await;
+                        serve(socket, provider, key, ring, vocabulary, Arc::default(), trace)
+                            .await;
                     })
                 }
             }),
@@ -2163,7 +2203,7 @@ mod relay_tests {
             None,
         )
         .await;
-        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+        let (port, _key, _ring) = relay(upstream_port, Arc::default(), Some(trace)).await;
 
         let mut client = client(port).await;
         client
@@ -2235,7 +2275,7 @@ mod relay_tests {
             None,
         )
         .await;
-        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+        let (port, _key, _ring) = relay(upstream_port, Arc::default(), Some(trace)).await;
 
         let mut client = client(port).await;
         client
@@ -2373,7 +2413,7 @@ mod relay_tests {
             None,
         )
         .await;
-        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+        let (port, _key, _ring) = relay(upstream_port, Arc::default(), Some(trace)).await;
 
         let mut client = client(port).await;
         client
@@ -2454,7 +2494,7 @@ mod relay_tests {
             )),
         )
         .await;
-        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+        let (port, _key, _ring) = relay(upstream_port, Arc::default(), Some(trace)).await;
 
         let mut client = client(port).await;
         client
@@ -2536,7 +2576,7 @@ mod relay_tests {
             // The socket stays open: the relay must survive the frame.
             while ws.next().await.is_some() {}
         });
-        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+        let (port, _key, _ring) = relay(upstream_port, Arc::default(), Some(trace)).await;
 
         let mut client = client(port).await;
         client
@@ -2600,7 +2640,7 @@ mod relay_tests {
             // The socket stays open: the relay must survive the frame.
             while ws.next().await.is_some() {}
         });
-        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+        let (port, _key, _ring) = relay(upstream_port, Arc::default(), Some(trace)).await;
 
         let mut client = client(port).await;
         client
@@ -2696,7 +2736,7 @@ mod relay_tests {
                 .await;
             while ws.next().await.is_some() {}
         });
-        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+        let (port, _key, _ring) = relay(upstream_port, Arc::default(), Some(trace)).await;
 
         let mut client = client(port).await;
         client
@@ -2772,7 +2812,7 @@ mod relay_tests {
             None,
         )
         .await;
-        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+        let (port, _key, _ring) = relay(upstream_port, Arc::default(), Some(trace)).await;
 
         let mut client = client(port).await;
         client
@@ -2842,6 +2882,57 @@ mod relay_tests {
         cleanup(diagnostics, &root);
     }
 
+    /// The vocabulary the socket was bound to really reaches the setup frame,
+    /// and the archive keeps only how many terms it had: a term is user text
+    /// and never enters a record.
+    #[tokio::test]
+    async fn the_archived_setup_counts_the_vocabulary_without_its_terms() {
+        let root = scratch("vocabulary-setup");
+        let (diagnostics, trace) = take(&root);
+        let (upstream_port, _received) = fake_upstream(
+            vec![json!({ "setupComplete": {} })],
+            None,
+            None,
+        )
+        .await;
+        let (port, _key, _ring) = relay(
+            upstream_port,
+            Arc::from(vec!["Speechek".to_owned(), "Kubernetes".to_owned()]),
+            Some(trace),
+        )
+        .await;
+
+        let mut client = client(port).await;
+        client
+            .send(WsMessage::text(json!({ "type": "start", "mode": "smart" }).to_string()))
+            .await
+            .expect("the start frame");
+        assert!(client.next().await.expect("a frame").expect("text")
+            .to_text()
+            .expect("text")
+            .contains("ready"));
+
+        let records = journal_when(&root, 300, |rows| {
+            !content_bodies(rows, "live_setup").is_empty()
+        })
+        .await;
+        let setups = content_bodies(&records, "live_setup");
+        assert_eq!(setups.len(), 1, "one setup frame, one record: {setups:?}");
+        assert!(
+            setups[0].contains("\"custom_vocabulary_terms\":2"),
+            "how many terms the setup carried: {setups:?}"
+        );
+        assert!(
+            setups[0].contains("\"mode\":\"SMART\""),
+            "the mode the socket was opened with: {setups:?}"
+        );
+        assert!(
+            !setups[0].contains("Kubernetes"),
+            "no term of the vocabulary enters the record: {setups:?}"
+        );
+        cleanup(diagnostics, &root);
+    }
+
     /// An upstream that drops the connection without a close frame is the 1006
     /// the browser API reports. The drop surfaces twice: once as the failed
     /// read it really is - a received message, and rightly counted - and then
@@ -2852,7 +2943,7 @@ mod relay_tests {
         let root = scratch("eof");
         let (diagnostics, trace) = take(&root);
         let (upstream_port, mut received) = abrupt_upstream(vec![json!({ "setupComplete": {} })]).await;
-        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+        let (port, _key, _ring) = relay(upstream_port, Arc::default(), Some(trace)).await;
 
         let mut client = client(port).await;
         client
@@ -2940,7 +3031,7 @@ mod relay_tests {
         fn new_relay() -> Relay {
             let key = Arc::new(SecretKey::new(SYNTHETIC_KEY.to_string()));
             let ring = Arc::new(KeyRing::new(vec![Arc::clone(&key)]));
-            Relay::new(key, ring, None)
+            Relay::new(key, ring, Arc::default(), Arc::default(), None)
         }
 
         let mut state = new_relay();
@@ -3004,7 +3095,7 @@ mod relay_tests {
             None,
         )
         .await;
-        let (port, _key, _ring) = relay(upstream_port, Some(trace)).await;
+        let (port, _key, _ring) = relay(upstream_port, Arc::default(), Some(trace)).await;
 
         let mut client = client(port).await;
         client
@@ -3062,5 +3153,47 @@ mod relay_tests {
             "the relay is still running: {records:?}"
         );
         cleanup(diagnostics, &root);
+    }
+}
+
+/// The setup frame's wire shape, pinned without the diagnostics the relay tests
+/// above need: an empty vocabulary or language list leaves the frame exactly as
+/// it was, set ones ride in `inputAudioTranscription` as `customVocabulary` and
+/// `languageCodes`.
+#[cfg(test)]
+mod payload_tests {
+    use super::*;
+
+    #[test]
+    fn the_live_setup_omits_an_empty_vocabulary_and_carries_a_set_one() {
+        let empty = setup_payload(Mode::Smart, &[], &[]);
+        assert_eq!(
+            empty["setup"]["inputAudioTranscription"],
+            json!({ "mode": "SMART" })
+        );
+        let set = setup_payload(Mode::Smart, &["Speechek".to_owned()], &[]);
+        assert_eq!(
+            set["setup"]["inputAudioTranscription"],
+            json!({ "mode": "SMART", "customVocabulary": ["Speechek"] })
+        );
+    }
+
+    #[test]
+    fn the_live_setup_carries_the_dictation_languages_only_when_chosen() {
+        let languages = ["ru-RU".to_owned(), "en-US".to_owned()];
+        let hinted = setup_payload(Mode::Smart, &[], &languages);
+        assert_eq!(
+            hinted["setup"]["inputAudioTranscription"],
+            json!({ "mode": "SMART", "languageCodes": ["ru-RU", "en-US"] })
+        );
+        let both = setup_payload(Mode::Smart, &["Speechek".to_owned()], &languages);
+        assert_eq!(
+            both["setup"]["inputAudioTranscription"],
+            json!({
+                "mode": "SMART",
+                "customVocabulary": ["Speechek"],
+                "languageCodes": ["ru-RU", "en-US"],
+            })
+        );
     }
 }

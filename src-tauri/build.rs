@@ -64,6 +64,7 @@ fn main() {
                 "settings_close",
                 "settings_action",
                 "settings_update_hotkey",
+                "settings_update_vocabulary",
                 "settings_hotkey_capture",
                 "settings_set_autostart",
             ])),

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-settings-update-vocabulary"
+description = "Enables the settings_update_vocabulary command without any pre-configured scope."
+commands.allow = ["settings_update_vocabulary"]
+
+[[permission]]
+identifier = "deny-settings-update-vocabulary"
+description = "Denies the settings_update_vocabulary command without any pre-configured scope."
+commands.deny = ["settings_update_vocabulary"]

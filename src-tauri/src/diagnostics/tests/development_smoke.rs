@@ -575,6 +575,11 @@ fn snapshot() -> Arc<RuntimeSnapshot> {
             port: 4175,
             input_device: None,
             language: Language::En,
+            custom_vocabulary: Arc::from(vec![
+                "Speechek".to_owned(),
+                "Kubernetes".to_owned(),
+            ]),
+            dictation_languages: Arc::from(vec!["ru-RU".to_owned(), "en-US".to_owned()]),
         },
         keys: Arc::new(KeyRing::new(
             PINNED_KEYS
@@ -1392,6 +1397,16 @@ fn verify_content(dir: &Path) {
     describing("recorder_result", FINAL);
     // The one close this session got, with the reason it carried.
     describing("socket_close", CLOSE_REASON);
+    // The setup frame the relay opened with: the archive keeps how many terms
+    // of the custom vocabulary it carried, and never a term itself.
+    describing("live_setup", "\"custom_vocabulary_terms\":2");
+    // The dictation-language hints of the snapshot reach the setup frame.
+    describing("live_setup", "\"languageCodes\":[\"ru-RU\",\"en-US\"]");
+    assert!(
+        !carries("live_setup", "Kubernetes"),
+        "no term of the vocabulary reaches the archive: {:?}",
+        bodies("live_setup")
+    );
 
     // Every record is a whole body: nothing is shortened and nothing is a
     // payload of a class the archive does not know.

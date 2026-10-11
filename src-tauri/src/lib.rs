@@ -73,6 +73,7 @@ mod backend;
 mod capture;
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
 mod diagnostics;
+mod dictation_language;
 
 #[cfg(all(feature = "dev-diagnostics", not(debug_assertions)))]
 compile_error!("dev-diagnostics requires a debug build");
@@ -1042,6 +1043,7 @@ fn runtime_context(snapshot: &RuntimeSnapshot) -> serde_json::Value {
         "mode": settings.mode,
         "input_device": settings.input_device,
         "language": settings.language,
+        "dictation_languages": settings.dictation_languages,
         "mute": settings.mute_during_recording,
         "hotkey": settings.hotkey,
         "port": settings.port,
@@ -3986,6 +3988,7 @@ pub fn run() {
             preferences::settings_close,
             preferences::settings_action,
             preferences::settings_update_hotkey,
+            preferences::settings_update_vocabulary,
             preferences::settings_hotkey_capture,
             preferences::settings_set_autostart
         ])
@@ -4110,6 +4113,8 @@ mod tests {
                 port: crate::settings::DEFAULT_PORT,
                 input_device: None,
                 language: crate::i18n::Language::En,
+                custom_vocabulary: Arc::default(),
+                dictation_languages: Arc::default(),
             },
             keys: Arc::new(KeyRing::empty()),
             revision: 1,
@@ -4266,6 +4271,8 @@ mod tests {
                 port: crate::settings::DEFAULT_PORT,
                 input_device: None,
                 language: crate::i18n::Language::En,
+                custom_vocabulary: Arc::default(),
+                dictation_languages: Arc::default(),
             },
             keys: Arc::new(KeyRing::empty()),
             revision: 1,
@@ -4506,6 +4513,8 @@ mod tests {
                 port: crate::settings::DEFAULT_PORT,
                 input_device: None,
                 language: crate::i18n::Language::En,
+                custom_vocabulary: Arc::default(),
+                dictation_languages: Arc::default(),
             },
             keys: Arc::new(KeyRing::empty()),
             revision: 1,
@@ -4702,6 +4711,8 @@ mod tests {
                 port: 65_535,
                 input_device: Some("wasapi:card-two".to_owned()),
                 language: crate::i18n::Language::Ru,
+                custom_vocabulary: Arc::default(),
+                dictation_languages: Arc::default(),
             },
             keys: Arc::new(KeyRing::empty()),
             revision: 2,

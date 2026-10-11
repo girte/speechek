@@ -245,6 +245,9 @@ impl Provider {
     ///
     /// `mode` is `"smart"` or `"verbatim"`; anything else is the route's 400,
     /// checked here so an invalid mode never costs an upload.
+    /// `vocabulary` biases recognition toward the user's terms; empty means the
+    /// request carries no vocabulary field at all. `languages` are the
+    /// dictation-language hints; empty is Auto-detect and keeps `language_codes: []`.
     /// The development diagnostics may observe this request; the transport
     /// behavior, the payloads and the deadlines never depend on it.
     pub async fn transcribe(
@@ -252,6 +255,8 @@ impl Provider {
         key: &Arc<SecretKey>,
         keys: &[Arc<SecretKey>],
         mode: &str,
+        vocabulary: &[String],
+        languages: &[String],
         wav: Vec<u8>,
         #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
         traced: Option<RequestTrace>,
@@ -290,6 +295,12 @@ impl Provider {
                         "model": BATCH_MODEL,
                         "mode": mode,
                         "mode_payload": &mode_payload,
+                        // How many terms the request biases recognition toward:
+                        // the count only, never a term.
+                        "custom_vocabulary_terms": vocabulary.len(),
+                        // The dictation-language hints: configuration, not
+                        // user text.
+                        "language_codes": languages,
                         "wav_bytes": wav.len(),
                         // Which pinned rotation entry this request used, and
                         // how many the ring had: the ordinal and the count
@@ -315,6 +326,8 @@ impl Provider {
                 key,
                 keys,
                 &uploaded.uri,
+                vocabulary,
+                languages,
                 mode_payload,
                 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
                 traced,
@@ -460,12 +473,16 @@ impl Provider {
     /// Interactions API transcription: the body built by [`interaction_payload`],
     /// pinned to `gemini-3.5-transcribe`. The transcript is `output_text`; when
     /// it is blank, the text parts of `outputs` and then of `steps` content are
-    /// used.
+    /// used. `vocabulary` is the custom vocabulary the body biases recognition
+    /// toward; an empty slice adds no vocabulary field at all. `languages` are
+    /// the dictation-language hints the body's `language_codes` carries.
     async fn transcribe_uploaded_file(
         &self,
         key: &Arc<SecretKey>,
         keys: &[Arc<SecretKey>],
         file_uri: &str,
+        vocabulary: &[String],
+        languages: &[String],
         mode_payload: Value,
         #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] traced: Option<&RequestTrace>,
     ) -> Result<String, ApiError> {
@@ -474,7 +491,7 @@ impl Provider {
             .post(format!("{}{}", self.http_base, INTERACTIONS_PATH))
             .header("x-goog-api-key", key.as_str())
             .header("content-type", "application/json")
-            .body(interaction_payload(file_uri, mode_payload).to_string());
+            .body(interaction_payload(file_uri, mode_payload, vocabulary, languages).to_string());
         let response = send_checked(
             request,
             MessageId::GoogleTranscriptionFailed,
@@ -616,15 +633,27 @@ impl Provider {
 
 /// The exact `POST /v1beta/interactions` body for one transcription, field for
 /// field: the uploaded file URI, the mode (`"smart"` or `{"type":"verbatim"}`),
-/// `language_codes: []` for automatic detection and `store: false`. Kept as one
+/// `language_codes` with the dictation-language hints - `[]`, automatic
+/// detection, when there are none - and `store: false`. A non-empty
+/// `vocabulary` rides in the same `transcription_config`; an empty one leaves
+/// the body exactly as it was before the vocabulary existed. Kept as one
 /// function so the wire shape is pinned by the tests below instead of drifting
 /// here.
-fn interaction_payload(file_uri: &str, mode_payload: Value) -> Value {
+fn interaction_payload(
+    file_uri: &str,
+    mode_payload: Value,
+    vocabulary: &[String],
+    languages: &[String],
+) -> Value {
+    let mut transcription_config = json!({ "mode": mode_payload, "language_codes": languages });
+    if !vocabulary.is_empty() {
+        transcription_config["custom_vocabulary"] = json!(vocabulary);
+    }
     json!({
         "model": BATCH_MODEL,
         "input": [{ "type": "audio", "uri": file_uri, "mime_type": WAV_MIME_TYPE }],
         "generation_config": {
-            "transcription_config": { "mode": mode_payload, "language_codes": [] },
+            "transcription_config": transcription_config,
         },
         "store": false,
     })
@@ -1328,7 +1357,8 @@ mod tests {
     /// reference documents.
     #[test]
     fn smart_interaction_payload_matches_the_documented_shape() {
-        let payload = interaction_payload("files/abc", Value::String("smart".to_owned()));
+        let payload =
+            interaction_payload("files/abc", Value::String("smart".to_owned()), &[], &[]);
         assert_eq!(payload["model"], BATCH_MODEL);
         assert_eq!(payload["input"][0]["type"], "audio");
         assert_eq!(payload["input"][0]["uri"], "files/abc");
@@ -1348,7 +1378,7 @@ mod tests {
     /// requires (`{"type":"verbatim"}`).
     #[test]
     fn verbatim_interaction_payload_carries_the_mode_object() {
-        let payload = interaction_payload("files/abc", json!({ "type": "verbatim" }));
+        let payload = interaction_payload("files/abc", json!({ "type": "verbatim" }), &[], &[]);
         assert_eq!(
             payload["generation_config"]["transcription_config"]["mode"],
             json!({ "type": "verbatim" })
@@ -1366,7 +1396,7 @@ mod tests {
     #[test]
     fn transcription_requests_never_ask_for_thinking() {
         for mode in [Value::String("smart".to_owned()), json!({ "type": "verbatim" })] {
-            let payload = interaction_payload("files/abc", mode.clone());
+            let payload = interaction_payload("files/abc", mode.clone(), &[], &[]);
             assert_eq!(
                 payload,
                 json!({
@@ -1379,6 +1409,43 @@ mod tests {
                 })
             );
         }
+    }
+
+    /// A non-empty vocabulary rides in the same `transcription_config` the mode
+    /// uses, as the plain array of terms the reference documents; the terms keep
+    /// the order the user listed them in.
+    #[test]
+    fn a_vocabulary_rides_in_the_transcription_config() {
+        let payload = interaction_payload(
+            "files/abc",
+            Value::String("smart".to_owned()),
+            &["Speechek".to_owned(), "BigQuery".to_owned()],
+            &[],
+        );
+        assert_eq!(
+            payload["generation_config"]["transcription_config"],
+            json!({
+                "mode": "smart",
+                "language_codes": [],
+                "custom_vocabulary": ["Speechek", "BigQuery"],
+            })
+        );
+    }
+
+    /// The dictation-language hints ride in `language_codes`, in the order the
+    /// user chose them.
+    #[test]
+    fn the_dictation_languages_ride_in_language_codes() {
+        let payload = interaction_payload(
+            "files/abc",
+            Value::String("smart".to_owned()),
+            &[],
+            &["ru-RU".to_owned(), "en-US".to_owned()],
+        );
+        assert_eq!(
+            payload["generation_config"]["transcription_config"],
+            json!({ "mode": "smart", "language_codes": ["ru-RU", "en-US"] })
+        );
     }
 
     /// Every wording the thinking gate returns since 2026-10-07 maps to the

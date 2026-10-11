@@ -22,11 +22,13 @@
 //! environment. The settings window saves through [`patch_settings_document`]
 //! and [`atomic_replace`].
 
+use crate::dictation_language;
 use crate::i18n::{self, Language, MessageId, UiMessage};
 use crate::profile::{self, BuildFlavor};
 use crate::secrets::{KeyRing, SecretKey};
 use parking_lot::{Mutex, RwLock};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::env;
 use std::error::Error;
 use std::ffi::OsStr;
@@ -176,14 +178,16 @@ const HOTKEY_NAMED_KEYS: &[&str] = &[
 
 /// Launcher settings. `/api/settings` publishes `hotkey` and `mode` and nothing
 /// else; the settings window reads this same struct, `mute_during_recording`,
-/// `port`, `input_device` and `language` included.
+/// `port`, `input_device`, `language`, `custom_vocabulary` and
+/// `dictation_languages` included.
 ///
-/// `mute_during_recording`, `port`, `input_device` and `language` are the
-/// managed values a document may omit: a file written before each existed has
-/// no such property, and it reads as the documented default there - `false`,
-/// the active flavor's default port, the system default input device and the
-/// language this profile would otherwise start in - not as a guess about a
-/// value the user chose.
+/// `mute_during_recording`, `port`, `input_device`, `language`,
+/// `custom_vocabulary` and `dictation_languages` are the managed values a
+/// document may omit: a file written before each existed has no such property,
+/// and it reads as the documented default there - `false`, the active flavor's
+/// default port, the system default input device, the language this profile
+/// would otherwise start in, an empty vocabulary and no language hints
+/// (Auto-detect) - not as a guess about a value the user chose.
 /// The patch writes the properties into the document on the next change, so the
 /// values a page chose survive the save rather than being read back as missing
 /// and refused.
@@ -213,6 +217,16 @@ pub struct Settings {
     /// start in.
     #[serde(default = "crate::i18n::detect_default_language")]
     pub language: Language,
+    /// Words and phrases recognition is biased toward, in the order the user
+    /// listed them: trimmed, non-empty, without line breaks, without exact
+    /// repeats, at most [`MAX_CUSTOM_VOCABULARY`]. Empty means no vocabulary.
+    #[serde(default)]
+    pub custom_vocabulary: Arc<[String]>,
+    /// Dictation-language hints for Gemini, as BCP-47 codes from
+    /// [`crate::dictation_language::DICTATION_LANGUAGES`] in the order the user chose
+    /// them: at most two, no repeats. Empty means automatic detection.
+    #[serde(default)]
+    pub dictation_languages: Arc<[String]>,
 }
 /// One coherent configuration revision. Existing dictations retain their Arc
 /// while Save publishes a replacement for subsequent requests.
@@ -537,9 +551,11 @@ pub fn startup_language(config_path: Option<&Path>) -> Language {
 /// Only managed values are edited; `compare_all` is removed with its separator
 /// comma. A required property that is missing or repeated is an error rather
 /// than a guessed default, while `mute_during_recording`, `port`,
-/// `input_device` and `language` are inserted together when missing, in that
-/// fixed order in front of the first property using its indentation and line
-/// ending. The result is read back and compared with `settings` before it is returned.
+/// `input_device`, `language`, `custom_vocabulary` and `dictation_languages`
+/// are inserted together
+/// when missing, in that fixed order in front of the first property using its
+/// indentation and line ending. The result is read back and compared with
+/// `settings` before it is returned.
 ///
 /// The result is the whole document: a leading byte order mark in `raw` is kept
 /// in front of it, so the caller writes [`patch_settings_document`]'s text as
@@ -574,6 +590,12 @@ pub fn patch_settings_document(raw: &str, settings: &Settings) -> Result<String,
         .is_some_and(|device| usable_device_id(device).is_none())
     {
         return Err(invalid("input_device"));
+    }
+    if !is_canonical_vocabulary(&settings.custom_vocabulary) {
+        return Err(invalid("custom_vocabulary"));
+    }
+    if !dictation_language::is_valid_list(&settings.dictation_languages) {
+        return Err(invalid("dictation_languages"));
     }
 
     // A document handed over by a caller that kept the original bytes may still
@@ -611,6 +633,16 @@ pub fn patch_settings_document(raw: &str, settings: &Settings) -> Result<String,
     if let Some(member) = single_member(&members, "language")? {
         if member_language(member, &masked).is_none() {
             return Err(invalid("language"));
+        }
+    }
+    if let Some(member) = single_member(&members, "custom_vocabulary")? {
+        if member_vocabulary(member, &masked).is_none() {
+            return Err(invalid("custom_vocabulary"));
+        }
+    }
+    if let Some(member) = single_member(&members, "dictation_languages")? {
+        if member_dictation_languages(member, &masked).is_none() {
+            return Err(invalid("dictation_languages"));
         }
     }
 
@@ -653,6 +685,18 @@ pub fn patch_settings_document(raw: &str, settings: &Settings) -> Result<String,
         Some(member) => edits.push((member.value_span.clone(), language)),
         None => missing.push(("language", language)),
     }
+    let vocabulary = serde_json::to_string(&*settings.custom_vocabulary)
+        .expect("a list of strings always serializes");
+    match single_member(&members, "custom_vocabulary")? {
+        Some(member) => edits.push((member.value_span.clone(), vocabulary)),
+        None => missing.push(("custom_vocabulary", vocabulary)),
+    }
+    let languages = serde_json::to_string(&*settings.dictation_languages)
+        .expect("a list of strings always serializes");
+    match single_member(&members, "dictation_languages")? {
+        Some(member) => edits.push((member.value_span.clone(), languages)),
+        None => missing.push(("dictation_languages", languages)),
+    }
     member_insertion_edits(body, &masked, &members, &missing, &mut edits);
 
     // Retire the obsolete setting without changing unrelated document bytes.
@@ -685,6 +729,8 @@ fn verify_patched(document: &str, settings: &Settings) -> Result<(), ConfigError
         port: settings.port,
         input_device: settings.input_device.clone(),
         language: settings.language,
+        custom_vocabulary: Arc::clone(&settings.custom_vocabulary),
+        dictation_languages: Arc::clone(&settings.dictation_languages),
     };
     if written != expected {
         return Err(ConfigError::new(UiMessage::new(
@@ -726,7 +772,8 @@ fn member_removal_edits<'a>(
 /// yet. Each missing property is written as `"name": value` in the order given,
 /// and all of them go into one insertion in front of the first root property,
 /// with that property's own indentation and line ending: a document from before
-/// `mute_during_recording`, `port`, `input_device` or `language` existed has no
+/// `mute_during_recording`, `port`, `input_device`, `language`,
+/// `custom_vocabulary` or `dictation_languages` existed has no
 /// such values to write, and one edit keeps the spans of several zero-width
 /// insertions from piling up at the same offset. Every other byte - the
 /// comments, the order, the mark - stays where it was, and an object whose
@@ -827,16 +874,20 @@ fn requirement(name: &str) -> UiMessage {
         "port" => MessageId::ConfigPortRequirement,
         "input_device" => MessageId::ConfigInputDeviceRequirement,
         "language" => MessageId::ConfigLanguageRequirement,
+        "custom_vocabulary" => MessageId::ConfigCustomVocabularyRequirement,
+        "dictation_languages" => MessageId::ConfigDictationLanguagesRequirement,
         _ => MessageId::ConfigMuteRequirement,
     };
     UiMessage::new(key)
 }
 
 /// The managed properties of a document, each typed and checked.
-/// `mute_during_recording`, `port`, `input_device` and `language` are the ones
-/// that may be absent - a document written before them reads as `false`, the
-/// active flavor's default port, the system default input device and the
-/// default language there - while every other missing or malformed
+/// `mute_during_recording`, `port`, `input_device`, `language`,
+/// `custom_vocabulary` and `dictation_languages` are the ones that may be
+/// absent - a document written before them reads as `false`, the active
+/// flavor's default port, the system default input device, the default
+/// language, an empty vocabulary and no language hints there -
+/// while every other missing or malformed
 /// property refuses the document. The obsolete root `compare_all`
 /// is not read at all: the patch removes it, so it never becomes a value.
 /// `config_path` names the file a problem belongs to when the caller has one;
@@ -932,6 +983,24 @@ fn settings_from_members(
         Ok(None) => default_language,
         Err(error) => return Err(named(error.ui)),
     };
+    let custom_vocabulary = match single_member(members, "custom_vocabulary") {
+        // Blank lines, edge whitespace and repeats in a hand-edited list are
+        // normalized rather than refused, so they cannot stop the launcher.
+        Ok(Some(vocabulary)) => {
+            member_vocabulary(vocabulary, document).ok_or_else(|| invalid("custom_vocabulary"))?
+        }
+        Ok(None) => Arc::default(),
+        Err(error) => return Err(named(error.ui)),
+    };
+    let dictation_languages = match single_member(members, "dictation_languages") {
+        // Unlike the vocabulary, a hand-edited list is not normalized: an unknown
+        // code, a different spelling or a repeat refuses the document.
+        Ok(Some(languages)) => member_dictation_languages(languages, document)
+            .ok_or_else(|| invalid("dictation_languages"))?,
+        // A document written before the setting existed reads as Auto-detect.
+        Ok(None) => Arc::default(),
+        Err(error) => return Err(named(error.ui)),
+    };
 
     Ok(Settings {
         hotkey,
@@ -940,6 +1009,8 @@ fn settings_from_members(
         port,
         input_device,
         language,
+        custom_vocabulary,
+        dictation_languages,
     })
 }
 
@@ -971,6 +1042,37 @@ fn member_language(member: &RootMember, document: &str) -> Option<Language> {
     }
 }
 
+/// The value of a `custom_vocabulary` member as the vocabulary it stores: a JSON
+/// array of strings without line breaks, normalized by [`collect_vocabulary`];
+/// `None` for any other JSON value, a line break inside a term or a list that
+/// is still longer than [`MAX_CUSTOM_VOCABULARY`] after normalization.
+fn member_vocabulary(member: &RootMember, document: &str) -> Option<Arc<[String]>> {
+    let value = member_value(member, document);
+    let items = value.as_array()?;
+    let mut terms = Vec::with_capacity(items.len());
+    for item in items {
+        let term = item.as_str()?;
+        if term.contains(['\r', '\n']) {
+            return None;
+        }
+        terms.push(term);
+    }
+    collect_vocabulary(terms).ok()
+}
+
+/// The value of a `dictation_languages` member as the hints it stores: a JSON
+/// array of strings that [`dictation_language::is_valid_list`] accepts as
+/// written, untrimmed; `None` for any other JSON value or list.
+fn member_dictation_languages(member: &RootMember, document: &str) -> Option<Arc<[String]>> {
+    let value = member_value(member, document);
+    let codes = value
+        .as_array()?
+        .iter()
+        .map(|item| item.as_str().map(str::to_owned))
+        .collect::<Option<Vec<String>>>()?;
+    dictation_language::is_valid_list(&codes).then(|| codes.into())
+}
+
 /// The lowercase wire spelling of a language, the form a document stores.
 fn language_text(language: Language) -> &'static str {
     match language {
@@ -991,6 +1093,48 @@ fn language_text(language: Language) -> &'static str {
 pub(crate) fn usable_device_id(value: &str) -> Option<String> {
     let parsed = cpal::DeviceId::from_str(value).ok()?;
     (!value.is_empty() && !parsed.1.is_empty()).then(|| value.to_owned())
+}
+
+/// The most terms Gemini accepts as a custom vocabulary.
+pub const MAX_CUSTOM_VOCABULARY: usize = 1000;
+
+/// The vocabulary `terms` describe: each term trimmed, empty ones dropped and
+/// exact repeats (case-sensitive) dropped after their first occurrence, in the
+/// order given. A list still longer than [`MAX_CUSTOM_VOCABULARY`] is refused
+/// with the number of terms it has, never cut short. Line breaks inside a term
+/// are the caller's to refuse.
+pub(crate) fn collect_vocabulary<'a>(
+    terms: impl IntoIterator<Item = &'a str>,
+) -> Result<Arc<[String]>, usize> {
+    let mut seen = HashSet::new();
+    let kept: Vec<String> = terms
+        .into_iter()
+        .map(ts_trim)
+        .filter(|term| !term.is_empty() && seen.insert(*term))
+        .map(str::to_owned)
+        .collect();
+    if kept.len() > MAX_CUSTOM_VOCABULARY {
+        return Err(kept.len());
+    }
+    Ok(kept.into())
+}
+
+/// The vocabulary the settings window's text holds, one term per line.
+pub(crate) fn vocabulary_from_text(text: &str) -> Result<Arc<[String]>, usize> {
+    collect_vocabulary(text.split(['\r', '\n']))
+}
+
+/// Whether `terms` is already in the form [`collect_vocabulary`] produces, so
+/// the patch never writes a list the next read would change or refuse.
+fn is_canonical_vocabulary(terms: &[String]) -> bool {
+    let mut seen = HashSet::new();
+    terms.len() <= MAX_CUSTOM_VOCABULARY
+        && terms.iter().all(|term| {
+            !term.is_empty()
+                && ts_trim(term) == term
+                && !term.contains(['\r', '\n'])
+                && seen.insert(term.as_str())
+        })
 }
 
 /// The value of a member, parsed from the document text.
@@ -2663,8 +2807,8 @@ mod tests {
     /// properties and user comments remain unchanged.
     #[test]
     fn patching_a_marked_commented_document_keeps_every_other_byte() {
-        let document = "\u{feff}// Speechek settings\r\n{\r\n  // Этот файл сохранён в UTF-8 с BOM.\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": \"wasapi:card-one\",\r\n  \"language\": \"en\",\r\n  \"compare_all\": false,\r\n\r\n  // Заметки пользователя и вложенный объект.\r\n  \"notes\": {\r\n    \"text\": \"keep this value\",\r\n    \"nested\": [1, 2, { \"deep\": true }]\r\n  },\r\n  \"trailing\": null,\r\n  // Дополнительное поле пользователя.\r\n  \"extra\": \"kept\"\r\n}\r\n";
-        let expected = "\u{feff}// Speechek settings\r\n{\r\n  // Этот файл сохранён в UTF-8 с BOM.\r\n  \"hotkey\": \"Ctrl+Shift+F9\",\r\n  \"mode\": \"verbatim\",\r\n  \"mute_during_recording\": true,\r\n  \"port\": 43118,\r\n  \"input_device\": \"wasapi:card-two\",\r\n  \"language\": \"en\",\r\n  \r\n\r\n  // Заметки пользователя и вложенный объект.\r\n  \"notes\": {\r\n    \"text\": \"keep this value\",\r\n    \"nested\": [1, 2, { \"deep\": true }]\r\n  },\r\n  \"trailing\": null,\r\n  // Дополнительное поле пользователя.\r\n  \"extra\": \"kept\"\r\n}\r\n";
+        let document = "\u{feff}// Speechek settings\r\n{\r\n  // Этот файл сохранён в UTF-8 с BOM.\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": \"wasapi:card-one\",\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"compare_all\": false,\r\n\r\n  // Заметки пользователя и вложенный объект.\r\n  \"notes\": {\r\n    \"text\": \"keep this value\",\r\n    \"nested\": [1, 2, { \"deep\": true }]\r\n  },\r\n  \"trailing\": null,\r\n  // Дополнительное поле пользователя.\r\n  \"extra\": \"kept\"\r\n}\r\n";
+        let expected = "\u{feff}// Speechek settings\r\n{\r\n  // Этот файл сохранён в UTF-8 с BOM.\r\n  \"hotkey\": \"Ctrl+Shift+F9\",\r\n  \"mode\": \"verbatim\",\r\n  \"mute_during_recording\": true,\r\n  \"port\": 43118,\r\n  \"input_device\": \"wasapi:card-two\",\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [\"Speechek\"],\r\n  \"dictation_languages\": [\"ru-RU\",\"en-US\"],\r\n  \r\n\r\n  // Заметки пользователя и вложенный объект.\r\n  \"notes\": {\r\n    \"text\": \"keep this value\",\r\n    \"nested\": [1, 2, { \"deep\": true }]\r\n  },\r\n  \"trailing\": null,\r\n  // Дополнительное поле пользователя.\r\n  \"extra\": \"kept\"\r\n}\r\n";
 
         let patched = patch_settings_document(
             document,
@@ -2675,6 +2819,8 @@ mod tests {
                 port: 43118,
                 input_device: Some("wasapi:card-two".to_owned()),
                 language: Language::En,
+                custom_vocabulary: Arc::from(vec!["Speechek".to_owned()]),
+                dictation_languages: Arc::from(vec!["ru-RU".to_owned(), "en-US".to_owned()]),
             },
         )
         .expect("the documented patch");
@@ -2684,14 +2830,16 @@ mod tests {
 
     /// The optional values a document may not carry: a file from before them
     /// still loads as the documented defaults - `false`, the active flavor's
-    /// default port, the system default input device and the detected language
-    /// - and the first patch that changes them writes all four properties into
-    /// the document in one insertion, in front of the first property and in
-    /// that property's indentation and CRLF, in the fixed order
-    /// `mute_during_recording`, `port`, `input_device`, `language`, instead of
-    /// readback refusing values the file does not hold. Later patches replace
-    /// the same bytes in place, and every other byte of the document survives,
-    /// including an unknown property between them.
+    /// default port, the system default input device, the detected language,
+    /// an empty vocabulary and no dictation languages - and the first patch that
+    /// changes them writes all six properties into the document in one
+    /// insertion, in front of the first property and in that property's
+    /// indentation and CRLF, in the fixed order `mute_during_recording`,
+    /// `port`, `input_device`, `language`, `custom_vocabulary`,
+    /// `dictation_languages`, instead of readback refusing values the file does
+    /// not hold. Later patches replace the same bytes in place, and every other
+    /// byte of the document survives, including an unknown property between
+    /// them.
     #[test]
     fn a_document_without_the_optional_values_gains_them_in_one_patch() {
         let path = Path::new("settings.json");
@@ -2707,6 +2855,8 @@ mod tests {
         assert!(!loaded.mute_during_recording);
         assert_eq!(loaded.port, DEFAULT_PORT);
         assert_eq!(loaded.input_device, None);
+        assert!(loaded.custom_vocabulary.is_empty());
+        assert!(loaded.dictation_languages.is_empty());
 
         let switched_on = Settings {
             hotkey: "F2".to_owned(),
@@ -2715,11 +2865,13 @@ mod tests {
             port: 43118,
             input_device: Some("wasapi:card-one".to_owned()),
             language: Language::En,
+            custom_vocabulary: Arc::from(vec!["Speechek".to_owned()]),
+            dictation_languages: Arc::from(vec!["ru-RU".to_owned()]),
         };
         let on_document = patch_settings_document(document, &switched_on).expect("a patch");
         assert_eq!(
             on_document,
-            "{\r\n  \"mute_during_recording\": true,\r\n  \"port\": 43118,\r\n  \"input_device\": \"wasapi:card-one\",\r\n  \"language\": \"en\",\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": { \"keep\": true }\r\n}\r\n"
+            "{\r\n  \"mute_during_recording\": true,\r\n  \"port\": 43118,\r\n  \"input_device\": \"wasapi:card-one\",\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [\"Speechek\"],\r\n  \"dictation_languages\": [\"ru-RU\"],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": { \"keep\": true }\r\n}\r\n"
         );
         assert_eq!(
             parse_settings_document_with_language(&on_document, path, MessageId::SettingsFileRole, Language::En)
@@ -2734,13 +2886,15 @@ mod tests {
             port: DEFAULT_PORT,
             input_device: None,
             language: Language::En,
+            custom_vocabulary: Arc::default(),
+            dictation_languages: Arc::default(),
         };
         let off_document =
             patch_settings_document(&on_document, &switched_off).expect("a patch");
         assert_eq!(
             off_document,
             format!(
-                "{{\r\n  \"mute_during_recording\": false,\r\n  \"port\": {DEFAULT_PORT},\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": {{ \"keep\": true }}\r\n}}\r\n"
+                "{{\r\n  \"mute_during_recording\": false,\r\n  \"port\": {DEFAULT_PORT},\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": {{ \"keep\": true }}\r\n}}\r\n"
             )
         );
         assert_eq!(
@@ -2758,8 +2912,8 @@ mod tests {
     #[test]
     fn an_obsolete_compare_all_is_ignored_on_read_and_removed_by_the_next_patch() {
         let path = Path::new("settings.json");
-        let with = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"compare_all\": true,\r\n  \"notes\": 1\r\n}\r\n";
-        let without = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"notes\": 1\r\n}\r\n";
+        let with = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"compare_all\": true,\r\n  \"notes\": 1\r\n}\r\n";
+        let without = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"notes\": 1\r\n}\r\n";
         let expected = Settings {
             hotkey: "F2".to_owned(),
             mode: "smart".to_owned(),
@@ -2767,6 +2921,8 @@ mod tests {
             port: 4173,
             input_device: None,
             language: Language::En,
+            custom_vocabulary: Arc::default(),
+            dictation_languages: Arc::default(),
         };
 
         // Reading: the obsolete property is simply not a value, so an old and a
@@ -2787,7 +2943,7 @@ mod tests {
         let patched = patch_settings_document(with, &expected).expect("a patch");
         assert_eq!(
             patched,
-            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \r\n  \"notes\": 1\r\n}\r\n"
+            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \r\n  \"notes\": 1\r\n}\r\n"
         );
         assert_eq!(
             parse_settings_document_with_language(&patched, path, MessageId::SettingsFileRole, Language::En)
@@ -2796,10 +2952,10 @@ mod tests {
         );
 
         // Writing: as the last property it loses the comma before it instead.
-        let last = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"compare_all\": true\r\n}\r\n";
+        let last = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"compare_all\": true\r\n}\r\n";
         assert_eq!(
             patch_settings_document(last, &expected).expect("a patch"),
-            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\"\r\n  \r\n}\r\n"
+            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": []\r\n  \r\n}\r\n"
         );
 
         // A repeated obsolete property cannot be migrated by the same rule the
@@ -2820,7 +2976,7 @@ mod tests {
     #[test]
     fn a_null_device_is_the_system_default_and_a_stored_id_is_kept() {
         let path = Path::new("settings.json");
-        let default_device = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 5000,\n  \"input_device\": null,\n  \"language\": \"en\"\n}\n";
+        let default_device = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 5000,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": []\n}\n";
         let loaded = parse_settings_document_with_language(
             default_device,
             path,
@@ -2835,7 +2991,7 @@ mod tests {
             default_device
         );
 
-        let chosen = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 5000,\n  \"input_device\": \"wasapi:card-one\",\n  \"language\": \"en\"\n}\n";
+        let chosen = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 5000,\n  \"input_device\": \"wasapi:card-one\",\n  \"language\": \"en\",\n  \"custom_vocabulary\": [\"Speechek\"],\n  \"dictation_languages\": [\"ru-RU\",\"en-US\"]\n}\n";
         let loaded = parse_settings_document_with_language(
             chosen,
             path,
@@ -2844,6 +3000,8 @@ mod tests {
         )
         .expect("a stored device id");
         assert_eq!(loaded.input_device.as_deref(), Some("wasapi:card-one"));
+        assert_eq!(&*loaded.custom_vocabulary, ["Speechek"]);
+        assert_eq!(&*loaded.dictation_languages, ["ru-RU", "en-US"]);
         assert_eq!(
             patch_settings_document(chosen, &loaded).expect("a patch"),
             chosen
@@ -2871,6 +3029,8 @@ mod tests {
             port: DEFAULT_PORT,
             input_device: None,
             language: Language::En,
+            custom_vocabulary: Arc::default(),
+            dictation_languages: Arc::default(),
         };
 
         for value in ["\"4173\"", "4173.5", "0", "65536", "-1", "null", "true"] {
@@ -2931,7 +3091,7 @@ mod tests {
     #[test]
     fn a_general_change_does_not_leave_an_old_port_or_device_behind() {
         let path = Path::new("settings.json");
-        let document = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 5000,\n  \"input_device\": \"wasapi:old\",\n  \"language\": \"en\",\n  \"notes\": \"kept\"\n}\n";
+        let document = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 5000,\n  \"input_device\": \"wasapi:old\",\n  \"language\": \"en\",\n  \"custom_vocabulary\": [\"OldTerm\"],\n  \"dictation_languages\": [\"de-DE\"],\n  \"notes\": \"kept\"\n}\n";
         let changed = Settings {
             hotkey: "Ctrl+Shift+F9".to_owned(),
             mode: "verbatim".to_owned(),
@@ -2939,15 +3099,19 @@ mod tests {
             port: 43118,
             input_device: Some("wasapi:new".to_owned()),
             language: Language::En,
+            custom_vocabulary: Arc::from(vec!["NewTerm".to_owned()]),
+            dictation_languages: Arc::from(vec!["ru-RU".to_owned(), "en-US".to_owned()]),
         };
 
         let patched = patch_settings_document(document, &changed).expect("a patch");
         assert_eq!(
             patched,
-            "{\n  \"hotkey\": \"Ctrl+Shift+F9\",\n  \"mode\": \"verbatim\",\n  \"mute_during_recording\": true,\n  \"port\": 43118,\n  \"input_device\": \"wasapi:new\",\n  \"language\": \"en\",\n  \"notes\": \"kept\"\n}\n"
+            "{\n  \"hotkey\": \"Ctrl+Shift+F9\",\n  \"mode\": \"verbatim\",\n  \"mute_during_recording\": true,\n  \"port\": 43118,\n  \"input_device\": \"wasapi:new\",\n  \"language\": \"en\",\n  \"custom_vocabulary\": [\"NewTerm\"],\n  \"dictation_languages\": [\"ru-RU\",\"en-US\"],\n  \"notes\": \"kept\"\n}\n"
         );
         assert!(!patched.contains("5000"), "the old port is gone");
         assert!(!patched.contains("wasapi:old"), "the old device is gone");
+        assert!(!patched.contains("OldTerm"), "the old vocabulary is gone");
+        assert!(!patched.contains("de-DE"), "the old dictation languages are gone");
         assert_eq!(
             parse_settings_document_with_language(&patched, path, MessageId::SettingsFileRole, Language::En)
                 .expect("the patched document"),
@@ -2977,11 +3141,185 @@ mod tests {
         assert_eq!(loaded.port, production.port);
         assert_eq!(loaded.input_device, None);
         assert_eq!(loaded.language, Language::En);
+        assert!(loaded.custom_vocabulary.is_empty());
 
         assert_eq!(
             patch_settings_document(SETTINGS_EXAMPLE, &loaded).expect("a patch"),
             SETTINGS_EXAMPLE
         );
+    }
+
+    /// The settings window's text becomes one term per line: edges trimmed with
+    /// the loader's whitespace rule, blank lines dropped and exact repeats
+    /// dropped after their first occurrence, in the order typed. Case is part of
+    /// the spelling, so two spellings stay two terms.
+    #[test]
+    fn vocabulary_text_is_trimmed_deduplicated_and_kept_in_order() {
+        let terms = vocabulary_from_text("  Speechek \r\n\r\nKubernetes\nSpeechek\n\u{a0}BigQuery")
+            .expect("a short list");
+        assert_eq!(&*terms, ["Speechek", "Kubernetes", "BigQuery"]);
+
+        let spellings = vocabulary_from_text("speechek\nSpeechek").expect("a short list");
+        assert_eq!(&*spellings, ["speechek", "Speechek"]);
+    }
+
+    /// The limit counts the terms that would be sent, after blank lines and
+    /// repeats are gone, and a list above it is refused with its real size
+    /// instead of being cut short.
+    #[test]
+    fn the_vocabulary_limit_counts_terms_after_normalization() {
+        let distinct: Vec<String> = (0..MAX_CUSTOM_VOCABULARY).map(|n| format!("term{n}")).collect();
+        let mut at_limit = distinct.join("\n");
+        at_limit.push_str("\n\nterm0\nterm1\nterm2\nterm3\nterm4\n");
+        assert_eq!(
+            vocabulary_from_text(&at_limit).expect("repeats do not count").len(),
+            MAX_CUSTOM_VOCABULARY
+        );
+
+        let over = format!("{}\nterm{MAX_CUSTOM_VOCABULARY}", distinct.join("\n"));
+        assert_eq!(
+            vocabulary_from_text(&over).expect_err("one term too many"),
+            MAX_CUSTOM_VOCABULARY + 1
+        );
+    }
+
+    /// A stored vocabulary is written compactly, without escaping Cyrillic, and
+    /// reads back unchanged. A value that is not a list of strings, a term with
+    /// a line break and a list over the limit refuse the document and the patch
+    /// with the property's own name, while edge whitespace, blank terms and
+    /// repeats in a hand-edited file are normalized rather than stopping the
+    /// launcher.
+    #[test]
+    fn a_stored_vocabulary_round_trips_and_a_malformed_one_is_refused() {
+        let path = Path::new("settings.json");
+        let document_with = |value: &str| {
+            format!(
+                "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 4173,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": {value},\n  \"dictation_languages\": []\n}}\n"
+            )
+        };
+        let settings = Settings {
+            hotkey: "F2".to_owned(),
+            mode: "live".to_owned(),
+            mute_during_recording: false,
+            port: 4173,
+            input_device: None,
+            language: Language::En,
+            custom_vocabulary: Arc::from(vec!["Speechek".to_owned(), "Кубернетес".to_owned()]),
+            dictation_languages: Arc::default(),
+        };
+
+        let patched = patch_settings_document(&document_with("[]"), &settings).expect("a patch");
+        assert_eq!(patched, document_with(r#"["Speechek","Кубернетес"]"#));
+        assert_eq!(
+            parse_settings_document_with_language(&patched, path, MessageId::SettingsFileRole, Language::En)
+                .expect("the patched document"),
+            settings
+        );
+
+        let over = format!(
+            "[{}]",
+            (0..=MAX_CUSTOM_VOCABULARY)
+                .map(|n| format!("\"term{n}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let names_the_vocabulary = |ui: &UiMessage| {
+            let text = serde_json::to_string(ui).expect("a message serializes");
+            text.contains("ConfigPropertyInvalid") && text.contains("\"custom_vocabulary\"")
+        };
+        for value in ["\"Speechek\"", "[1]", r#"["a\nb"]"#, "null", over.as_str()] {
+            let document = document_with(value);
+            let error = parse_settings_document_with_language(
+                &document,
+                path,
+                MessageId::SettingsFileRole,
+                Language::En,
+            )
+            .expect_err("a malformed vocabulary");
+            assert!(names_the_vocabulary(&error.ui), "{value}: {:?}", error.ui);
+            let error = patch_settings_document(&document, &settings)
+                .expect_err("a malformed stored vocabulary must refuse the patch");
+            assert_eq!(error.ui.key, MessageId::ConfigPropertyInvalid);
+            assert!(names_the_vocabulary(&error.ui), "{value}: {:?}", error.ui);
+        }
+
+        let hand_edited = document_with(r#"[" Speechek ", "Speechek", ""]"#);
+        let loaded =
+            parse_settings_document_with_language(&hand_edited, path, MessageId::SettingsFileRole, Language::En)
+                .expect("a hand-edited list is normalized");
+        assert_eq!(&*loaded.custom_vocabulary, ["Speechek"]);
+
+        // The writer never stores a list the next read would change.
+        let untrimmed = Settings {
+            custom_vocabulary: Arc::from(vec![" Speechek".to_owned()]),
+            ..settings
+        };
+        let error = patch_settings_document(&document_with("[]"), &untrimmed)
+            .expect_err("a list that is not normalized");
+        assert!(names_the_vocabulary(&error.ui), "{:?}", error.ui);
+    }
+
+    /// A document without dictation languages reads as Auto-detect, a stored
+    /// list reads in the user's order, and the patch adds the member to a
+    /// document from before it existed. Unlike the vocabulary, a hand-edited
+    /// list is never normalized: an unknown code, another spelling, a repeat,
+    /// a third code or another JSON type refuses the document and the patch.
+    #[test]
+    fn stored_dictation_languages_round_trip_and_an_invalid_list_is_refused() {
+        let path = Path::new("settings.json");
+        let base = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 4173,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": []";
+        let without = format!("{base}\n}}\n");
+        let document_with = |value: &str| format!("{base},\n  \"dictation_languages\": {value}\n}}\n");
+        let read = |document: &str| {
+            parse_settings_document_with_language(document, path, MessageId::SettingsFileRole, Language::En)
+        };
+
+        let auto = read(&without).expect("a document without the property");
+        assert!(auto.dictation_languages.is_empty(), "a missing property is Auto-detect");
+        let stored = read(&document_with(r#"["ru-RU", "en-US"]"#)).expect("a stored list");
+        assert_eq!(&*stored.dictation_languages, ["ru-RU", "en-US"]);
+
+        let chosen = Settings {
+            dictation_languages: Arc::from(vec!["ru-RU".to_owned(), "en-US".to_owned()]),
+            ..auto.clone()
+        };
+        let patched = patch_settings_document(&without, &chosen).expect("a patch");
+        assert_eq!(
+            &*read(&patched).expect("the patched document").dictation_languages,
+            ["ru-RU", "en-US"]
+        );
+
+        let names_the_languages = |ui: &UiMessage| {
+            let text = serde_json::to_string(ui).expect("a message serializes");
+            text.contains("ConfigPropertyInvalid") && text.contains("\"dictation_languages\"")
+        };
+        for value in [
+            "\"ru-RU\"",
+            r#"["xx-XX"]"#,
+            r#"["ru-ru"]"#,
+            r#"["ru-RU", "ru-RU"]"#,
+            r#"["ru-RU", "en-US", "de-DE"]"#,
+            "[1]",
+            "null",
+        ] {
+            let document = document_with(value);
+            let error = read(&document).expect_err("an invalid list");
+            assert!(names_the_languages(&error.ui), "{value}: {:?}", error.ui);
+            let error = patch_settings_document(&document, &auto)
+                .expect_err("an invalid stored list must refuse the patch");
+            assert!(names_the_languages(&error.ui), "{value}: {:?}", error.ui);
+        }
+
+        // The writer never stores a list the next read would refuse.
+        for codes in [vec!["xx-XX"], vec!["ru-RU", "ru-RU"], vec!["ru-RU", "en-US", "de-DE"]] {
+            let invalid = Settings {
+                dictation_languages: codes.iter().map(|code| (*code).to_owned()).collect(),
+                ..auto.clone()
+            };
+            let error = patch_settings_document(&without, &invalid)
+                .expect_err("an invalid list must not be written");
+            assert!(names_the_languages(&error.ui), "{codes:?}: {:?}", error.ui);
+        }
     }
 
     /// Readback refuses a document that still carries the retired property, so a
@@ -2996,6 +3334,8 @@ mod tests {
             port: DEFAULT_PORT,
             input_device: None,
             language: Language::En,
+            custom_vocabulary: Arc::default(),
+            dictation_languages: Arc::default(),
         };
         verify_patched(
             "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"compare_all\": true\r\n}\r\n",
@@ -3044,6 +3384,8 @@ mod tests {
             port: DEFAULT_PORT,
             input_device: None,
             language: Language::En,
+            custom_vocabulary: Arc::default(),
+            dictation_languages: Arc::default(),
         })
         .expect_err("a repeated switch must refuse the patch");
     }
@@ -3069,6 +3411,8 @@ mod tests {
                 port: DEFAULT_PORT,
                 input_device: None,
                 language: Language::En,
+                custom_vocabulary: Arc::default(),
+                dictation_languages: Arc::default(),
             },
             keys: Arc::clone(&ring),
             revision: 1,
@@ -3091,6 +3435,8 @@ mod tests {
                 port: 43118,
                 input_device: Some("wasapi:card-one".to_owned()),
                 language: Language::En,
+                custom_vocabulary: Arc::default(),
+                dictation_languages: Arc::default(),
             },
             keys: Arc::clone(&ring),
             revision: 2,
@@ -3904,7 +4250,7 @@ mod tests {
         let patched = patch_settings_document(document, &loaded).expect("a patch");
         assert_eq!(
             patched,
-            "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"language\": \"ru\",\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 5000,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n"
+            "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"language\": \"ru\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 5000,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n"
         );
 
         let reread =
@@ -3916,7 +4262,7 @@ mod tests {
         let english = patch_settings_document(&patched, &switched).expect("a patch");
         assert_eq!(
             english,
-            "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"language\": \"en\",\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 5000,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n"
+            "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 5000,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n"
         );
         assert_eq!(
             parse_settings_document_with_language(&english, path, MessageId::SettingsFileRole, Language::Ru)
@@ -3945,6 +4291,8 @@ mod tests {
             port: DEFAULT_PORT,
             input_device: None,
             language: Language::En,
+            custom_vocabulary: Arc::default(),
+            dictation_languages: Arc::default(),
         };
 
         for value in ["\"de\"", "\"EN\"", "null", "5", "true", "{}", "\"\""] {
