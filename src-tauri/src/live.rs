@@ -2864,6 +2864,37 @@ mod relay_tests {
         rows
     }
 
+    /// The same wait with the fixture's frozen clock moved on between reads.
+    ///
+    /// The writer's periodic snapshot is gated on that clock: one is written
+    /// once the clock has passed a whole interval since the take's last one,
+    /// and the take's watermark is set on the pass that registers it. A
+    /// fixture that advances the clock exactly once therefore races that pass:
+    /// when the writer registers the take after the advance, the gate can never
+    /// open again and no counter is ever written. Advancing again on every read
+    /// that is still short of `done` takes that race out, and the one behind it
+    /// too: a snapshot written before the relay counted the frame is followed
+    /// by another one written after it, instead of the gate closing on a count
+    /// that is one short.
+    async fn journal_when_advancing(
+        root: &Path,
+        diagnostics: &Diagnostics,
+        ticks: usize,
+        done: impl Fn(&[Value]) -> bool,
+    ) -> Vec<Value> {
+        let mut rows = records(root);
+        for _ in 0..ticks {
+            if done(&rows) {
+                return rows;
+            }
+            // Past the writer's one-second gate, then one writer pass.
+            diagnostics.advance_clock(Duration::from_secs(2));
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            rows = records(root);
+        }
+        rows
+    }
+
     /// The one terminal record of the request, once it is written.
     fn terminal(records: &[Value]) -> Option<&Value> {
         records
@@ -3666,11 +3697,9 @@ mod relay_tests {
             .contains("ready"));
 
         // The writer's snapshot is gated on the sink's own clock, and this
-        // fixture's clock is frozen: advance it past the one-second gate so the
-        // periodic relay snapshot carrying the counter is written too. The wait
-        // then needs both the byte record and that snapshot.
-        diagnostics.advance_clock(Duration::from_secs(2));
-        let records = journal_when(&root, 300, |rows| {
+        // fixture's clock is frozen: the wait moves it on until the periodic
+        // relay snapshot carrying the counter lands beside the byte record.
+        let records = journal_when_advancing(&root, &diagnostics, 300, |rows| {
             content_bodies(rows, "live_message")
                 .iter()
                 .any(|body| body.contains("\"encoding\":\"base64\""))
@@ -3761,10 +3790,10 @@ mod relay_tests {
             .expect("text")
             .contains("ready"));
 
-        // Advance the frozen clock past the snapshot gate, then wait for the
-        // byte record and the periodic snapshot that carries the counters.
-        diagnostics.advance_clock(Duration::from_secs(2));
-        let records = journal_when(&root, 300, |rows| {
+        // The same frozen-clock gate, moved on the same way, until the byte
+        // record and the periodic snapshot that carries the counters are both
+        // written.
+        let records = journal_when_advancing(&root, &diagnostics, 300, |rows| {
             content_bodies(rows, "live_message")
                 .iter()
                 .any(|body| body.contains("\"frame\":\"ping\""))
@@ -4104,9 +4133,8 @@ mod relay_tests {
 
         // A snapshot of the counters as they are now, and no terminal: an
         // observer that panicked or aborted would have left neither. The same
-        // frozen-clock gate, advanced the same way, admits it.
-        diagnostics.advance_clock(Duration::from_secs(2));
-        let records = journal_when(&root, 30, |rows| {
+        // frozen-clock gate admits it once it is moved on.
+        let records = journal_when_advancing(&root, &diagnostics, 30, |rows| {
             counter(rows, "upstream_sent_frames") == Some(1)
         })
         .await;
