@@ -67,6 +67,12 @@ fn main() {
                 "settings_update_vocabulary",
                 "settings_hotkey_capture",
                 "settings_set_autostart",
+                "history_list",
+                "history_audio",
+                "history_retry",
+                "history_delete",
+                "history_clear",
+                "history_save_audio",
             ])),
     )
     .expect("Tauri command permission generation failed");

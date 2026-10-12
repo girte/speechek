@@ -45,7 +45,7 @@ The helper does not accept arbitrary profile/provider/target-dir flags. If `spee
 
 Third-party license texts are collected with `scripts/collect-notices.ps1` into `third_party/THIRD-PARTY-NOTICES.txt` from the exact locked release graph, and the notice file ships inside the installer and the application.
 
-The debug Development archive uses its own generated notice file, `third_party/THIRD-PARTY-NOTICES-DEV.txt`, produced by the same collector with `-Features dev-diagnostics` and verified by `scripts/prepare-preview.ps1`. It is never hand-written, and the Production `THIRD-PARTY-NOTICES.txt` above stays codec-free.
+The debug Development archive uses its own generated notice file, `third_party/THIRD-PARTY-NOTICES-DEV.txt`, produced by the same collector with `-Features dev-diagnostics` and verified by `scripts/prepare-preview.ps1`. It is never hand-written. Both notice files include the FLAC codecs used by the recording history.
 
 ## Pre-flight checks
 

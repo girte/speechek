@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
 
-use super::flac::{self, FlacEncoder, FrameCommit};
+use crate::flac::{self, FlacEncoder, FrameCommit};
 
 use super::{
     system_millis, ArchiveError, AudioGap, AudioPacket, AudioStatus, AudioVerified,
@@ -291,6 +291,7 @@ struct FileCommit<'a> {
 }
 
 impl FrameCommit for FileCommit<'_> {
+    type Error = DiagnosticCode;
     fn write_frame(&mut self, encoded: &[u8]) -> Result<(), DiagnosticCode> {
         let wanted = encoded.len() as u64;
         let relative = self.path.parent().map(Path::to_path_buf);
@@ -911,6 +912,7 @@ fn source_of(event: &Event) -> Source {
         Event::RendererSnapshot(_) | Event::RendererBoundary(_) => Source::Renderer,
         Event::RelaySnapshot(_)
         | Event::UpstreamBoundary(_)
+        | Event::ActivityRotate(_)
         | Event::SendBegin(_)
         | Event::SendEnd(_)
         | Event::Deadline(_) => Source::Relay,
@@ -2833,10 +2835,10 @@ impl State {
             self.with_audio(key, |audio| audio.verified = false);
             return;
         };
-        let checked = self
-            .io
-            .open_read(&part)
-            .and_then(|reader| flac::verify(reader, finished.samples, &finished.md5));
+        let checked = self.io.open_read(&part).and_then(|reader| {
+            flac::verify(reader, finished.samples, &finished.md5)
+                .map_err(DiagnosticCode::from)
+        });
         if let Err(code) = checked {
             self.note_audio_error(key, code);
             self.with_audio(key, |audio| audio.verified = false);

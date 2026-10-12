@@ -36,6 +36,7 @@
       <nav class="settings-nav" role="tablist" aria-label="Settings sections" data-i18n-aria-label="SettingsSectionsAria">
         <button type="button" class="settings-tab" id="tab-general" role="tab" aria-selected="true" aria-controls="panel-general" data-i18n="SettingsGeneralTab">General settings</button>
         <button type="button" class="settings-tab" id="tab-keys" role="tab" aria-selected="false" aria-controls="panel-keys" tabindex="-1" data-i18n="SettingsKeysTab">API keys</button>
+        <button type="button" class="settings-tab" id="tab-history" role="tab" aria-selected="false" aria-controls="panel-history" tabindex="-1" data-i18n="SettingsHistoryTab">Recording history</button>
       </nav>
 
       <div class="settings-panels">
@@ -154,6 +155,25 @@
 
           <p class="settings-summary" id="keys-check-summary" role="status" aria-live="polite"></p>
           <ul class="settings-results" id="keys-check-results" aria-label="Key check results" data-i18n-aria-label="SettingsCheckResultsAria" hidden></ul>
+        </section>
+
+        <section class="settings-panel" id="panel-history" role="tabpanel" aria-labelledby="tab-history" tabindex="-1" hidden>
+          <h2 class="settings-block-title" data-i18n="SettingsHistoryTitle">Recording history</h2>
+          <p class="settings-lead" data-i18n="SettingsHistoryLead">Stored only on this computer, encrypted.</p>
+          <p class="error" id="history-error" role="alert" hidden></p>
+          <ul class="settings-results" id="history-list"></ul>
+          <p class="hint" id="history-empty" data-i18n="SettingsHistoryEmpty" hidden>Your dictations will appear here.</p>
+          <div class="history-footer">
+            <label for="history-limit" data-i18n="SettingsHistoryLimitLabel">Keep the last</label>
+            <select id="history-limit" class="settings-device-select">
+              <option value="5">5</option><option value="10" selected>10</option><option value="20">20</option><option value="50">50</option>
+            </select>
+            <button type="button" class="settings-button" id="history-clear" data-i18n="SettingsHistoryClear">Clear history</button>
+          </div>
+          <div class="history-undo" id="history-undo" role="status" hidden>
+            <span data-i18n="SettingsHistoryDeleted">Recording deleted</span>
+            <button type="button" class="settings-button" id="history-undo-button" data-i18n="SettingsHistoryUndo">Undo</button>
+          </div>
         </section>
       </div>
     </div>

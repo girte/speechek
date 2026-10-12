@@ -88,6 +88,18 @@ const SETTINGS_FILE_NAME: &str = "settings.json";
 /// no file beside it.
 const SETTINGS_EXAMPLE: &str = include_str!("../../config/settings.example.json");
 
+/// The history sizes the settings window offers and a document may store.
+pub(crate) const HISTORY_LIMITS: [u32; 4] = [5, 10, 20, 50];
+
+/// The size a document that carries no history limit reads as, and the size the
+/// first-run template ships.
+pub(crate) const DEFAULT_HISTORY_LIMIT: u32 = 10;
+
+/// The `serde` default of [`Settings::history_limit`].
+fn default_history_limit() -> u32 {
+    DEFAULT_HISTORY_LIMIT
+}
+
 /// The six comment lines the shipped template wrote in front of the `port`
 /// property it also shipped, without their line endings: a document saved with
 /// CRLF matches them, and the migration removes the document's own bytes. The
@@ -187,18 +199,18 @@ const HOTKEY_NAMED_KEYS: &[&str] = &[
 
 /// Launcher settings. `/api/settings` publishes `hotkey` and `mode` and nothing
 /// else; the settings window reads this same struct, `mute_during_recording`,
-/// `input_device`, `language`, `custom_vocabulary` and `dictation_languages`
-/// included.
+/// `input_device`, `language`, `custom_vocabulary`, `dictation_languages` and
+/// `history_limit` included.
 ///
-/// `mute_during_recording`, `input_device`, `language`, `custom_vocabulary` and
-/// `dictation_languages` are the managed values a document may omit: a file
-/// written before each existed has no such property, and it reads as the
-/// documented default there - `false`, the system default input device, the
-/// language this profile would otherwise start in, an empty vocabulary and no
-/// language hints (Auto-detect) - not as a guess about a value the user chose.
-/// The patch writes the properties into the document on the next change, so the
-/// values a page chose survive the save rather than being read back as missing
-/// and refused.
+/// `mute_during_recording`, `input_device`, `language`, `custom_vocabulary`,
+/// `dictation_languages` and `history_limit` are the managed values a document
+/// may omit: a file written before each existed has no such property, and it
+/// reads as the documented default there - `false`, the system default input
+/// device, the language this profile would otherwise start in, an empty
+/// vocabulary, no language hints (Auto-detect) and [`DEFAULT_HISTORY_LIMIT`] -
+/// not as a guess about a value the user chose. The patch writes the properties
+/// into the document on the next change, so the values a page chose survive the
+/// save rather than being read back as missing and refused.
 ///
 /// `input_device` is a `cpal::DeviceId` in its `Display`/`FromStr` form, or
 /// `None` for the system default input device; the device is looked up when a
@@ -234,6 +246,11 @@ pub struct Settings {
     /// them: at most two, no repeats. Empty means automatic detection.
     #[serde(default)]
     pub dictation_languages: Arc<[String]>,
+    /// Maximum number of recent dictations retained: one of [`HISTORY_LIMITS`],
+    /// or [`DEFAULT_HISTORY_LIMIT`] for a document that does not carry the
+    /// property.
+    #[serde(default = "default_history_limit")]
+    pub history_limit: u32,
 }
 /// One coherent configuration revision. Existing dictations retain their Arc
 /// while Save publishes a replacement for subsequent requests.
@@ -557,10 +574,10 @@ pub fn startup_language(config_path: Option<&Path>) -> Language {
 /// separator comma, and `port` takes the comment block the released template
 /// wrote with it. A required property that is missing or repeated is an error
 /// rather than a guessed default, while `mute_during_recording`,
-/// `input_device`, `language`, `custom_vocabulary` and `dictation_languages`
-/// are inserted together when missing, in that fixed order in front of the
-/// first property using its indentation and line ending. The result is read
-/// back and compared with `settings` before it is returned.
+/// `input_device`, `language`, `custom_vocabulary`, `dictation_languages` and
+/// `history_limit` are inserted together when missing, in that fixed order in
+/// front of the first property using its indentation and line ending. The result
+/// is read back and compared with `settings` before it is returned.
 ///
 /// The result is the whole document: a leading byte order mark in `raw` is kept
 /// in front of it, so the caller writes [`patch_settings_document`]'s text as
@@ -598,6 +615,9 @@ pub fn patch_settings_document(raw: &str, settings: &Settings) -> Result<String,
     }
     if !dictation_language::is_valid_list(&settings.dictation_languages) {
         return Err(invalid("dictation_languages"));
+    }
+    if !HISTORY_LIMITS.contains(&settings.history_limit) {
+        return Err(invalid("history_limit"));
     }
 
     // A document handed over by a caller that kept the original bytes may still
@@ -640,6 +660,11 @@ pub fn patch_settings_document(raw: &str, settings: &Settings) -> Result<String,
     if let Some(member) = single_member(&members, "dictation_languages")? {
         if member_dictation_languages(member, &masked).is_none() {
             return Err(invalid("dictation_languages"));
+        }
+    }
+    if let Some(member) = single_member(&members, "history_limit")? {
+        if member_history_limit(member, &masked).is_none() {
+            return Err(invalid("history_limit"));
         }
     }
 
@@ -690,6 +715,11 @@ pub fn patch_settings_document(raw: &str, settings: &Settings) -> Result<String,
         Some(member) => edits.push((member.value_span.clone(), languages)),
         None => missing.push(("dictation_languages", languages)),
     }
+    let history_limit = settings.history_limit.to_string();
+    match single_member(&members, "history_limit")? {
+        Some(member) => edits.push((member.value_span.clone(), history_limit)),
+        None => missing.push(("history_limit", history_limit)),
+    }
     member_insertion_edits(body, &masked, &members, &missing, &mut edits);
 
     // Obsolete root properties are retired without changing unrelated bytes;
@@ -730,6 +760,7 @@ fn verify_patched(document: &str, settings: &Settings) -> Result<(), ConfigError
         language: settings.language,
         custom_vocabulary: Arc::clone(&settings.custom_vocabulary),
         dictation_languages: Arc::clone(&settings.dictation_languages),
+        history_limit: settings.history_limit,
     };
     if written != expected {
         return Err(ConfigError::new(UiMessage::new(
@@ -868,13 +899,12 @@ fn line_content(document: &str, start: usize) -> &str {
 /// yet. Each missing property is written as `"name": value` in the order given,
 /// and all of them go into one insertion in front of the first root property,
 /// with that property's own indentation and line ending: a document from before
-/// `mute_during_recording`, `input_device`, `language`,
-/// `custom_vocabulary` or `dictation_languages` existed has no
-/// such values to write, and one edit keeps the spans of several zero-width
-/// insertions from piling up at the same offset. Every other byte - the
-/// comments, the order, the mark - stays where it was, and an object whose
-/// first property shares a line
-/// with the opening brace gets the insertion separated by a space instead.
+/// `mute_during_recording`, `input_device`, `language`, `custom_vocabulary`,
+/// `dictation_languages` or `history_limit` existed has no such values to write,
+/// and one edit keeps the spans of several zero-width insertions from piling up
+/// at the same offset. Every other byte - the comments, the order, the mark -
+/// stays where it was, and an object whose first property shares a line with the
+/// opening brace gets the insertion separated by a space instead.
 ///
 /// `document` is the text the patch splices, so its own line endings and
 /// indentation decide what the inserted lines look like. `masked` is the same
@@ -971,17 +1001,19 @@ fn requirement(name: &str) -> UiMessage {
         "language" => MessageId::ConfigLanguageRequirement,
         "custom_vocabulary" => MessageId::ConfigCustomVocabularyRequirement,
         "dictation_languages" => MessageId::ConfigDictationLanguagesRequirement,
+        "history_limit" => MessageId::ConfigHistoryLimitRequirement,
         _ => MessageId::ConfigMuteRequirement,
     };
     UiMessage::new(key)
 }
 
 /// The managed properties of a document, each typed and checked.
-/// `mute_during_recording`, `input_device`, `language`, `custom_vocabulary` and
-/// `dictation_languages` are the ones that may be absent - a document written
-/// before them reads as `false`, the system default input device, the default
-/// language, an empty vocabulary and no language hints there - while every
-/// other missing or malformed property refuses the document. The obsolete root
+/// `mute_during_recording`, `input_device`, `language`, `custom_vocabulary`,
+/// `dictation_languages` and `history_limit` are the ones that may be absent - a
+/// document written before them reads as `false`, the system default input
+/// device, the default language, an empty vocabulary, no language hints and
+/// [`DEFAULT_HISTORY_LIMIT`] there - while every other missing or malformed
+/// property refuses the document. The obsolete root
 /// `compare_all` and `port` are not read at all: the patch removes them, so
 /// neither ever becomes a value, and a document that carries one of them twice
 /// is refused because it could not be migrated unambiguously. `config_path`
@@ -1088,6 +1120,14 @@ fn settings_from_members(
         Ok(None) => Arc::default(),
         Err(error) => return Err(named(error.ui)),
     };
+    let history_limit = match single_member(members, "history_limit") {
+        // A document written before the setting existed reads as the size the
+        // settings window offers by default.
+        Ok(Some(limit)) => member_history_limit(limit, document)
+            .ok_or_else(|| invalid("history_limit"))?,
+        Ok(None) => DEFAULT_HISTORY_LIMIT,
+        Err(error) => return Err(named(error.ui)),
+    };
 
     Ok(Settings {
         hotkey,
@@ -1097,7 +1137,17 @@ fn settings_from_members(
         language,
         custom_vocabulary,
         dictation_languages,
+        history_limit,
     })
+}
+
+/// The value of a `history_limit` member as the size it stores: a JSON integer
+/// that is one of [`HISTORY_LIMITS`]; `None` for any other JSON value, a
+/// fraction, a negative number and every size the settings window does not
+/// offer.
+fn member_history_limit(member: &RootMember, document: &str) -> Option<u32> {
+    let limit = u32::try_from(member_value(member, document).as_u64()?).ok()?;
+    HISTORY_LIMITS.contains(&limit).then_some(limit)
 }
 
 /// The string value of a member, trimmed the way the loader has always trimmed
@@ -2813,8 +2863,8 @@ mod tests {
     /// comments remain unchanged.
     #[test]
     fn patching_a_marked_commented_document_keeps_every_other_byte() {
-        let document = "\u{feff}// Speechek settings\r\n{\r\n  // Этот файл сохранён в UTF-8 с BOM.\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": \"wasapi:card-one\",\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"compare_all\": false,\r\n\r\n  // Заметки пользователя и вложенный объект.\r\n  \"notes\": {\r\n    \"text\": \"keep this value\",\r\n    \"nested\": [1, 2, { \"deep\": true }]\r\n  },\r\n  \"trailing\": null,\r\n  // Дополнительное поле пользователя.\r\n  \"extra\": \"kept\"\r\n}\r\n";
-        let expected = "\u{feff}// Speechek settings\r\n{\r\n  // Этот файл сохранён в UTF-8 с BOM.\r\n  \"hotkey\": \"Ctrl+Shift+F9\",\r\n  \"mode\": \"verbatim\",\r\n  \"mute_during_recording\": true,\r\n  \r\n  \"input_device\": \"wasapi:card-two\",\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [\"Speechek\"],\r\n  \"dictation_languages\": [\"ru-RU\",\"en-US\"],\r\n  \r\n\r\n  // Заметки пользователя и вложенный объект.\r\n  \"notes\": {\r\n    \"text\": \"keep this value\",\r\n    \"nested\": [1, 2, { \"deep\": true }]\r\n  },\r\n  \"trailing\": null,\r\n  // Дополнительное поле пользователя.\r\n  \"extra\": \"kept\"\r\n}\r\n";
+        let document = "\u{feff}// Speechek settings\r\n{\r\n  // Этот файл сохранён в UTF-8 с BOM.\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": \"wasapi:card-one\",\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"history_limit\": 5,\r\n  \"compare_all\": false,\r\n\r\n  // Заметки пользователя и вложенный объект.\r\n  \"notes\": {\r\n    \"text\": \"keep this value\",\r\n    \"nested\": [1, 2, { \"deep\": true }]\r\n  },\r\n  \"trailing\": null,\r\n  // Дополнительное поле пользователя.\r\n  \"extra\": \"kept\"\r\n}\r\n";
+        let expected = "\u{feff}// Speechek settings\r\n{\r\n  // Этот файл сохранён в UTF-8 с BOM.\r\n  \"hotkey\": \"Ctrl+Shift+F9\",\r\n  \"mode\": \"verbatim\",\r\n  \"mute_during_recording\": true,\r\n  \r\n  \"input_device\": \"wasapi:card-two\",\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [\"Speechek\"],\r\n  \"dictation_languages\": [\"ru-RU\",\"en-US\"],\r\n  \"history_limit\": 5,\r\n  \r\n\r\n  // Заметки пользователя и вложенный объект.\r\n  \"notes\": {\r\n    \"text\": \"keep this value\",\r\n    \"nested\": [1, 2, { \"deep\": true }]\r\n  },\r\n  \"trailing\": null,\r\n  // Дополнительное поле пользователя.\r\n  \"extra\": \"kept\"\r\n}\r\n";
 
         let patched = patch_settings_document(
             document,
@@ -2826,6 +2876,7 @@ mod tests {
                 language: Language::En,
                 custom_vocabulary: Arc::from(vec!["Speechek".to_owned()]),
                 dictation_languages: Arc::from(vec!["ru-RU".to_owned(), "en-US".to_owned()]),
+                history_limit: 5,
             },
         )
         .expect("the documented patch");
@@ -2835,15 +2886,15 @@ mod tests {
 
     /// The optional values a document may not carry: a file from before them
     /// still loads as the documented defaults - `false`, the system default
-    /// input device, the detected language, an empty vocabulary and no
-    /// dictation languages - and the first patch that changes them writes all
-    /// five properties into the document in one insertion, in front of the
-    /// first property and in that property's indentation and CRLF, in the fixed
-    /// order `mute_during_recording`, `input_device`, `language`,
-    /// `custom_vocabulary`, `dictation_languages`, instead of readback refusing
-    /// values the file does not hold. Later patches replace the same bytes in
-    /// place, and every other byte of the document survives, including an
-    /// unknown property between them.
+    /// input device, the detected language, an empty vocabulary, no dictation
+    /// languages and the default history limit - and the first patch that
+    /// changes them writes all six properties into the document in one
+    /// insertion, in front of the first property and in that property's
+    /// indentation and CRLF, in the fixed order `mute_during_recording`,
+    /// `input_device`, `language`, `custom_vocabulary`, `dictation_languages`,
+    /// `history_limit`, instead of readback refusing values the file does not
+    /// hold. Later patches replace the same bytes in place, and every other byte
+    /// of the document survives, including an unknown property between them.
     #[test]
     fn a_document_without_the_optional_values_gains_them_in_one_patch() {
         let path = Path::new("settings.json");
@@ -2860,6 +2911,7 @@ mod tests {
         assert_eq!(loaded.input_device, None);
         assert!(loaded.custom_vocabulary.is_empty());
         assert!(loaded.dictation_languages.is_empty());
+        assert_eq!(loaded.history_limit, DEFAULT_HISTORY_LIMIT);
 
         let switched_on = Settings {
             hotkey: "F2".to_owned(),
@@ -2869,11 +2921,12 @@ mod tests {
             language: Language::En,
             custom_vocabulary: Arc::from(vec!["Speechek".to_owned()]),
             dictation_languages: Arc::from(vec!["ru-RU".to_owned()]),
+            history_limit: 20,
         };
         let on_document = patch_settings_document(document, &switched_on).expect("a patch");
         assert_eq!(
             on_document,
-            "{\r\n  \"mute_during_recording\": true,\r\n  \"input_device\": \"wasapi:card-one\",\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [\"Speechek\"],\r\n  \"dictation_languages\": [\"ru-RU\"],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": { \"keep\": true }\r\n}\r\n"
+            "{\r\n  \"mute_during_recording\": true,\r\n  \"input_device\": \"wasapi:card-one\",\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [\"Speechek\"],\r\n  \"dictation_languages\": [\"ru-RU\"],\r\n  \"history_limit\": 20,\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": { \"keep\": true }\r\n}\r\n"
         );
         assert_eq!(
             parse_settings_document_with_language(&on_document, path, MessageId::SettingsFileRole, Language::En)
@@ -2889,12 +2942,13 @@ mod tests {
             language: Language::En,
             custom_vocabulary: Arc::default(),
             dictation_languages: Arc::default(),
+            history_limit: DEFAULT_HISTORY_LIMIT,
         };
         let off_document =
             patch_settings_document(&on_document, &switched_off).expect("a patch");
         assert_eq!(
             off_document,
-            "{\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": { \"keep\": true }\r\n}\r\n"
+            "{\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"history_limit\": 10,\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": { \"keep\": true }\r\n}\r\n"
         );
         assert_eq!(
             parse_settings_document_with_language(&off_document, path, MessageId::SettingsFileRole, Language::En)
@@ -2911,8 +2965,8 @@ mod tests {
     #[test]
     fn an_obsolete_compare_all_is_ignored_on_read_and_removed_by_the_next_patch() {
         let path = Path::new("settings.json");
-        let with = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"compare_all\": true,\r\n  \"notes\": 1\r\n}\r\n";
-        let without = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"notes\": 1\r\n}\r\n";
+        let with = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"history_limit\": 10,\r\n  \"compare_all\": true,\r\n  \"notes\": 1\r\n}\r\n";
+        let without = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"history_limit\": 10,\r\n  \"notes\": 1\r\n}\r\n";
         let expected = Settings {
             hotkey: "F2".to_owned(),
             mode: "smart".to_owned(),
@@ -2921,6 +2975,7 @@ mod tests {
             language: Language::En,
             custom_vocabulary: Arc::default(),
             dictation_languages: Arc::default(),
+            history_limit: DEFAULT_HISTORY_LIMIT,
         };
 
         // Reading: the obsolete property is simply not a value, so an old and a
@@ -2941,7 +2996,7 @@ mod tests {
         let patched = patch_settings_document(with, &expected).expect("a patch");
         assert_eq!(
             patched,
-            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \r\n  \"notes\": 1\r\n}\r\n"
+            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"history_limit\": 10,\r\n  \r\n  \"notes\": 1\r\n}\r\n"
         );
         assert_eq!(
             parse_settings_document_with_language(&patched, path, MessageId::SettingsFileRole, Language::En)
@@ -2950,10 +3005,10 @@ mod tests {
         );
 
         // Writing: as the last property it loses the comma before it instead.
-        let last = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"compare_all\": true\r\n}\r\n";
+        let last = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"history_limit\": 10,\r\n  \"compare_all\": true\r\n}\r\n";
         assert_eq!(
             patch_settings_document(last, &expected).expect("a patch"),
-            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": []\r\n  \r\n}\r\n"
+            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"history_limit\": 10\r\n  \r\n}\r\n"
         );
 
         // A repeated obsolete property cannot be migrated by the same rule the
@@ -3029,9 +3084,9 @@ mod tests {
         let path = Path::new("settings.json");
         let block = OBSOLETE_PORT_COMMENTS.join("\r\n");
         let with = format!(
-            "{{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n\r\n{block}\r\n  \"port\": 5000,\r\n\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"notes\": \"kept\"\r\n}}\r\n"
+            "{{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n\r\n{block}\r\n  \"port\": 5000,\r\n\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"history_limit\": 10,\r\n  \"notes\": \"kept\"\r\n}}\r\n"
         );
-        let without = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"notes\": \"kept\"\r\n}\r\n";
+        let without = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"history_limit\": 10,\r\n  \"notes\": \"kept\"\r\n}\r\n";
 
         let loaded = parse_settings_document_with_language(
             &with,
@@ -3061,11 +3116,11 @@ mod tests {
         // separated the property from the property before the block goes with
         // it, so the document stays readable.
         let last = format!(
-            "{{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"notes\": \"kept\",\r\n\r\n{block}\r\n  \"port\": 5000\r\n}}\r\n"
+            "{{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"history_limit\": 10,\r\n  \"notes\": \"kept\",\r\n\r\n{block}\r\n  \"port\": 5000\r\n}}\r\n"
         );
         assert_eq!(
             patch_settings_document(&last, &loaded).expect("a patch"),
-            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"notes\": \"kept\"\r\n\r\n}\r\n"
+            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"history_limit\": 10,\r\n  \"notes\": \"kept\"\r\n\r\n}\r\n"
         );
     }
 
@@ -3121,20 +3176,20 @@ mod tests {
         .expect("a document with every managed value");
 
         let above = format!(
-            "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  // моя заметка\n{block}\n  \"port\": 43118,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": []\n}}\n"
+            "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  // моя заметка\n{block}\n  \"port\": 43118,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": [],\n  \"history_limit\": 10\n}}\n"
         );
         assert_eq!(
             patch_settings_document(&above, &settings).expect("a patch"),
-            "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  // моя заметка\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": []\n}\n"
+            "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  // моя заметка\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": [],\n  \"history_limit\": 10\n}\n"
         );
 
         let inside = format!(
-            "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n{block}\n  // моя заметка\n  \"port\": 43118,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": []\n}}\n"
+            "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n{block}\n  // моя заметка\n  \"port\": 43118,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": [],\n  \"history_limit\": 10\n}}\n"
         );
         assert_eq!(
             patch_settings_document(&inside, &settings).expect("a patch"),
             format!(
-                "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n{block}\n  // моя заметка\n  \n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": []\n}}\n"
+                "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n{block}\n  // моя заметка\n  \n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": [],\n  \"history_limit\": 10\n}}\n"
             )
         );
     }
@@ -3148,7 +3203,7 @@ mod tests {
     #[test]
     fn a_null_device_is_the_system_default_and_a_stored_id_is_kept() {
         let path = Path::new("settings.json");
-        let default_device = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": []\n}\n";
+        let default_device = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": [],\n  \"history_limit\": 10\n}\n";
         let loaded = parse_settings_document_with_language(
             default_device,
             path,
@@ -3162,7 +3217,7 @@ mod tests {
             default_device
         );
 
-        let chosen = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": \"wasapi:card-one\",\n  \"language\": \"en\",\n  \"custom_vocabulary\": [\"Speechek\"],\n  \"dictation_languages\": [\"ru-RU\",\"en-US\"]\n}\n";
+        let chosen = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": \"wasapi:card-one\",\n  \"language\": \"en\",\n  \"custom_vocabulary\": [\"Speechek\"],\n  \"dictation_languages\": [\"ru-RU\",\"en-US\"],\n  \"history_limit\": 10\n}\n";
         let loaded = parse_settings_document_with_language(
             chosen,
             path,
@@ -3200,6 +3255,7 @@ mod tests {
             language: Language::En,
             custom_vocabulary: Arc::default(),
             dictation_languages: Arc::default(),
+            history_limit: DEFAULT_HISTORY_LIMIT,
         };
 
         for value in ["5", "\"\"", "\"not-a-device-id\"", "\"wasapi:\"", "true", "{}"] {
@@ -3238,7 +3294,7 @@ mod tests {
     #[test]
     fn a_general_change_does_not_leave_an_old_port_or_device_behind() {
         let path = Path::new("settings.json");
-        let document = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 5000,\n  \"input_device\": \"wasapi:old\",\n  \"language\": \"en\",\n  \"custom_vocabulary\": [\"OldTerm\"],\n  \"dictation_languages\": [\"de-DE\"],\n  \"notes\": \"kept\"\n}\n";
+        let document = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 5000,\n  \"input_device\": \"wasapi:old\",\n  \"language\": \"en\",\n  \"custom_vocabulary\": [\"OldTerm\"],\n  \"dictation_languages\": [\"de-DE\"],\n  \"history_limit\": 10,\n  \"notes\": \"kept\"\n}\n";
         let changed = Settings {
             hotkey: "Ctrl+Shift+F9".to_owned(),
             mode: "verbatim".to_owned(),
@@ -3247,12 +3303,13 @@ mod tests {
             language: Language::En,
             custom_vocabulary: Arc::from(vec!["NewTerm".to_owned()]),
             dictation_languages: Arc::from(vec!["ru-RU".to_owned(), "en-US".to_owned()]),
+            history_limit: DEFAULT_HISTORY_LIMIT,
         };
 
         let patched = patch_settings_document(document, &changed).expect("a patch");
         assert_eq!(
             patched,
-            "{\n  \"hotkey\": \"Ctrl+Shift+F9\",\n  \"mode\": \"verbatim\",\n  \"mute_during_recording\": true,\n  \n  \"input_device\": \"wasapi:new\",\n  \"language\": \"en\",\n  \"custom_vocabulary\": [\"NewTerm\"],\n  \"dictation_languages\": [\"ru-RU\",\"en-US\"],\n  \"notes\": \"kept\"\n}\n"
+            "{\n  \"hotkey\": \"Ctrl+Shift+F9\",\n  \"mode\": \"verbatim\",\n  \"mute_during_recording\": true,\n  \n  \"input_device\": \"wasapi:new\",\n  \"language\": \"en\",\n  \"custom_vocabulary\": [\"NewTerm\"],\n  \"dictation_languages\": [\"ru-RU\",\"en-US\"],\n  \"history_limit\": 10,\n  \"notes\": \"kept\"\n}\n"
         );
         assert!(!patched.contains("5000"), "the old port is gone");
         assert!(!patched.contains("wasapi:old"), "the old device is gone");
@@ -3287,6 +3344,7 @@ mod tests {
         assert_eq!(loaded.input_device, None);
         assert_eq!(loaded.language, Language::En);
         assert!(loaded.custom_vocabulary.is_empty());
+        assert_eq!(loaded.history_limit, DEFAULT_HISTORY_LIMIT);
 
         assert_eq!(
             patch_settings_document(SETTINGS_EXAMPLE, &loaded).expect("a patch"),
@@ -3339,7 +3397,7 @@ mod tests {
         let path = Path::new("settings.json");
         let document_with = |value: &str| {
             format!(
-                "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": {value},\n  \"dictation_languages\": []\n}}\n"
+                "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": {value},\n  \"dictation_languages\": [],\n  \"history_limit\": 10\n}}\n"
             )
         };
         let settings = Settings {
@@ -3350,6 +3408,7 @@ mod tests {
             language: Language::En,
             custom_vocabulary: Arc::from(vec!["Speechek".to_owned(), "Кубернетес".to_owned()]),
             dictation_languages: Arc::default(),
+            history_limit: DEFAULT_HISTORY_LIMIT,
         };
 
         let patched = patch_settings_document(&document_with("[]"), &settings).expect("a patch");
@@ -3466,6 +3525,106 @@ mod tests {
         }
     }
 
+    /// A document that does not carry a history limit reads as the documented
+    /// default, a stored size is a value of its own that is replaced in place,
+    /// and the property is the last one written when a document from before it
+    /// existed gains the optional values.
+    #[test]
+    fn stored_history_limit_defaults_round_trips_and_is_inserted_last() {
+        let path = Path::new("settings.json");
+        let base = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": []";
+        let without = format!("{base}\n}}\n");
+        let read = |document: &str| {
+            parse_settings_document_with_language(document, path, MessageId::SettingsFileRole, Language::En)
+        };
+
+        let absent = read(&without).expect("a document without the property");
+        assert_eq!(
+            absent.history_limit, DEFAULT_HISTORY_LIMIT,
+            "a missing property is the documented default"
+        );
+
+        // The property is written last, after the other optional values, in one
+        // insertion in front of the first property.
+        let chosen = Settings {
+            history_limit: 20,
+            ..absent.clone()
+        };
+        let patched = patch_settings_document(&without, &chosen).expect("a patch");
+        assert_eq!(
+            patched,
+            "{\n  \"dictation_languages\": [],\n  \"history_limit\": 20,\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": []\n}\n"
+        );
+        assert_eq!(read(&patched).expect("the patched document"), chosen);
+
+        // A document that already carries the property keeps it in place: the
+        // patch is a no-op on the size it holds, and a new size replaces those
+        // bytes while every other byte of the document stays.
+        let stored = format!("{base},\n  \"dictation_languages\": [],\n  \"history_limit\": 50\n}}\n");
+        let loaded = read(&stored).expect("a stored size");
+        assert_eq!(loaded.history_limit, 50);
+        assert_eq!(
+            patch_settings_document(&stored, &loaded).expect("a patch"),
+            stored
+        );
+
+        let switched = Settings {
+            history_limit: 5,
+            ..loaded
+        };
+        let replaced = format!("{base},\n  \"dictation_languages\": [],\n  \"history_limit\": 5\n}}\n");
+        assert_eq!(
+            patch_settings_document(&stored, &switched).expect("a patch"),
+            replaced
+        );
+        assert_eq!(read(&replaced).expect("the replaced document"), switched);
+    }
+
+    /// A history limit outside the offered sizes is refused by the loader and by
+    /// the patch, whatever JSON type spells it, and the writer never stores a
+    /// size the next read would refuse.
+    #[test]
+    fn a_history_limit_outside_the_offered_sizes_is_refused() {
+        let path = Path::new("settings.json");
+        let base = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": []";
+        let without = format!("{base}\n}}\n");
+        let document_with = |value: &str| format!("{base},\n  \"history_limit\": {value}\n}}\n");
+        let read = |document: &str| {
+            parse_settings_document_with_language(document, path, MessageId::SettingsFileRole, Language::En)
+        };
+        let names_the_limit = |ui: &UiMessage| {
+            let text = serde_json::to_string(ui).expect("a message serializes");
+            text.contains("ConfigPropertyInvalid") && text.contains("\"history_limit\"")
+        };
+        let base_settings = read(&without).expect("a document without the property");
+
+        for value in ["7", "\"10\"", "0", "51", "-10", "10.5", "null", "true", "[]"] {
+            let document = document_with(value);
+            let error = read(&document).expect_err("an unsupported size");
+            assert!(names_the_limit(&error.ui), "{value}: {:?}", error.ui);
+            let error = patch_settings_document(&document, &base_settings)
+                .expect_err("an unsupported stored size must refuse the patch");
+            assert!(names_the_limit(&error.ui), "{value}: {:?}", error.ui);
+        }
+
+        let accepted = read(&document_with("20")).expect("an offered size");
+        assert_eq!(accepted.history_limit, 20);
+        assert_eq!(
+            patch_settings_document(&document_with("20"), &accepted).expect("a patch"),
+            document_with("20")
+        );
+
+        for value in [0u32, 7, 51, u32::MAX] {
+            let invalid = Settings {
+                history_limit: value,
+                ..base_settings.clone()
+            };
+            let error = patch_settings_document(&without, &invalid)
+                .expect_err("an unsupported size must not be written");
+            assert!(names_the_limit(&error.ui), "{value}: {:?}", error.ui);
+        }
+    }
+
     /// Readback refuses a document that still carries an obsolete root property,
     /// so a patch can never report success on a file it failed to migrate even
     /// when the managed values themselves read back correctly.
@@ -3479,6 +3638,7 @@ mod tests {
             language: Language::En,
             custom_vocabulary: Arc::default(),
             dictation_languages: Arc::default(),
+            history_limit: DEFAULT_HISTORY_LIMIT,
         };
         for name in ["compare_all", "port"] {
             let document = format!(
@@ -3541,6 +3701,7 @@ mod tests {
             language: Language::En,
             custom_vocabulary: Arc::default(),
             dictation_languages: Arc::default(),
+            history_limit: DEFAULT_HISTORY_LIMIT,
         })
         .expect_err("a repeated switch must refuse the patch");
     }
@@ -3567,6 +3728,7 @@ mod tests {
                 language: Language::En,
                 custom_vocabulary: Arc::default(),
                 dictation_languages: Arc::default(),
+                history_limit: DEFAULT_HISTORY_LIMIT,
             },
             keys: Arc::clone(&ring),
             revision: 1,
@@ -3590,6 +3752,7 @@ mod tests {
                 language: Language::En,
                 custom_vocabulary: Arc::default(),
                 dictation_languages: Arc::default(),
+                history_limit: DEFAULT_HISTORY_LIMIT,
             },
             keys: Arc::clone(&ring),
             revision: 2,
@@ -4083,7 +4246,7 @@ mod tests {
         let patched = patch_settings_document(document, &loaded).expect("a patch");
         assert_eq!(
             patched,
-            "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"language\": \"ru\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n"
+            "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"language\": \"ru\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"history_limit\": 10,\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n"
         );
 
         let reread =
@@ -4095,7 +4258,7 @@ mod tests {
         let english = patch_settings_document(&patched, &switched).expect("a patch");
         assert_eq!(
             english,
-            "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n"
+            "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"history_limit\": 10,\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n"
         );
         assert_eq!(
             parse_settings_document_with_language(&english, path, MessageId::SettingsFileRole, Language::Ru)
@@ -4125,6 +4288,7 @@ mod tests {
             language: Language::En,
             custom_vocabulary: Arc::default(),
             dictation_languages: Arc::default(),
+            history_limit: DEFAULT_HISTORY_LIMIT,
         };
 
         for value in ["\"de\"", "\"EN\"", "null", "5", "true", "{}", "\"\""] {

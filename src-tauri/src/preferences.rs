@@ -21,8 +21,8 @@
 //! completely is reported as `SAVE_PARTIAL` and makes every following apply
 //! rewrite and read back the roles it names before it may succeed again.
 //!
-//! What an apply owns is its scope. The general form - `mode` and
-//! `mute_during_recording` - is applied at once on every accepted change;
+//! What an apply owns is its scope. The general form - including `mode`,
+//! `mute_during_recording` and `history_limit` - is applied at once on every accepted change;
 //! the chord the page typed is validated, registered and read back before it is
 //! reported as accepted; and the key list changes only through the page's
 //! explicit apply, never as a side effect of a mode or a chord change.
@@ -58,6 +58,7 @@ pub(crate) const SETTINGS_LABEL: &str = "settings";
 /// The sections the page can be opened on, as the native request spells them.
 const SECTION_GENERAL: &str = "general";
 const SECTION_KEYS: &str = "keys";
+const SECTION_HISTORY: &str = "history";
 const SECTION_LAST: &str = "last";
 
 /// Sent to the overlay once an apply has published a new revision, so a caption
@@ -636,7 +637,7 @@ impl PreferencesState {
         let mut pending = self.pending_section.lock();
         let requested = pending.clone();
         *pending = SECTION_LAST.to_owned();
-        if requested == SECTION_GENERAL || requested == SECTION_KEYS {
+        if requested == SECTION_GENERAL || requested == SECTION_KEYS || requested == SECTION_HISTORY {
             return requested;
         }
         if self.runtime.snapshot().keys.is_empty() && self.secrets_status() != "ready" {
@@ -687,7 +688,7 @@ impl PreferencesState {
 /// The page a settings command may be called from. Both halves are checked: the
 /// window label, and the exact document URL — derived from the running dev URL,
 /// without a query or a fragment — the settings window was really opened on.
-fn check_window(window: &WebviewWindow) -> Result<(), SettingsUiError> {
+pub(crate) fn check_window(window: &WebviewWindow) -> Result<(), SettingsUiError> {
     if crate::is_app_page(window, SETTINGS_LABEL, crate::SETTINGS_PAGE_PATH) {
         Ok(())
     } else {
@@ -781,6 +782,8 @@ fn open_blocking(app: &AppHandle) -> Result<SettingsView, SettingsUiError> {
 pub struct GeneralSettings {
     pub mode: String,
     pub mute_during_recording: bool,
+    /// Required retention choice; unsupported values are refused before saving.
+    pub history_limit: u32,
     /// The chosen input device id, or `null` for the system default device.
     /// `null` is a value of the contract; an omitted field is refused.
     #[serde(deserialize_with = "input_device_choice")]
@@ -915,13 +918,24 @@ fn update_general_blocking(
     // The page's values are checked before anything is planned for the draft:
     // a device the document would refuse never reaches the draft, the files or
     // the runtime.
+    let history_limit = request.history_limit;
+    if !settings::HISTORY_LIMITS.contains(&history_limit) {
+        return Err(SettingsUiError::new(
+            "INVALID_HISTORY_LIMIT",
+            UiMessage::new(MessageId::ConfigHistoryLimitRequirement),
+        ));
+    }
     let input_device = usable_input_device(request.input_device)?;
     let dictation_languages = usable_dictation_languages(request.dictation_languages)?;
     let snapshot = inner.runtime.snapshot();
+    // What the limit was before this apply, so a lower one can be brought into
+    // effect on the store the moment the document holds it.
+    let previous_limit = snapshot.settings.history_limit;
     let planned = Settings {
         hotkey: snapshot.settings.hotkey.clone(),
         mode: request.mode,
         mute_during_recording: request.mute_during_recording,
+        history_limit,
         input_device,
         language: request.language,
         custom_vocabulary: Arc::clone(&snapshot.settings.custom_vocabulary),
@@ -932,7 +946,14 @@ fn update_general_blocking(
     if draft.id != draft_id || draft.revision != revision {
         return Err(SettingsUiError::stale_draft());
     }
-    apply_locked(app, &state, draft, planned, ApplyScope::General, false)
+    let result = apply_locked(app, &state, draft, planned, ApplyScope::General, false)?;
+    // A lower limit deletes recordings the user can still see, so the store is
+    // brought down to it as soon as the new document is in effect; the pruning
+    // itself is what tells the settings window the list has moved.
+    if history_limit < previous_limit {
+        crate::history::prune_to_limit(app);
+    }
+    Ok(result)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1044,6 +1065,7 @@ fn update_hotkey_blocking(
         hotkey,
         mode: snapshot.settings.mode.clone(),
         mute_during_recording: snapshot.settings.mute_during_recording,
+        history_limit: snapshot.settings.history_limit,
         input_device: snapshot.settings.input_device.clone(),
         language: snapshot.settings.language,
         custom_vocabulary: Arc::clone(&snapshot.settings.custom_vocabulary),
@@ -1773,6 +1795,7 @@ fn planned_for_scope(
             hotkey: snapshot.hotkey.clone(),
             mode: planned.mode,
             mute_during_recording: planned.mute_during_recording,
+            history_limit: planned.history_limit,
             input_device: planned.input_device,
             language: planned.language,
             custom_vocabulary: Arc::clone(&snapshot.custom_vocabulary),
@@ -1793,6 +1816,7 @@ fn planned_for_scope(
             })?,
             mode: snapshot.mode.clone(),
             mute_during_recording: snapshot.mute_during_recording,
+            history_limit: snapshot.history_limit,
             input_device: snapshot.input_device.clone(),
             language: snapshot.language,
             custom_vocabulary: Arc::clone(&snapshot.custom_vocabulary),
@@ -2526,6 +2550,7 @@ mod tests {
             hotkey: "F2".to_owned(),
             mode: mode.to_owned(),
             mute_during_recording: false,
+            history_limit: settings::DEFAULT_HISTORY_LIMIT,
             input_device: None,
             language: Language::En,
             custom_vocabulary: Arc::default(),
@@ -2673,6 +2698,7 @@ mod tests {
             hotkey: "F2".to_owned(),
             mode: "smart".to_owned(),
             mute_during_recording: false,
+            history_limit: settings::DEFAULT_HISTORY_LIMIT,
             input_device: Some("wasapi:card-one".to_owned()),
             language: Language::En,
             custom_vocabulary: Arc::default(),
@@ -2686,6 +2712,7 @@ mod tests {
                 hotkey: "stale".to_owned(),
                 mode: "verbatim".to_owned(),
                 mute_during_recording: true,
+                history_limit: settings::DEFAULT_HISTORY_LIMIT,
                 input_device: None,
                 language: Language::Ru,
                 custom_vocabulary: Arc::default(),
@@ -2712,6 +2739,7 @@ mod tests {
             hotkey: "stale".to_owned(),
             mode: "verbatim".to_owned(),
             mute_during_recording: true,
+            history_limit: settings::DEFAULT_HISTORY_LIMIT,
             input_device: None,
             language: Language::En,
             custom_vocabulary: Arc::default(),
@@ -2821,7 +2849,7 @@ mod tests {
             assert_eq!(error.field.as_deref(), Some("dictation_languages"));
         }
 
-        let without = r#"{"mode":"smart","mute_during_recording":false,"input_device":null,"language":"ru"}"#;
+        let without = r#"{"mode":"smart","mute_during_recording":false,"input_device":null,"language":"ru","history_limit":10}"#;
         assert!(
             serde_json::from_str::<GeneralSettings>(without).is_err(),
             "an omitted list is refused, not read as Auto-detect"
@@ -2839,24 +2867,25 @@ mod tests {
             "input_device": null,
             "language": "ru",
             "dictation_languages": [],
+            "history_limit": settings::DEFAULT_HISTORY_LIMIT,
         }))
         .expect("a complete general payload");
         assert_eq!(complete.language, Language::Ru);
 
         let missing =
-            r#"{"mode":"smart","mute_during_recording":false,"input_device":null,"dictation_languages":[]}"#;
+            r#"{"mode":"smart","mute_during_recording":false,"input_device":null,"dictation_languages":[],"history_limit":10}"#;
         assert!(
             serde_json::from_str::<GeneralSettings>(missing).is_err(),
             "an omitted language is refused, not defaulted"
         );
 
-        let unsupported = r#"{"mode":"smart","mute_during_recording":false,"input_device":null,"language":"de","dictation_languages":[]}"#;
+        let unsupported = r#"{"mode":"smart","mute_during_recording":false,"input_device":null,"language":"de","dictation_languages":[],"history_limit":10}"#;
         assert!(
             serde_json::from_str::<GeneralSettings>(unsupported).is_err(),
             "a language the interface does not ship is refused"
         );
 
-        let duplicate = r#"{"mode":"smart","mute_during_recording":false,"input_device":null,"language":"ru","language":"en","dictation_languages":[]}"#;
+        let duplicate = r#"{"mode":"smart","mute_during_recording":false,"input_device":null,"language":"ru","language":"en","dictation_languages":[],"history_limit":10}"#;
         assert!(
             serde_json::from_str::<GeneralSettings>(duplicate).is_err(),
             "a duplicated language is refused, not coerced"
@@ -2925,6 +2954,7 @@ mod tests {
             hotkey: "F2".to_owned(),
             mode: "verbatim".to_owned(),
             mute_during_recording: true,
+            history_limit: settings::DEFAULT_HISTORY_LIMIT,
             input_device: None,
             language: Language::En,
             custom_vocabulary: Arc::default(),
@@ -2956,7 +2986,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&config).expect("the written document"),
-            "\u{feff}{\r\n  // режим\r\n  \"mute_during_recording\": true,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"verbatim\"\r\n  \r\n}\r\n",
+            "\u{feff}{\r\n  // режим\r\n  \"mute_during_recording\": true,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"history_limit\": 10,\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"verbatim\"\r\n  \r\n}\r\n",
             "the retired property is gone and every other byte survived"
         );
     }

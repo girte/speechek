@@ -320,7 +320,7 @@ async function beginSession(generation) {
     // open one of its own: `external` makes `acceptPcmChunk` the only way audio
     // reaches it, and no capture of this page ever touches a device. The session
     // tag keeps every request of this take on the snapshot the shell pinned.
-    await ensureRecorder().start({ modes: [active.mode], external: true, sessionId: active.sessionId });
+    await ensureRecorder().start({ modes: [active.mode], external: true, sessionId: active.sessionId, liveFallback: true });
   } catch (cause) {
     if (!isLive(active)) return;
     // The capture never opened: nothing was recorded, so nothing is inserted.
@@ -521,7 +521,7 @@ function finish(active) {
  */
 function finishSuccess(active) {
   if (!finish(active)) return;
-  void finishShell(active, 'success');
+  void finishShell(active, 'success', null);
 }
 
 /**
@@ -531,7 +531,7 @@ function finishSuccess(active) {
 function finishCopied(active) {
   if (!finish(active)) return;
   render('copied');
-  void finishShell(active, 'error');
+  void finishShell(active, 'error', null);
 }
 
 /**
@@ -541,11 +541,17 @@ function finishCopied(active) {
 function finishError(active, message, detail = { key: 'OverlayNotPasted' }) {
   if (!finish(active)) return;
   render('error', { message, detail });
-  void finishShell(active, 'error');
+  void finishShell(active, 'error', descriptorOf(message));
 }
 
-async function finishShell(active, outcome) {
-  await invoke('finish_session', { generation: active.generation, outcome }, (error) => {
+function descriptorOf(value) {
+  if (value?.ui && typeof value.ui === 'object' && typeof value.ui.key === 'string') return value.ui;
+  if (value && typeof value === 'object' && typeof value.key === 'string') return value;
+  return null;
+}
+
+async function finishShell(active, outcome, error = null) {
+  await invoke('finish_session', { generation: active.generation, outcome, error }, (error) => {
     // A late failure cannot overwrite a newer take or bring a hidden pill back.
     if (session === active) render('error', { message: error });
   });

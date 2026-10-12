@@ -870,6 +870,10 @@ async fn handle_diagnostic_report(
 /* POST /api/transcribe                                                       */
 /* -------------------------------------------------------------------------- */
 
+fn batch_mode_allowed(pinned: &str, requested: &str) -> bool {
+    requested == pinned || (pinned == LIVE_MODE && requested == "smart")
+}
+
 async fn handle_transcribe(
     state: &Arc<AppState>,
     selected: &mut Option<RequestSnapshot>,
@@ -902,8 +906,9 @@ async fn handle_transcribe(
     }
     // A tagged recording belongs to the dictation that pinned it: asking for a
     // mode those settings do not have is a 409, never a licence to transcribe
-    // with whichever settings are current.
-    if request.session.is_some() && mode != request.snapshot.settings.mode {
+    // with whichever settings are current. The one exception is a Live
+    // dictation falling back to Smart for its whole recording.
+    if request.session.is_some() && !batch_mode_allowed(&request.snapshot.settings.mode, &mode) {
         return Err(mode_mismatch_error());
     }
 
@@ -1535,6 +1540,14 @@ mod tests {
     use super::*;
     use std::net::{SocketAddr, TcpStream};
 
+    #[test]
+    fn batch_modes_only_allow_the_pinned_mode_or_live_smart_fallback() {
+        assert!(batch_mode_allowed("live", "smart"));
+        assert!(!batch_mode_allowed("live", "verbatim"));
+        assert!(batch_mode_allowed("smart", "smart"));
+        assert!(!batch_mode_allowed("verbatim", "smart"));
+    }
+
     fn test_snapshot(language: Language, revision: u64, keys: crate::secrets::KeyRing) -> Arc<RuntimeSnapshot> {
         Arc::new(RuntimeSnapshot {
             settings: crate::settings::Settings {
@@ -1545,6 +1558,7 @@ mod tests {
                 language,
                 custom_vocabulary: Arc::default(),
                 dictation_languages: Arc::default(),
+                history_limit: crate::settings::DEFAULT_HISTORY_LIMIT,
             },
             keys: Arc::new(keys),
             revision,

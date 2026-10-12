@@ -246,6 +246,46 @@ body.settings-body [hidden] { display: none !important; }
 .settings-result-denied { border-color: var(--error-line); }
 .settings-result-denied .settings-result-text { color: var(--error); }
 
+/* Recording history: one row per dictation. The row is a card of the same
+   family as the key-check results, opened by its header and holding the player,
+   the text and the actions. */
+.history-row { display: block; min-width: 0; }
+.history-row-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.history-row-toggle {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 0;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  border-radius: 7px;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.history-row-toggle:focus-visible, .history-row .settings-button:focus-visible { outline: 3px solid var(--accent-text); outline-offset: 2px; }
+.history-glyph { flex: none; font-size: 15px; }
+.history-row[data-status="recognized"] .history-glyph { color: var(--accent-text); }
+.history-row[data-status="failed"] .history-glyph { color: var(--error); }
+.history-row[data-status="transcribing"] .history-glyph { color: var(--muted); }
+.history-time, .history-duration { color: var(--muted); flex: none; font-size: 12px; }
+.history-preview { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.history-row-head .history-retry { flex: none; padding: 6px 10px; font-size: 12px; }
+.history-row-body { padding: 10px 0 0; }
+.history-row-body audio { width: 100%; margin: 0 0 10px; }
+.history-text { white-space: pre-wrap; user-select: text; overflow-wrap: anywhere; margin: 0 0 10px; font-size: 13px; line-height: 1.55; }
+.history-more { flex: none; padding: 8px 12px; font-size: 13px; }
+.history-menu { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 0; padding: 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+.history-menu .settings-button { padding: 8px 12px; font-size: 13px; }
+.history-footer, .history-undo { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+.history-footer .settings-device-select { width: auto; max-width: 120px; }
+#history-clear { color: var(--error); }
+.history-undo { padding: 12px 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+#history-list { margin-top: 14px; }
+
 .settings-foot {
   border-top: 1px solid var(--line);
   padding: 14px 0 18px;
@@ -282,6 +322,8 @@ body.settings-body [hidden] { display: none !important; }
 
 @media (max-width: 550px) {
   .settings-shell { padding: 14px 14px 0; }
+  .history-row-head { flex-wrap: wrap; }
+  .history-preview { flex-basis: 100%; }
   .settings-shell h1 { font-size: 22px; margin: 8px 0 5px; }
   .settings-lead { font-size: 13px; }
   .settings-foot { padding: 12px 0 14px; }

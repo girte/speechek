@@ -12,10 +12,15 @@
 //!   wrapper feeds to the core, so the native tap, the emitted frames and the
 //!   relayed audio are one sample sequence;
 //! * the relay really forwards every frame to a real upstream socket; the
-//!   upstream's own boundaries (setup, an interim, a turn, the final tail, one
-//!   close) reach the journal as numbers, and the text those frames carried is
-//!   archived beside them complete - the interim, the final and the close
+//!   upstream's own boundaries (setup, the activity it opens, an interim, the
+//!   final of that speech, the turn, the end of each activity, the final tail,
+//!   one close) reach the journal as numbers, and the text those frames carried
+//!   is archived beside them complete - the interim, the finals and the close
 //!   detail the archive is read back for;
+//! * the take is long enough for the relay to rotate its own activity at the
+//!   forced limit, hold the audio that follows until the upstream ends that
+//!   activity and replay it into the next one, so not a frame of a recording
+//!   longer than the server's own ~220 s activity is lost;
 //! * the renderer's own report, result and errors included, is admitted over
 //!   the real loopback endpoint while the take is open, and its boundaries land
 //!   beside the native ones;
@@ -82,6 +87,15 @@ const FRAMES: u64 = 7_501;
 
 /// The samples those frames carry.
 const SAMPLES: u64 = 7_500 * 512 + 37;
+
+/// The sample rate the capture and the relay both work in, in Hz.
+const SAMPLE_RATE: u64 = 16_000;
+
+/// The transcript the fake upstream finalizes the interim's speech with, before
+/// the take reaches its first rotation. A real upstream finalizes speech it has
+/// heard; an activity that ends on an interim whose final never came is the
+/// incomplete case, not this one.
+const ACTIVITY_FINAL: &str = "synthetic activity final transcript";
 
 /// Source samples one batch may carry, so one batch emits at most 128 frames.
 const BATCH_SOURCE: usize = 128 * 512;
@@ -382,11 +396,31 @@ fn json_response(status: StatusCode, body: Value) -> Response {
 /* The fake upstream                                                          */
 /* -------------------------------------------------------------------------- */
 
-/// A Gemini-shaped Live socket: it confirms the setup, then answers the
-/// relayed audio with an interim transcript and a turn boundary mid-capture,
-/// sends the final tail when the recording ends and closes once. Nothing here
-/// is a second capture: every frame it receives is a frame the native capture
-/// produced.
+/// The bytes one base64 payload carries, its padding removed: what the frame
+/// really holds, so the fixture can name the audio offset it answers at.
+fn base64_bytes(base64: &str) -> usize {
+    let padding = base64
+        .as_bytes()
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'=')
+        .count();
+    base64.len() / 4 * 3 - padding
+}
+
+/// One audio offset in the shape the Live API announces it in: the seconds of
+/// audio the session has carried so far, as `"220.440s"`.
+fn offset_seconds(samples: u64) -> String {
+    format!("{:.3}s", samples as f64 / SAMPLE_RATE as f64)
+}
+
+/// A Gemini-shaped Live socket: it confirms the setup, opens the activity it is
+/// asked for, then answers the relayed audio with an interim transcript and the
+/// final that settles it, sends the end of every activity it is asked to close
+/// - naming the audio offset it ended at - and, once the whole recording has
+/// arrived and the take's own `activityEnd` follows it, the final tail and one
+/// close. Nothing here is a second capture: every frame it receives is a frame
+/// the native capture produced.
 async fn fake_upstream(listener: TcpListener) {
     let Ok((stream, _)) = listener.accept().await else {
         return;
@@ -395,6 +429,7 @@ async fn fake_upstream(listener: TcpListener) {
         return;
     };
     let mut audio = 0_u64;
+    let mut samples = 0_u64;
     while let Some(message) = socket.next().await {
         let Ok(message) = message else {
             return;
@@ -416,8 +451,12 @@ async fn fake_upstream(listener: TcpListener) {
                 .await;
             continue;
         }
-        if payload.pointer("/realtimeInput/audio").is_some() {
+        if let Some(data) = payload
+            .pointer("/realtimeInput/audio/data")
+            .and_then(Value::as_str)
+        {
             audio += 1;
+            samples += (base64_bytes(data) / 2) as u64;
             if audio == 8 {
                 let _ = socket
                     .send(UpstreamMessage::text(
@@ -427,29 +466,63 @@ async fn fake_upstream(listener: TcpListener) {
                     .await;
             }
             if audio == 16 {
+                // The speech the interim announced, finalized with the turn it
+                // belonged to: an activity may only end after this.
                 let _ = socket
                     .send(UpstreamMessage::text(
-                        json!({ "serverContent": { "turnComplete": true } }).to_string(),
+                        json!({ "serverContent": {
+                            "inputTranscription": { "text": ACTIVITY_FINAL },
+                            "turnComplete": true,
+                        } })
+                        .to_string(),
                     ))
                     .await;
             }
             continue;
         }
-        if payload.pointer("/realtimeInput/activityEnd").is_some() {
-            // The final tail, then the one close this session gets.
+        if payload.pointer("/realtimeInput/activityStart").is_some() {
+            // The activity the relay just opened, and the offset of the audio
+            // it is about to hear.
             let _ = socket
                 .send(UpstreamMessage::text(
-                    json!({ "serverContent": { "inputTranscription": { "text": FINAL } } })
-                        .to_string(),
+                    json!({ "voiceActivity": {
+                        "type": "ACTIVITY_START",
+                        "audioOffset": offset_seconds(samples),
+                    } })
+                    .to_string(),
                 ))
                 .await;
+            continue;
+        }
+        if payload.pointer("/realtimeInput/activityEnd").is_some() {
+            // The activity ends here, at the offset of the audio it carried.
+            // The take's own end is the one that arrives once every frame of
+            // the recording has: only that one carries the final tail and the
+            // one close this session gets.
             let _ = socket
-                .send(UpstreamMessage::Close(Some(CloseFrame {
-                    code: CloseCode::from(1000_u16),
-                    reason: CLOSE_REASON.into(),
-                })))
+                .send(UpstreamMessage::text(
+                    json!({ "voiceActivity": {
+                        "type": "ACTIVITY_END",
+                        "audioOffset": offset_seconds(samples),
+                    } })
+                    .to_string(),
+                ))
                 .await;
-            return;
+            if samples == SAMPLES {
+                let _ = socket
+                    .send(UpstreamMessage::text(
+                        json!({ "serverContent": { "inputTranscription": { "text": FINAL } } })
+                            .to_string(),
+                    ))
+                    .await;
+                let _ = socket
+                    .send(UpstreamMessage::Close(Some(CloseFrame {
+                        code: CloseCode::from(1000_u16),
+                        reason: CLOSE_REASON.into(),
+                    })))
+                    .await;
+                return;
+            }
         }
     }
 }
@@ -579,6 +652,7 @@ fn snapshot() -> Arc<RuntimeSnapshot> {
                 "Kubernetes".to_owned(),
             ]),
             dictation_languages: Arc::from(vec!["ru-RU".to_owned(), "en-US".to_owned()]),
+            history_limit: crate::settings::DEFAULT_HISTORY_LIMIT,
         },
         keys: Arc::new(KeyRing::new(
             PINNED_KEYS
@@ -1110,6 +1184,17 @@ fn verify_journal(dir: &Path) {
     assert_eq!(last["client_pcm_bytes"], SAMPLES * 2);
     assert_eq!(last["upstream_sent_frames"], FRAMES);
     assert_eq!(last["upstream_pcm_bytes"], SAMPLES * 2);
+    // The take is longer than the server's own activity, so the relay closed
+    // its first activity at the forced limit and the frames that followed it
+    // were replayed into the next one: every frame still crossed the socket
+    // exactly once, as the counters above say.
+    let rotations = events(&records, "activity_rotate");
+    assert_eq!(rotations.len(), 1, "one rotation in this take");
+    let rotation = &rotations[0]["data"];
+    assert_eq!(rotation["index"], 1, "the first activity is the one rotated");
+    assert_eq!(rotation["reason"], "limit", "{rotation}");
+    assert_eq!(rotation["activity_audio_ms"], 200_000, "{rotation}");
+    assert_eq!(rotation["replayed_frames"], 0, "{rotation}");
     assert_eq!(last["send_failures"], 0);
     assert!(last["received_messages"].as_u64().unwrap_or(0) >= 3);
     assert!(last["interim_count"].as_u64().unwrap_or(0) >= 1);
@@ -1381,9 +1466,10 @@ fn verify_content(dir: &Path) {
             "no {kind} record carries its text: {all:?}"
         );
     };
-    // Both transcripts the fake upstream sent, whole, in the records of the
+    // Every transcript the fake upstream sent, whole, in the records of the
     // frames that carried them.
     describing("live_message", INTERIM);
+    describing("live_message", ACTIVITY_FINAL);
     describing("live_message", FINAL);
     // And the same text as the take handed it to the browser.
     assert!(

@@ -21,6 +21,9 @@
  *                           rendered in the language current at that moment;
  *                           `ui` is the `{ key, args }` descriptor pages keep to
  *                           re-render the same report after a language change.
+ * With `liveFallback`, transport/service failures stay deferred until stop's
+ * whole-take Smart request completes. A confirmed silent Live `done` remains
+ * an immediate no-text report; it does not trigger a batch request.
  *
  * `start`, `stop`, `acceptPcmChunk` and `dispose` are the whole surface. `stop`
  * is what produces the text; `dispose` is the opposite: it drops the take and
@@ -42,6 +45,7 @@ const LIVE_URL = '/api/live';
 const TRANSCRIBE_URL = '/api/transcribe';
 
 const LIVE_MODE = 'live';
+const LIVE_FALLBACK_MODE = 'smart';
 const BATCH_MODES = ['smart', 'verbatim'];
 const VALID_MODES = new Set([LIVE_MODE, ...BATCH_MODES]);
 /** Every mode a session may run, in the order its results belong in. */
@@ -175,6 +179,8 @@ export function createRecorder(handlers = {}) {
   let queue = [];
   let ready = false;
   let liveFailed = false;
+  let liveFallback = false;
+  let deferredLive = null;
   let liveFinal = [];
   let liveInterim = '';
   let liveFinish = null;
@@ -218,6 +224,12 @@ export function createRecorder(handlers = {}) {
     if (!disposed) onError(name, message, ui);
   }
 
+  function liveFailure(ui, diagnostic = '') {
+    liveFailed = true;
+    if (liveFallback) deferredLive ??= { ui, diagnostic };
+    else reportError(LIVE_MODE, ui, diagnostic);
+  }
+
   function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
@@ -242,9 +254,18 @@ export function createRecorder(handlers = {}) {
     return btoa(binary);
   }
 
+  function sendLive(message) {
+    if (socket?.readyState !== WebSocket.OPEN || liveFailed || disposed) return;
+    try {
+      socket.send(JSON.stringify(message));
+    } catch (cause) {
+      liveFailure(uiMsg('RecorderLiveConnectionFailed'), diagnosticOf(cause));
+      finishLive();
+    }
+  }
+
   function sendAudio(chunk) {
-    if (socket?.readyState !== WebSocket.OPEN) return;
-    socket.send(JSON.stringify({ type: 'audio', data: bytesToBase64(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)) }));
+    sendLive({ type: 'audio', data: bytesToBase64(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)) });
   }
 
   function sendOrQueue(chunk) {
@@ -258,13 +279,12 @@ export function createRecorder(handlers = {}) {
     }
     queue = [];
     ready = false;
-    liveFailed = true;
-    reportError(LIVE_MODE, uiMsg('RecorderLiveServerTimeout'));
+    liveFailure(uiMsg('RecorderLiveServerTimeout'));
     socket?.close();
   }
 
   function liveEnd() {
-    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'end' }));
+    sendLive({ type: 'end' });
   }
 
   function finishLive() {
@@ -274,16 +294,25 @@ export function createRecorder(handlers = {}) {
     if (finish) finish();
   }
 
-  function openLive() {
+  function openLive(options) {
     ready = false;
     queue = [];
     liveFailed = false;
+    liveFallback = options?.liveFallback === true;
+    deferredLive = null;
     liveFinal = [];
     liveInterim = '';
     liveDone = new Promise((resolve) => { liveFinish = resolve; });
-    socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}${withSession(LIVE_URL)}`);
-    socket.onopen = () => socket.send(JSON.stringify({ type: 'start', mode: 'smart' }));
+    try {
+      socket = new WebSocket(`${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}${withSession(LIVE_URL)}`);
+    } catch (cause) {
+      liveFailure(uiMsg('RecorderLiveConnectionFailed'), diagnosticOf(cause));
+      finishLive();
+      return;
+    }
+    socket.onopen = () => sendLive({ type: 'start', mode: 'smart' });
     socket.onmessage = (event) => {
+      if (disposed || liveFailed) return;
       let message;
       try { message = JSON.parse(event.data); } catch { return; }
       if (message.type === 'ready') {
@@ -301,12 +330,11 @@ export function createRecorder(handlers = {}) {
         liveInterim = '';
         onFinal(LIVE_MODE, liveFinal.filter(Boolean).join(' '));
       } else if (message.type === 'error') {
-        liveFailed = true;
         ready = false;
         queue = [];
         const structured = isDescriptor(message.ui) ? message.ui : null;
         const raw = typeof message.message === 'string' && message.message ? message.message : '';
-        reportError(LIVE_MODE, structured ?? uiMsg('RecorderLiveServiceError', {
+        liveFailure(structured ?? uiMsg('RecorderLiveServiceError', {
           detail: raw || uiMsg('RecorderLiveServiceUnknown'),
         }), raw);
         finishLive();
@@ -318,15 +346,13 @@ export function createRecorder(handlers = {}) {
       }
     };
     socket.onerror = () => {
-      liveFailed = true;
-      reportError(LIVE_MODE, uiMsg('RecorderLiveConnectionFailed'));
+      liveFailure(uiMsg('RecorderLiveConnectionFailed'));
       finishLive();
     };
     socket.onclose = () => {
       ready = false;
       if (!liveFinish) return;
-      liveFailed = true;
-      reportError(LIVE_MODE, uiMsg('RecorderLiveInterrupted'));
+      liveFailure(uiMsg('RecorderLiveInterrupted'));
       finishLive();
     };
   }
@@ -338,7 +364,7 @@ export function createRecorder(handlers = {}) {
   function ingest(chunk) {
     if (disposed) return;
     samples += chunk.length;
-    if (needsBatch) chunks.push(chunk);
+    if (chunks !== null) chunks.push(chunk);
     if (!processor) {
       // External frames carry their own level: peak per ~33 ms window.
       let peak = levelPeak;
@@ -354,7 +380,7 @@ export function createRecorder(handlers = {}) {
         emitLevel(peak / PCM16_PEAK);
       }
     }
-    if (needsLive) sendOrQueue(chunk);
+    if (needsLive && !liveFailed) sendOrQueue(chunk);
   }
 
   function handleWorklet(data) {
@@ -396,6 +422,10 @@ export function createRecorder(handlers = {}) {
     socket = null;
     ready = false;
     if (!closing) return;
+    closing.onopen = null;
+    closing.onmessage = null;
+    closing.onerror = null;
+    closing.onclose = null;
     try {
       closing.close();
     } catch { /* already closing */ }
@@ -454,11 +484,13 @@ export function createRecorder(handlers = {}) {
     needsBatch = modes.some((name) => name !== LIVE_MODE);
     const external = options?.external === true;
 
-    chunks = needsBatch ? [] : null;
+    liveFallback = options?.liveFallback === true;
+    chunks = (needsBatch || (needsLive && liveFallback)) ? [] : null;
     samples = 0;
     queue = [];
     ready = false;
     liveFailed = false;
+    deferredLive = null;
     liveFinal = [];
     liveInterim = '';
     errors = {};
@@ -498,7 +530,7 @@ export function createRecorder(handlers = {}) {
       if (pending === mine) pending = null;
 
       setState('recording');
-      if (needsLive) openLive();
+      if (needsLive) openLive(options);
       // The microphone path owns the ten-minute cap. An external host (native cpal
       // capture) runs its own timer, drains its tail and then calls stop(), so the
       // recorder must not cut the take short underneath it.
@@ -591,11 +623,13 @@ export function createRecorder(handlers = {}) {
       if (disposed) return emptyResult();
       if (needsLive) {
         if (ready && socket?.readyState === WebSocket.OPEN) liveEnd();
-        else if (socket?.readyState !== WebSocket.OPEN) finishLive();
+        else if (socket?.readyState !== WebSocket.OPEN) {
+          if (liveFinish) liveFailure(uiMsg('RecorderLiveInterrupted'));
+          finishLive();
+        }
         await Promise.race([liveDone, delay(LIVE_DRAIN_MS)]);
         if (liveFinish) {
-          liveFailed = true;
-          reportError(LIVE_MODE, uiMsg('RecorderLiveTimeout'));
+          liveFailure(uiMsg('RecorderLiveTimeout'));
           finishLive();
         }
         await closeSocket();
@@ -606,6 +640,17 @@ export function createRecorder(handlers = {}) {
       if (samples < MIN_SAMPLES) {
         reportError('', uiMsg('RecorderTooShort'));
         return { results, errors, errorDetails };
+      }
+
+      if (needsLive && liveFallback && liveFailed) {
+        const outcome = await transcribe(LIVE_FALLBACK_MODE, makeWave());
+        if (disposed) return emptyResult();
+        if (outcome.text) {
+          results.live = outcome.text;
+          onFinal(LIVE_MODE, outcome.text);
+        } else if (!outcome.aborted) {
+          reportError(LIVE_MODE, outcome.ui, outcome.diagnostic);
+        }
       }
 
       if (needsBatch) {
@@ -634,6 +679,10 @@ export function createRecorder(handlers = {}) {
       samples = 0;
       queue = [];
       liveInterim = '';
+      liveFallback = false;
+      liveFailed = false;
+      deferredLive = null;
+      liveFinal = [];
       emitLevel(0);
       await closeSocket();
       await closeContext();
@@ -649,7 +698,9 @@ export function createRecorder(handlers = {}) {
    * Idempotent while a session is arming or recording.
    * `modes` is the exact set of transcriptions a take produces - one entry for
    * an ordinary dictation, all three for the laboratory - in canonical order
-   * live, smart, verbatim; no other mode is ever sent.
+   * live, smart, verbatim.
+   * `liveFallback: true` retains the whole take and retries failed Live with
+   * Smart, publishing its text as the Live result rather than a partial stream.
    * `external: true` skips the microphone; the host then feeds `acceptPcmChunk`.
    * `sessionId`, when given, tags every request of the take with the session the
    * desktop shell pinned its settings to.
@@ -702,6 +753,11 @@ export function createRecorder(handlers = {}) {
     chunks = null;
     samples = 0;
     queue = [];
+    liveFallback = false;
+    liveFailed = false;
+    deferredLive = null;
+    liveFinal = [];
+    liveInterim = '';
     emitLevel(0);
     setState('idle');
     disposed = true;

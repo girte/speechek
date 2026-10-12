@@ -3,8 +3,9 @@
 //!
 //! The whole module exists only in a debug build with the `dev-diagnostics`
 //! feature (see the `mod diagnostics` gate and the `compile_error!` in
-//! `lib.rs`), so a released executable cannot contain a writer, a codec or an
-//! asset for this.
+//! `lib.rs`), so a released executable cannot contain a writer or an asset for
+//! this. The FLAC codec the archive writes with is [`crate::flac`], which every
+//! build carries.
 //!
 //! What lives in this file is the producer half:
 //!
@@ -30,7 +31,6 @@
 //! Counter events remain a closed numeric vocabulary. Development content
 //! records also preserve full provider, recorder and paste evidence, redacted
 //! at the boundary before it enters this same bounded writer.
-mod flac;
 mod storage;
 mod content;
 pub(crate) mod redaction;
@@ -51,6 +51,7 @@ use std::time::{Duration, Instant, SystemTime};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
+use crate::flac;
 use crate::i18n::MessageId;
 
 /// Audio packets a running take may have in flight before its producer starts
@@ -316,14 +317,15 @@ impl ReceiveFlags {
     }
 }
 
-/// The real reason a request ended; `TAIL_GRACE` is not a new final.
+/// The real reason a request ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestCause {
     ClientEnd,
     ClientCancel,
     ReadyTimeout,
-    TailGrace,
+    ActivityIncomplete,
+    RotateTimeout,
     FinalReceived,
     IdleTimeout,
     HardDeadline,
@@ -365,6 +367,16 @@ pub enum DiagnosticCode {
     InvalidReport,
     MissingTerminal,
     Unknown,
+}
+
+impl From<flac::FlacError> for DiagnosticCode {
+    fn from(error: flac::FlacError) -> Self {
+        match error {
+            flac::FlacError::Codec => Self::Codec,
+            flac::FlacError::Decode => Self::Decode,
+            flac::FlacError::HashMismatch => Self::HashMismatch,
+        }
+    }
 }
 
 impl DiagnosticCode {
@@ -501,6 +513,26 @@ pub struct UpstreamBoundary {
     pub time_left_us: Option<u64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RotateReason {
+    Pause,
+    Limit,
+    ServerCut,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) struct ActivityRotate {
+    pub(crate) index: u32,
+    pub(crate) reason: RotateReason,
+    pub(crate) activity_audio_ms: u64,
+    pub(crate) pause_ms: u32,
+    pub(crate) wait_us: u64,
+    pub(crate) held_frames: u32,
+    pub(crate) replayed_frames: u32,
+}
+
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct SendBegin {
     pub kind: SendKind,
@@ -530,6 +562,7 @@ pub struct BatchStage {
 pub enum DeadlineTimer {
     Ready,
     Final,
+    Rotate,
     Settle,
     Hard,
     Idle,
@@ -620,6 +653,7 @@ pub enum Event {
     RendererBoundary(RendererBoundary),
     RelaySnapshot(RelayCounters),
     UpstreamBoundary(UpstreamBoundary),
+    ActivityRotate(ActivityRotate),
     SendBegin(SendBegin),
     SendEnd(SendEnd),
     BatchStage(BatchStage),
@@ -1871,6 +1905,11 @@ impl RequestTrace {
                 time_left_us: time_left.map(|left| left.as_micros() as u64),
             }),
         );
+    }
+
+    /// A completed activity rotation and the audio held or replayed across it.
+    pub(crate) fn activity_rotate(&self, rotation: ActivityRotate) {
+        self.state.entry.push_event(Some(self.state.id), Event::ActivityRotate(rotation));
     }
 
     /// The deadline that actually expired, distinct from its terminal cause.

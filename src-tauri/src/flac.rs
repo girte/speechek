@@ -1,10 +1,19 @@
-//! The streaming FLAC codec of the development diagnostics: the lossless
-//! archive of the take's PCM16 16 kHz mono stream, and its independent check.
+//! The shell's FLAC codec: the lossless archive of a PCM16 16 kHz mono stream,
+//! its independent check, and the in-memory pair [`encode_pcm`]/[`decode_pcm`].
 //!
-//! Everything here is memory-only and disk-free: the encoder stages one fixed
-//! block at a time and hands each encoded frame to a [`FrameCommit`], which is
-//! where the storage half admits it against the quota and writes it. Nothing
-//! accumulates a whole recording, and no `Vec<i32>` of the take ever exists.
+//! Two shapes of the same encoder:
+//!
+//! * [`FlacEncoder`] is the streaming one the Development archive writes a take
+//!   with. Everything there is memory-only and disk-free: it stages one fixed
+//!   block at a time and hands each encoded frame to a [`FrameCommit`], which is
+//!   where the storage half admits it against the quota and writes it. Nothing
+//!   accumulates a whole recording, and no `Vec<i32>` of the take ever exists.
+//! * [`encode_pcm`] encodes a whole take in memory and returns the complete file
+//!   as bytes; [`decode_pcm`] turns such a file back into the PCM it holds. Both
+//!   check what they produced or read before they hand it back.
+//!
+//! Nothing here knows the diagnostics: a step fails with a [`FlacError`], and
+//! the caller maps it onto its own class.
 //!
 //! The layout is the one the archive's own reader expects:
 //!
@@ -46,7 +55,7 @@
 //!   <https://docs.rs/flacenc/0.5.1/flacenc/component/trait.BitRepr.html> —
 //!   `Frame::write`/`Stream::write`.
 //! * <https://docs.rs/claxon/0.4.3/claxon/struct.FlacReader.html> —
-//!   `streaminfo()`, `blocks()`;
+//!   `new(reader)`, `streaminfo()` (the metadata by value), `blocks()`;
 //!   <https://docs.rs/claxon/0.4.3/claxon/frame/struct.Block.html> —
 //!   `duration()`, `channels()`, `time()`, `channel()`, `into_buffer()`, so one
 //!   buffer decodes every block;
@@ -72,7 +81,19 @@ use flacenc::config;
 use flacenc::error::{Verified, Verify};
 use flacenc::source::{Context, Fill, FrameBuf};
 
-use super::DiagnosticCode;
+/// What a codec step failed with. The module is shared, so it names the failure
+/// in its own terms and the caller maps it onto its own class.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlacError {
+    /// The input is not whole samples, or the encoder could not produce a frame
+    /// for it.
+    Codec,
+    /// The stream is not the layout this codec writes: a malformed file, a
+    /// wrong block boundary, a sample out of range or a count that disagrees.
+    Decode,
+    /// The stream's digest does not match the samples that came out of it.
+    HashMismatch,
+}
 
 /// Sampling rate of the archived stream, in Hz.
 pub(crate) const SAMPLE_RATE: usize = 16_000;
@@ -89,13 +110,31 @@ pub(crate) const BLOCK_BYTES: usize = BLOCK_SAMPLES * BYTES_PER_SAMPLE;
 
 const ZERO_MD5: [u8; 16] = [0; 16];
 
-/// Where one encoded frame goes. The storage half implements this with the
-/// exact quota admission and the file write; the tests with a byte vector. The
-/// encoder calls it *before* it counts the frame: a frame whose commit fails is
-/// never part of the take's own statistics, so what the take reports is exactly
-/// what the file holds.
+/// Where one encoded frame goes. The archive's storage half implements this with
+/// the exact quota admission and the file write, and its own error class; the
+/// in-memory path with a byte vector. The encoder calls it *before* it counts
+/// the frame: a frame whose commit fails is never part of the take's own
+/// statistics, so what the take reports is exactly what the file holds.
 pub(crate) trait FrameCommit {
-    fn write_frame(&mut self, encoded: &[u8]) -> Result<(), DiagnosticCode>;
+    /// The failure the committing half reports: its own class, which has to
+    /// accept the codec's, because everything the encoder itself fails with
+    /// reaches the caller through it.
+    type Error: From<FlacError>;
+
+    fn write_frame(&mut self, encoded: &[u8]) -> Result<(), Self::Error>;
+}
+
+/// The in-memory [`FrameCommit`]: the frames are appended to the byte vector
+/// the caller keeps, and appending cannot fail.
+struct MemoryCommit<'a>(&'a mut Vec<u8>);
+
+impl FrameCommit for MemoryCommit<'_> {
+    type Error = FlacError;
+
+    fn write_frame(&mut self, encoded: &[u8]) -> Result<(), Self::Error> {
+        self.0.extend_from_slice(encoded);
+        Ok(())
+    }
 }
 
 /// What a finished encoder produced: the same-size header that has to replace
@@ -129,17 +168,17 @@ impl FlacEncoder {
     /// A fresh encoder for 16 kHz mono PCM16, 2048 samples per block. The
     /// working stream information starts at the stream's format and the block
     /// bounds, with no frame committed yet.
-    pub(crate) fn new() -> Result<Self, DiagnosticCode> {
+    pub(crate) fn new() -> Result<Self, FlacError> {
         let config = config::Encoder::default()
             .into_verified()
-            .map_err(|_| DiagnosticCode::Codec)?;
+            .map_err(|_| FlacError::Codec)?;
         let frame_buf = FrameBuf::with_size(CHANNELS, BLOCK_SAMPLES)
-            .map_err(|_| DiagnosticCode::Codec)?;
+            .map_err(|_| FlacError::Codec)?;
         let mut stream_info = StreamInfo::new(SAMPLE_RATE, CHANNELS, BITS_PER_SAMPLE)
-            .map_err(|_| DiagnosticCode::Codec)?;
+            .map_err(|_| FlacError::Codec)?;
         stream_info
             .set_block_sizes(BLOCK_SAMPLES, BLOCK_SAMPLES)
-            .map_err(|_| DiagnosticCode::Codec)?;
+            .map_err(|_| FlacError::Codec)?;
         // The working stats keep the constructor's frame-size sentinel: the
         // minimum starts at `u32::MAX` and every `update_frame_info` lowers it,
         // so the patched header carries the smallest and largest frame really
@@ -170,11 +209,17 @@ impl FlacEncoder {
     }
 
     /// How many inter-channel samples have really been committed.
+    ///
+    /// Only the development archive and this module's own tests read the
+    /// running counts: the codec is part of every build, its progress
+    /// accounting is not.
+    #[cfg(any(test, all(debug_assertions, feature = "dev-diagnostics")))]
     pub(crate) fn samples(&self) -> u64 {
         self.samples
     }
 
     /// How many frames have really been committed.
+    #[cfg(any(test, all(debug_assertions, feature = "dev-diagnostics")))]
     pub(crate) fn frames(&self) -> u64 {
         self.frames
     }
@@ -186,9 +231,9 @@ impl FlacEncoder {
         &mut self,
         pcm: &[u8],
         commit: &mut C,
-    ) -> Result<(), DiagnosticCode> {
+    ) -> Result<(), C::Error> {
         if pcm.len() % BYTES_PER_SAMPLE != 0 {
-            return Err(DiagnosticCode::Codec);
+            return Err(FlacError::Codec.into());
         }
         let mut rest = pcm;
         while !rest.is_empty() {
@@ -212,18 +257,18 @@ impl FlacEncoder {
     pub(crate) fn finish<C: FrameCommit>(
         &mut self,
         commit: &mut C,
-    ) -> Result<Finished, DiagnosticCode> {
+    ) -> Result<Finished, C::Error> {
         self.encode_block(commit)?;
         let mut info = self.stream_info.clone();
         info.set_block_sizes(BLOCK_SAMPLES, BLOCK_SAMPLES)
-            .map_err(|_| DiagnosticCode::Codec)?;
+            .map_err(|_| FlacError::Codec)?;
         info.set_total_samples(self.samples as usize);
         info.set_md5_digest(&self.context.md5_digest());
         let header = serialize_header(&info)?;
         if header.len() != self.header.len() {
             // The patch is an in-place overwrite: a header that changed size
             // would leave the frame it already wrote unreadable.
-            return Err(DiagnosticCode::Codec);
+            return Err(FlacError::Codec.into());
         }
         Ok(Finished {
             header,
@@ -235,7 +280,7 @@ impl FlacEncoder {
     /// One block: encode it, hand it to the commit, and only count it once the
     /// commit returned. The frame number is the compression-block index the
     /// fixed blocking strategy requires — never the capture's own sequence.
-    fn encode_block<C: FrameCommit>(&mut self, commit: &mut C) -> Result<(), DiagnosticCode> {
+    fn encode_block<C: FrameCommit>(&mut self, commit: &mut C) -> Result<(), C::Error> {
         let filled = self.staged_filled;
         if filled == 0 {
             // An empty block cannot be encoded: the block-size specification
@@ -244,27 +289,27 @@ impl FlacEncoder {
         }
         self.frame_buf
             .fill_le_bytes(&self.staged[..filled], BYTES_PER_SAMPLE)
-            .map_err(|_| DiagnosticCode::Codec)?;
+            .map_err(|_| FlacError::Codec)?;
         let frame = flacenc::encode_fixed_size_frame(
             &self.config,
             &self.frame_buf,
             self.frames as usize,
             &self.stream_info,
         )
-        .map_err(|_| DiagnosticCode::Codec)?;
+        .map_err(|_| FlacError::Codec)?;
         self.sink.clear();
         frame
             .write(&mut self.sink)
-            .map_err(|_| DiagnosticCode::Codec)?;
+            .map_err(|_| FlacError::Codec)?;
         if self.sink.len() % 8 != 0 {
-            return Err(DiagnosticCode::Codec);
+            return Err(FlacError::Codec.into());
         }
         commit.write_frame(self.sink.as_slice())?;
         // The frame is on its way to the file: now it is part of the stream.
         self.stream_info.update_frame_info(&frame);
         self.context
             .fill_le_bytes(&self.staged[..filled], BYTES_PER_SAMPLE)
-            .map_err(|_| DiagnosticCode::Codec)?;
+            .map_err(|_| FlacError::Codec)?;
         self.frames += 1;
         self.samples += (filled / (BYTES_PER_SAMPLE * CHANNELS)) as u64;
         self.staged_filled = 0;
@@ -274,12 +319,12 @@ impl FlacEncoder {
 
 /// Serializes `fLaC` and one last STREAMINFO block. 42 bytes, always: the
 /// patched header is written over the previous one in place.
-fn serialize_header(info: &StreamInfo) -> Result<Vec<u8>, DiagnosticCode> {
+fn serialize_header(info: &StreamInfo) -> Result<Vec<u8>, FlacError> {
     let stream = Stream::with_stream_info(info.clone());
     let mut sink = ByteSink::new();
     stream
         .write(&mut sink)
-        .map_err(|_| DiagnosticCode::Codec)?;
+        .map_err(|_| FlacError::Codec)?;
     Ok(sink.as_slice().to_vec())
 }
 
@@ -287,12 +332,12 @@ fn serialize_header(info: &StreamInfo) -> Result<Vec<u8>, DiagnosticCode> {
 /// frame sizes, zero samples and a zero digest. The working `StreamInfo` keeps
 /// its own sentinels, so this is always a copy — a header a reader may parse,
 /// and never a claim about audio.
-fn initial_header_info(working: &StreamInfo) -> Result<StreamInfo, DiagnosticCode> {
+fn initial_header_info(working: &StreamInfo) -> Result<StreamInfo, FlacError> {
     let mut info = working.clone();
     info.set_frame_sizes(0, 0)
-        .map_err(|_| DiagnosticCode::Codec)?;
+        .map_err(|_| FlacError::Codec)?;
     info.set_block_sizes(BLOCK_SAMPLES, BLOCK_SAMPLES)
-        .map_err(|_| DiagnosticCode::Codec)?;
+        .map_err(|_| FlacError::Codec)?;
     info.set_total_samples(0);
     info.set_md5_digest(&ZERO_MD5);
     Ok(info)
@@ -312,28 +357,29 @@ pub(crate) fn verify<R: Read>(
     reader: R,
     samples: u64,
     md5: &[u8; 16],
-) -> Result<(), DiagnosticCode> {
+) -> Result<(), FlacError> {
     walk(reader, samples, *md5, |_, _| Ok(()))
 }
 
-#[cfg(all(test, debug_assertions, feature = "dev-diagnostics"))]
-/// The same check with the strongest comparison the archive can make: the
-/// digest is recomputed over the PCM the caller says was committed, and every
-/// decoded sample has to equal that PCM in order. The tests use this; the
-/// writer cannot, because it deliberately never keeps a whole take's PCM.
+/// The same check with the strongest comparison there is: the digest is
+/// recomputed over the PCM the caller says was committed, and every decoded
+/// sample has to equal that PCM in order. The tests use it; nothing in the
+/// shell may, because the streaming writer deliberately never keeps a whole
+/// take's PCM and the in-memory encode is checked by [`verify`] instead.
+#[cfg(test)]
 pub(crate) fn verify_pcm<R: Read>(
     reader: R,
     samples: u64,
     pcm_le: &[u8],
-) -> Result<(), DiagnosticCode> {
+) -> Result<(), FlacError> {
     if pcm_le.len() % BYTES_PER_SAMPLE != 0 || pcm_le.len() / BYTES_PER_SAMPLE != samples as usize
     {
-        return Err(DiagnosticCode::Decode);
+        return Err(FlacError::Decode);
     }
     let mut context = Context::new(BITS_PER_SAMPLE, CHANNELS);
     context
         .fill_le_bytes(pcm_le, BYTES_PER_SAMPLE)
-        .map_err(|_| DiagnosticCode::Codec)?;
+        .map_err(|_| FlacError::Codec)?;
     let md5 = context.md5_digest();
     let mut checked = 0usize;
     walk(reader, samples, md5, |_, value| {
@@ -342,13 +388,13 @@ pub(crate) fn verify_pcm<R: Read>(
         let at = checked * BYTES_PER_SAMPLE;
         checked += 1;
         let Some(pair) = pcm_le.get(at..at + BYTES_PER_SAMPLE) else {
-            return Err(DiagnosticCode::Decode);
+            return Err(FlacError::Decode);
         };
         let expected = i16::from_le_bytes([pair[0], pair[1]]) as i32;
         if expected == value {
             Ok(())
         } else {
-            Err(DiagnosticCode::Decode)
+            Err(FlacError::Decode)
         }
     })
 }
@@ -362,9 +408,9 @@ fn walk<R: Read>(
     reader: R,
     samples: u64,
     md5: [u8; 16],
-    mut want: impl FnMut(usize, i32) -> Result<(), DiagnosticCode>,
-) -> Result<(), DiagnosticCode> {
-    let mut reader = FlacReader::new(reader).map_err(|_| DiagnosticCode::Decode)?;
+    mut want: impl FnMut(usize, i32) -> Result<(), FlacError>,
+) -> Result<(), FlacError> {
+    let mut reader = FlacReader::new(reader).map_err(|_| FlacError::Decode)?;
     let info = reader.streaminfo();
     if info.sample_rate != SAMPLE_RATE as u32
         || info.channels != CHANNELS as u32
@@ -372,7 +418,7 @@ fn walk<R: Read>(
         || info.min_block_size != BLOCK_SAMPLES as u16
         || info.max_block_size != BLOCK_SAMPLES as u16
     {
-        return Err(DiagnosticCode::Decode);
+        return Err(FlacError::Decode);
     }
     // claxon's own metadata check only requires `min <= max`, and it models both
     // frame sizes as optional. A missing one is the zero sentinel of the initial
@@ -380,13 +426,13 @@ fn walk<R: Read>(
     // the pair must be ordered.
     match (info.min_frame_size, info.max_frame_size) {
         (Some(min), Some(max)) if min > 0 && max > 0 && min <= max => {}
-        _ => return Err(DiagnosticCode::Decode),
+        _ => return Err(FlacError::Decode),
     }
     if info.samples != Some(samples) {
-        return Err(DiagnosticCode::Decode);
+        return Err(FlacError::Decode);
     }
     if info.md5sum != md5 {
-        return Err(DiagnosticCode::HashMismatch);
+        return Err(FlacError::HashMismatch);
     }
     let full_blocks = samples / BLOCK_SAMPLES as u64;
     let tail = samples % BLOCK_SAMPLES as u64;
@@ -401,7 +447,7 @@ fn walk<R: Read>(
     loop {
         let Some(block) = blocks
             .read_next_or_eof(buffer)
-            .map_err(|_| DiagnosticCode::Decode)?
+            .map_err(|_| FlacError::Decode)?
         else {
             break;
         };
@@ -411,7 +457,7 @@ fn walk<R: Read>(
             || duration > BLOCK_SAMPLES as u64
             || previous_short
         {
-            return Err(DiagnosticCode::Decode);
+            return Err(FlacError::Decode);
         }
         // claxon derives a fixed-block frame's time as `block_size *
         // frame_number` — the frame's OWN block size, per its
@@ -421,7 +467,7 @@ fn walk<R: Read>(
         // frame's own position: a frame numbered past its place fails, the
         // short tail included.
         if block.time() != frames * duration {
-            return Err(DiagnosticCode::Decode);
+            return Err(FlacError::Decode);
         }
         // The layout is exactly the fixed blocking the archive claims: full
         // blocks, then at most one short final block of the real tail.
@@ -430,33 +476,77 @@ fn walk<R: Read>(
         } else if decoded + duration == samples {
             tail
         } else {
-            return Err(DiagnosticCode::Decode);
+            return Err(FlacError::Decode);
         };
         if duration != expected {
-            return Err(DiagnosticCode::Decode);
+            return Err(FlacError::Decode);
         }
         let values = block.channel(0);
         for (offset, &value) in values.iter().enumerate() {
             if !(-32_768..=32_767).contains(&value) {
-                return Err(DiagnosticCode::Decode);
+                return Err(FlacError::Decode);
             }
             want((decoded + offset as u64) as usize, value)?;
         }
         context
             .fill_interleaved(values)
-            .map_err(|_| DiagnosticCode::Codec)?;
+            .map_err(|_| FlacError::Codec)?;
         decoded += duration;
         frames += 1;
         previous_short = duration != BLOCK_SAMPLES as u64;
         buffer = block.into_buffer();
     }
     if frames == 0 || frames != expected_frames || decoded != samples {
-        return Err(DiagnosticCode::Decode);
+        return Err(FlacError::Decode);
     }
     if context.md5_digest() != md5 {
-        return Err(DiagnosticCode::HashMismatch);
+        return Err(FlacError::HashMismatch);
     }
     Ok(())
+}
+
+/// Encodes a whole take that is already in memory: the header, the frames and
+/// the in-place patch the streaming encoder writes to a file, returned as
+/// bytes. Only whole samples are accepted: a stream with no samples is not
+/// audio, and a trailing odd byte would silently change every following sample.
+///
+/// What comes back is checked before it is handed over: the independent decoder
+/// reads it, and the stream's own sample count and digest have to agree with
+/// the samples that really came out. A file this function returns is one
+/// [`decode_pcm`] reads back.
+pub(crate) fn encode_pcm(pcm_le: &[u8]) -> Result<Vec<u8>, FlacError> {
+    if pcm_le.is_empty() || pcm_le.len() % BYTES_PER_SAMPLE != 0 {
+        return Err(FlacError::Codec);
+    }
+    let mut encoder = FlacEncoder::new()?;
+    let mut bytes = encoder.initial_header().to_vec();
+    let header_len = bytes.len();
+    encoder.push_pcm(pcm_le, &mut MemoryCommit(&mut bytes))?;
+    let finished = encoder.finish(&mut MemoryCommit(&mut bytes))?;
+    // The patch goes over the header the file was opened with, in place: the
+    // encoder refuses to hand back one of another length.
+    bytes[..header_len].copy_from_slice(&finished.header);
+    verify(&bytes[..], finished.samples, &finished.md5)?;
+    Ok(bytes)
+}
+
+/// Decodes a whole FLAC stream that is already in memory back into the
+/// little-endian PCM16 it holds, and checks it while it does: the stream's own
+/// sample count and digest have to agree with the samples that really came out,
+/// and the layout has to be the one this codec writes. A stream whose header
+/// claims a digest its samples do not hash to fails instead of being returned.
+pub(crate) fn decode_pcm(stream: &[u8]) -> Result<Vec<u8>, FlacError> {
+    let info = FlacReader::new(stream)
+        .map_err(|_| FlacError::Decode)?
+        .streaminfo();
+    let samples = info.samples.ok_or(FlacError::Decode)?;
+    let mut pcm = Vec::new();
+    walk(stream, samples, info.md5sum, |_, value| {
+        // `walk` has already refused anything outside the 16-bit range.
+        pcm.extend_from_slice(&(value as i16).to_le_bytes());
+        Ok(())
+    })?;
+    Ok(pcm)
 }
 
 #[cfg(test)]
@@ -484,7 +574,9 @@ mod tests {
     }
 
     impl FrameCommit for Bytes {
-        fn write_frame(&mut self, encoded: &[u8]) -> Result<(), DiagnosticCode> {
+        type Error = FlacError;
+
+        fn write_frame(&mut self, encoded: &[u8]) -> Result<(), FlacError> {
             self.frames += 1;
             self.bytes.extend_from_slice(encoded);
             Ok(())
@@ -659,7 +751,7 @@ mod tests {
         wrong[100] ^= 0x01;
         assert_eq!(
             verify_pcm(&file.bytes[..], finished.samples, &wrong),
-            Err(DiagnosticCode::HashMismatch)
+            Err(FlacError::HashMismatch)
         );
 
         // A byte the disk changed in the middle of a frame.
@@ -673,8 +765,70 @@ mod tests {
         header[30] ^= 0xff;
         assert_eq!(
             verify_pcm(&header[..], finished.samples, &waveform),
-            Err(DiagnosticCode::HashMismatch)
+            Err(FlacError::HashMismatch)
         );
+    }
+
+    /// One second of a 440 Hz sine at 16 kHz plus a 37-sample tail: the
+    /// in-memory pair has to give every sample back, and the file it produced
+    /// has to carry that tail as one real short block rather than a padded one.
+    #[test]
+    fn a_sine_second_and_a_short_tail_round_trip_in_memory() {
+        const SAMPLES: usize = SAMPLE_RATE + 37;
+        let mut waveform = Vec::with_capacity(SAMPLES * BYTES_PER_SAMPLE);
+        for index in 0..SAMPLES {
+            let phase = 2.0 * std::f64::consts::PI * 440.0 * index as f64 / SAMPLE_RATE as f64;
+            let value = (phase.sin() * 12_000.0).round() as i16;
+            waveform.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let stream = encode_pcm(&waveform).expect("the in-memory take");
+        assert_eq!(
+            decode_pcm(&stream).expect("the samples back"),
+            waveform,
+            "every sample of the second and of its tail"
+        );
+
+        // The same file, read block by block: full blocks of 2048 and one
+        // short final block of exactly the tail.
+        let mut reader = FlacReader::new(&stream[..]).expect("a readable stream");
+        let info = reader.streaminfo();
+        assert_eq!(info.samples, Some(SAMPLES as u64));
+        assert_eq!(info.min_block_size, BLOCK_SAMPLES as u16);
+        assert_eq!(info.max_block_size, BLOCK_SAMPLES as u16);
+        let mut blocks = reader.blocks();
+        let mut buffer: Vec<i32> = Vec::new();
+        let mut durations: Vec<u32> = Vec::new();
+        while let Some(block) = blocks
+            .read_next_or_eof(buffer)
+            .expect("a decodable block")
+        {
+            durations.push(block.duration());
+            buffer = block.into_buffer();
+        }
+        assert_eq!(durations.len(), SAMPLES / BLOCK_SAMPLES + 1);
+        assert!(
+            durations[..durations.len() - 1]
+                .iter()
+                .all(|duration| *duration as usize == BLOCK_SAMPLES),
+            "every block but the last is full"
+        );
+        assert_eq!(
+            *durations.last().unwrap() as usize,
+            SAMPLES % BLOCK_SAMPLES,
+            "the tail is one short block of the real samples"
+        );
+    }
+
+    /// The in-memory decode checks what it read: a stream whose header claims a
+    /// digest its samples do not hash to is refused, not returned.
+    #[test]
+    fn the_memory_decode_refuses_a_stream_that_does_not_hash() {
+        let waveform = pcm(3_000);
+        let mut stream = encode_pcm(&waveform).expect("the in-memory take");
+        // A byte of the header's own digest, changed behind the samples' back.
+        stream[30] ^= 0xff;
+        assert_eq!(decode_pcm(&stream), Err(FlacError::HashMismatch));
     }
 
     #[test]
@@ -683,7 +837,7 @@ mod tests {
         let header = encoder.initial_header().to_vec();
         let mut file = Bytes::new(&header);
         let refused = encoder.push_pcm(&[0u8; 3], &mut file);
-        assert_eq!(refused, Err(DiagnosticCode::Codec));
+        assert_eq!(refused, Err(FlacError::Codec));
         assert_eq!(file.frames, 0, "nothing reached the file");
         assert_eq!(file.bytes.len(), header.len());
         assert_eq!(encoder.samples(), 0);

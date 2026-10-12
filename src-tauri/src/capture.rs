@@ -36,6 +36,7 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::audio;
+use crate::history;
 use crate::i18n::{self, Language, MessageId, UiError, UiMessage};
 use crate::{LAB_LABEL, OVERLAY_LABEL};
 
@@ -547,6 +548,11 @@ fn started_event(timing: &AttemptTiming) -> Event {
 struct Encoder<E: FrameEmitter = WindowEmitter> {
     /// Where the frames of this take go.
     emitter: E,
+    /// The take this capture records into the shell's history, when it has one:
+    /// every frame's PCM is appended there before the window gets its base64
+    /// copy. A laboratory take is never history, and neither is a frame of a
+    /// take the shell has already dropped.
+    history: Option<Arc<history::Take>>,
     /// The take this encoder frames.
     owner: CaptureOwner,
     /// Sequence of the last emitted frame; zero before the first one.
@@ -573,6 +579,7 @@ impl<E: FrameEmitter> Encoder<E> {
     /// The encoder of one take, framing into `emitter`.
     fn with_emitter(emitter: E, owner: CaptureOwner, source_rate: u32) -> Self {
         Self {
+            history: None,
             emitter,
             owner,
             sequence: 0,
@@ -638,6 +645,12 @@ impl<E: FrameEmitter> Encoder<E> {
         // take, and a gap the archive can account for.
         #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
         self.diagnostics.push(sequence, &self.bytes);
+        // The shell's history sees the very samples this frame is built from,
+        // before the base64 the window gets: what a take keeps is the audio it
+        // captured, not a re-encoding of what was emitted.
+        if let Some(take) = &self.history {
+            take.push_pcm(&self.bytes);
+        }
         let data = BASE64.encode(&self.bytes);
         let frame = Frame {
             generation: self.owner.generation(),
@@ -664,7 +677,19 @@ impl Encoder<WindowEmitter> {
     /// take. The take's diagnostics handle is attached by the worker, from the
     /// one lookup it made before the device was opened.
     fn new(app: &AppHandle, owner: CaptureOwner, source_rate: u32) -> Self {
-        Self::with_emitter(WindowEmitter { app: app.clone() }, owner, source_rate)
+        // A dictation records into the shell's history; a laboratory take is not
+        // history at all. The take is looked up once, before the device is
+        // opened, and the encoder then keeps it for the whole capture.
+        let history = match owner {
+            CaptureOwner::Dictation(generation) => {
+                app.state::<history::History>().take(generation)
+            }
+            CaptureOwner::Lab(_) => None,
+        };
+        Self {
+            history,
+            ..Self::with_emitter(WindowEmitter { app: app.clone() }, owner, source_rate)
+        }
     }
 }
 

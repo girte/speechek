@@ -51,6 +51,8 @@ const EVENT_DICTATION_STATE = 'speechek:dictation-state';
  * and writing it here is the same gesture as typing it.
  */
 const EVENT_HOTKEY_KEY = 'speechek:settings-hotkey-key';
+/** The history store changed: the list is a read of it, not of a draft. */
+const EVENT_HISTORY_CHANGED = 'speechek:history-changed';
 
 
 const CMD = {
@@ -68,9 +70,15 @@ const CMD = {
   close: 'settings_close',
   action: 'settings_action',
   setAutostart: 'settings_set_autostart',
+  historyList: 'history_list',
+  historyAudio: 'history_audio',
+  historyRetry: 'history_retry',
+  historyDelete: 'history_delete',
+  historyClear: 'history_clear',
+  historySaveAudio: 'history_save_audio',
 };
 
-const SECTIONS = ['general', 'keys'];
+const SECTIONS = ['general', 'keys', 'history'];
 const MODES = ['live', 'smart', 'verbatim'];
 /** How long typing may rest before the draft is told about it. */
 const TYPING_IDLE_MS = 350;
@@ -97,8 +105,8 @@ let shell = Boolean(tauri?.core?.invoke && tauri?.event?.listen);
 const el = (id) => document.getElementById(id);
 
 const notice = el('preview-notice');
-const tabs = { general: el('tab-general'), keys: el('tab-keys') };
-const panels = { general: el('panel-general'), keys: el('panel-keys') };
+const tabs = { general: el('tab-general'), keys: el('tab-keys'), history: el('tab-history') };
+const panels = { general: el('panel-general'), keys: el('panel-keys'), history: el('panel-history') };
 const modePicker = el('mode-picker');
 const muteToggle = el('mute-during-recording');
 const autostartToggle = el('autostart-enabled');
@@ -141,6 +149,13 @@ const dialogConfirm = el('dialog-confirm');
 const dialogConfirmText = el('dialog-confirm-text');
 const dialogConfirmOk = el('dialog-confirm-ok');
 const dialogConfirmCancel = el('dialog-confirm-cancel');
+const historyError = el('history-error');
+const historyList = el('history-list');
+const historyEmpty = el('history-empty');
+const historyLimit = el('history-limit');
+const historyClear = el('history-clear');
+const historyUndo = el('history-undo');
+const historyUndoButton = el('history-undo-button');
 
 // Translation-only display state: never stores editor values or changes controls.
 const retainedText = new Map();
@@ -190,6 +205,9 @@ function translateSettings(language) {
   // The language names sort in the interface language: a switch re-sorts both
   // pickers and keeps the choice on screen.
   if (view !== null) renderDictationLanguages(selectedDictationLanguages());
+  // A repaint in the new language rebuilds the history rows: their times and
+  // status words are written by this page, not annotated in the markup.
+  if (historyView !== null) renderHistory();
   for (const [node, state] of retainedText) {
     if (!node.isConnected) {
       retainedText.delete(node);
@@ -502,11 +520,17 @@ function renderSection() {
   }
 }
 
+/** Whether the page may take a new intent right now: the settings controls and
+ * the history list follow the same gate. */
+function controlsReady() {
+  return catalogReady && !formDisabled && view !== null && !busy && !closed && !closePending;
+}
+
 function renderControls() {
   // A close flow in flight freezes the page too: its own settings_close answer
   // must not be raced by a new chord or general intent, and a late answer must
   // not revive the draft the close is dropping.
-  const ready = catalogReady && !formDisabled && view !== null && !busy && !closed && !closePending;
+  const ready = controlsReady();
   // An explicit Apply keys or a close holds the page; a dictation forbids a
   // chord change. Neither one may touch the text already typed in the field.
   const usable = ready;
@@ -537,6 +561,7 @@ function renderControls() {
   dictationPrimary.disabled = !usable;
   dictationSecondary.disabled = !usable;
   languageSelect.disabled = !usable;
+  paintHistoryControls();
 }
 
 function renderHotkey() {
@@ -626,6 +651,12 @@ function renderGeneral() {
   if (pendingLanguage === view?.settings?.language) pendingLanguage = null;
   languageSelect.value = generalLanguage();
   renderDictationLanguages(view?.settings?.dictation_languages);
+  // The limit select follows the same snapshot as the controls around it, and a
+  // value the shell would refuse is never painted onto it.
+  const limit = view?.settings?.history_limit;
+  if (typeof limit === 'number' && historyLimit.querySelector(`option[value="${limit}"]`) !== null) {
+    historyLimit.value = String(limit);
+  }
   renderDevices();
   // A painted native view is the truth about the controls: a complaint about an
   // earlier attempt has been answered by it.
@@ -1249,15 +1280,16 @@ function onGeneralChange() {
   generalIntent = intent;
   // The chord is not part of this command: an old WebView view must not be able
   // to send a launcher key back, and a general change never touches the keys.
-  // The mute switch, the chosen device, the language and the dictation
-  // languages live in this section, so their own current values travel: the
-  // change takes effect from the next dictation.
+  // The mute switch, the chosen device, the language, the dictation languages
+  // and the history limit live in this section, so their own current values
+  // travel: the change takes effect from the next dictation.
   const settings = {
     mode: selectedMode(),
     mute_during_recording: muteToggle.checked,
     input_device: currentInputDevice(),
     language: generalLanguage(),
     dictation_languages: selectedDictationLanguages(),
+    history_limit: Number(historyLimit.value),
   };
   const draftId = view.draftId;
   // Counted until its answer lands: while a general send is outstanding, no
@@ -1906,6 +1938,630 @@ function checkKeys() {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Recording history                                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The history is a read of the shell's own store: every command here answers
+ * with the list as it is now, and this page keeps no copy of a recording. What
+ * it does own is the blob URL of the one row whose player is open, and that URL
+ * is revoked the moment the row closes, so a decrypted recording never outlives
+ * the player it was opened for.
+ *
+ * A delete is a promise, not a call: the row leaves the list at once and the
+ * shell is told five seconds later unless the user takes it back. A second
+ * delete, a close request and the page going away all settle that promise
+ * first, so no deletion is left waiting on a page that no longer exists.
+ */
+
+/** The wording behind each status glyph; the glyph itself is never read out. */
+const HISTORY_STATUS_KEY = Object.freeze({
+  recognized: 'SettingsHistoryStatusRecognized',
+  failed: 'SettingsHistoryStatusFailed',
+  transcribing: 'SettingsHistoryStatusTranscribing',
+});
+/** The glyph of each status. Symbols only: no language renders them. */
+const HISTORY_GLYPH = Object.freeze({ recognized: '✓', failed: '✕', transcribing: '◌' });
+/** How long a deleted recording stays recoverable. */
+const HISTORY_UNDO_MS = 5000;
+
+/** Newest accepted `history_list` answer, or null when there is none. */
+let historyView = null;
+/** The list was filled at least once for this document. */
+let historyLoaded = false;
+/** A change arrived while the panel was hidden: the next switch reloads. */
+let historyStale = false;
+/** Grows with every read, so an answer for an abandoned one is dropped. */
+let historyEpoch = 0;
+/** The row whose body is open, or null. */
+let expandedHistoryId = null;
+/** The object URL of the open row's player; revoked whenever it changes. */
+let historyAudioUrl = null;
+/** The recording a retry runs for; every Retry waits while it is set. */
+let historyRetryingId = null;
+/** Retry feedback belongs to the recording, not to a particular rendered row. */
+const historyRetryErrors = new Map();
+/** Wording of a failed history action, above the list until the next read. */
+let historyFailure = '';
+/** A delete inside its undo window: `{ id, timer }`, or null. */
+let pendingHistoryDelete = null;
+
+/** The row of one recording, or null when the list does not show it. */
+function historyRowOf(id) {
+  if (typeof id !== 'string' || id === '') return null;
+  for (const row of Array.from(historyList.querySelectorAll('.history-row'))) {
+    if (row.dataset.id === id) return row;
+  }
+  return null;
+}
+
+function historyEntryOf(id) {
+  const entries = Array.isArray(historyView?.entries) ? historyView.entries : [];
+  return entries.find((entry) => entry && entry.id === id) ?? null;
+}
+
+/** The row's one-line preview: the text it holds, why there is none, or the
+ * fact that it is still being transcribed. */
+function historyPreview(entry, status) {
+  if (typeof entry.text === 'string' && entry.text !== '') return entry.text;
+  if (status === 'transcribing') return msg('SettingsHistoryStatusTranscribing');
+  return entry.error ?? msg('HistoryNotRecognized');
+}
+
+/** A start time as the row shows it: today and yesterday are named, and the
+ * rest is written out in the interface language. */
+function historyTime(startedUtcMs) {
+  if (!Number.isFinite(startedUtcMs)) return '';
+  const language = runtimeLanguage ?? 'en';
+  const at = new Date(startedUtcMs);
+  const time = new Intl.DateTimeFormat(language, { hour: '2-digit', minute: '2-digit' }).format(at);
+  const now = new Date();
+  if (sameCalendarDay(at, now)) return msg('SettingsHistoryToday', { time });
+  if (sameCalendarDay(at, new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1))) {
+    return msg('SettingsHistoryYesterday', { time });
+  }
+  return new Intl.DateTimeFormat(language, { day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' }).format(at);
+}
+
+function sameCalendarDay(left, right) {
+  return left.getFullYear() === right.getFullYear() && left.getMonth() === right.getMonth() && left.getDate() === right.getDate();
+}
+
+/** A duration as `m:ss`: a length is a number, not copy. */
+function historyDuration(durationMs) {
+  const total = Number.isFinite(durationMs) && durationMs > 0 ? Math.round(durationMs / 1000) : 0;
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
+}
+
+/** The default file name's stamp: local time, `YYYY-MM-DD HH-MM`. */
+function historyFileNameTime(startedUtcMs) {
+  const at = new Date(Number.isFinite(startedUtcMs) ? startedUtcMs : Date.now());
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${at.getFullYear()}-${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${pad(at.getHours())}-${pad(at.getMinutes())}`;
+}
+
+function historyButton(className, label, action) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = className;
+  setText(button, label);
+  button.addEventListener('click', action);
+  return button;
+}
+
+/**
+ * One row: a header that opens the recording and a body that holds it. The text
+ * of a dictation is untrusted, so it only ever reaches the document as text.
+ */
+function historyRow(entry) {
+  const status = Object.hasOwn(HISTORY_STATUS_KEY, entry.status) ? entry.status : 'failed';
+  const text = typeof entry.text === 'string' ? entry.text : '';
+  const row = document.createElement('li');
+  row.className = 'settings-result history-row';
+  row.dataset.id = entry.id;
+  row.dataset.status = status;
+
+  const head = document.createElement('div');
+  head.className = 'history-row-head';
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'history-row-toggle';
+  toggle.setAttribute('aria-expanded', 'false');
+  toggle.setAttribute('aria-controls', `history-body-${entry.id}`);
+  const glyph = document.createElement('span');
+  glyph.className = 'history-glyph';
+  glyph.setAttribute('role', 'img');
+  glyph.setAttribute('aria-label', formatMessage(msg(HISTORY_STATUS_KEY[status])));
+  setText(glyph, HISTORY_GLYPH[status]);
+  const time = document.createElement('span');
+  time.className = 'history-time';
+  setText(time, historyTime(entry.startedUtcMs));
+  const duration = document.createElement('span');
+  duration.className = 'history-duration';
+  setText(duration, historyDuration(entry.durationMs));
+  const preview = document.createElement('span');
+  preview.className = text === '' && status !== 'transcribing' ? 'history-preview error' : 'history-preview';
+  setText(preview, historyPreview(entry, status));
+  toggle.append(glyph, time, duration, preview);
+  head.append(toggle);
+  // A recording without text is the one a retry is for: the header carries it
+  // where the row is read, and the body carries it where the text is.
+  if (status !== 'recognized') {
+    head.append(historyButton('settings-button history-retry', msg('SettingsHistoryRetry'), () => void retryHistory(entry.id)));
+  }
+
+  const body = document.createElement('div');
+  body.className = 'history-row-body';
+  body.id = `history-body-${entry.id}`;
+  body.hidden = true;
+  const player = document.createElement('audio');
+  player.controls = true;
+  player.preload = 'none';
+  body.append(player);
+  if (text !== '') {
+    const full = document.createElement('p');
+    full.className = 'history-text';
+    setText(full, text);
+    body.append(full);
+  }
+  const actions = document.createElement('div');
+  actions.className = 'settings-actions';
+  const copy = historyButton('settings-button settings-primary history-copy', msg('SettingsHistoryCopy'), () => void copyHistoryText(entry.id));
+  copy.disabled = text === '';
+  const more = historyButton('settings-button history-more', '⋯', () => toggleHistoryMenu(entry.id));
+  more.setAttribute('aria-label', formatMessage(msg('SettingsHistoryMore')));
+  more.setAttribute('aria-haspopup', 'menu');
+  more.setAttribute('aria-expanded', 'false');
+  actions.append(copy, historyButton('settings-button history-retry', msg('SettingsHistoryRetry'), () => void retryHistory(entry.id)), more);
+  body.append(actions);
+  const menu = document.createElement('div');
+  menu.className = 'history-menu';
+  menu.setAttribute('role', 'menu');
+  menu.hidden = true;
+  const save = historyButton('settings-button', msg('SettingsHistorySaveAudio'), () => {
+    setHistoryMenu(entry.id, false);
+    void saveHistoryAudio(entry.id);
+  });
+  save.setAttribute('role', 'menuitem');
+  const remove = historyButton('settings-button', msg('SettingsHistoryDelete'), () => {
+    setHistoryMenu(entry.id, false);
+    deleteHistory(entry.id);
+  });
+  remove.setAttribute('role', 'menuitem');
+  menu.append(save, remove);
+  body.append(menu);
+  const failure = document.createElement('p');
+  failure.className = 'error history-row-error';
+  failure.hidden = true;
+  body.append(failure);
+
+  toggle.addEventListener('click', () => toggleHistoryRow(entry.id));
+  const retryFailure = document.createElement('p');
+  retryFailure.className = 'error history-retry-error';
+  setError(retryFailure, historyRetryErrors.get(entry.id) ?? '');
+  row.append(head, retryFailure, body);
+  return row;
+}
+
+function setHistoryRowError(id, text) {
+  const node = historyRowOf(id)?.querySelector('.history-row-error');
+  if (node) setError(node, text);
+}
+
+/** Whether the row menu is open. One row at a time: it holds no state, so
+ * opening another one costs nothing. */
+function setHistoryMenu(id, open) {
+  const row = historyRowOf(id);
+  if (row === null) return;
+  const menu = row.querySelector('.history-menu');
+  if (menu) menu.hidden = !open;
+  const more = row.querySelector('.history-more');
+  if (more) more.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function toggleHistoryMenu(id) {
+  const row = historyRowOf(id);
+  if (row === null) return;
+  const menu = row.querySelector('.history-menu');
+  const open = menu === null || menu.hidden;
+  for (const other of Array.from(historyList.querySelectorAll('.history-row'))) {
+    if (other.dataset.id && other.dataset.id !== id) setHistoryMenu(other.dataset.id, false);
+  }
+  setHistoryMenu(id, open);
+}
+
+function closeHistoryMenus() {
+  for (const row of Array.from(historyList.querySelectorAll('.history-row'))) {
+    if (row.dataset.id) setHistoryMenu(row.dataset.id, false);
+  }
+}
+
+/** A click anywhere but the menu and its own button retires the menu. */
+function onHistoryOutsideClick(event) {
+  const target = event.target;
+  if (target instanceof Element && target.closest('.history-more, .history-menu') !== null) return;
+  closeHistoryMenus();
+}
+
+function onHistoryKey(event) {
+  if (event.key === 'Escape') closeHistoryMenus();
+}
+
+/** Opens one row. A row that already has a player keeps the URL it was opened
+ * with: a repaint must not read the decrypted recording a second time. */
+function openHistoryRow(id, url) {
+  const row = historyRowOf(id);
+  if (row === null) return;
+  expandedHistoryId = id;
+  const body = row.querySelector('.history-row-body');
+  if (body) body.hidden = false;
+  const toggle = row.querySelector('.history-row-toggle');
+  if (toggle) toggle.setAttribute('aria-expanded', 'true');
+  const player = row.querySelector('audio');
+  if (url == null) {
+    void loadHistoryAudio(id);
+    return;
+  }
+  historyAudioUrl = url;
+  if (player) player.src = url;
+}
+
+function toggleHistoryRow(id) {
+  if (expandedHistoryId === id) {
+    collapseHistoryRow();
+    return;
+  }
+  collapseHistoryRow();
+  openHistoryRow(id, null);
+}
+
+function collapseHistoryRow() {
+  const id = expandedHistoryId;
+  expandedHistoryId = null;
+  revokeHistoryAudio();
+  if (id === null) return;
+  const row = historyRowOf(id);
+  if (row === null) return;
+  setHistoryMenu(id, false);
+  const body = row.querySelector('.history-row-body');
+  if (body) body.hidden = true;
+  const toggle = row.querySelector('.history-row-toggle');
+  if (toggle) toggle.setAttribute('aria-expanded', 'false');
+}
+
+function revokeHistoryAudio() {
+  if (historyAudioUrl === null) return;
+  URL.revokeObjectURL(historyAudioUrl);
+  historyAudioUrl = null;
+}
+
+/** The decrypted FLAC as bytes: the raw answer, or the number array a build
+ * without the raw IPC response falls back to. */
+function historyBytes(value) {
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  return Array.isArray(value) ? Uint8Array.from(value) : new Uint8Array(0);
+}
+
+async function loadHistoryAudio(id) {
+  try {
+    const bytes = await invoke(CMD.historyAudio, { id });
+    if (closed || expandedHistoryId !== id) return;
+    revokeHistoryAudio();
+    historyAudioUrl = URL.createObjectURL(new Blob([historyBytes(bytes)], { type: 'audio/flac' }));
+    const player = historyRowOf(id)?.querySelector('audio');
+    if (player) {
+      player.src = historyAudioUrl;
+      player.load();
+    }
+  } catch (cause) {
+    if (closed || expandedHistoryId !== id) return;
+    setHistoryRowError(id, formatError(errorOf(cause)));
+  }
+}
+
+async function copyHistoryText(id) {
+  const entry = historyEntryOf(id);
+  if (entry === null || typeof entry.text !== 'string' || entry.text === '') return;
+  try {
+    await navigator.clipboard.writeText(entry.text);
+    setStatus(msg('SettingsHistoryCopied'));
+  } catch (cause) {
+    setHistoryRowError(id, formatError(errorOf(cause)));
+  }
+}
+
+/**
+ * Retries one recording: the shell transcribes the stored audio again in the
+ * mode the general settings name, and the stored text is replaced by the new
+ * one. Only one retry may run — the shell refuses a second — so every Retry
+ * waits for this answer.
+ */
+async function retryHistory(id) {
+  if (view === null || closed || historyRetryingId !== null) return;
+  historyRetryingId = id;
+  historyRetryErrors.delete(id);
+  const retryFailure = historyRowOf(id)?.querySelector('.history-retry-error');
+  if (retryFailure) setError(retryFailure, '');
+  paintHistoryControls();
+  try {
+    const entry = await invoke(CMD.historyRetry, { id });
+    historyRetryErrors.delete(id);
+    if (!closed) replaceHistoryEntry(entry);
+  } catch (cause) {
+    const error = errorOf(cause);
+    historyRetryErrors.set(id, error);
+    if (!closed) {
+      const retryFailure = historyRowOf(id)?.querySelector('.history-retry-error');
+      if (retryFailure) setError(retryFailure, error);
+    }
+  } finally {
+    historyRetryingId = null;
+    if (!closed) paintHistoryControls();
+  }
+}
+
+function replaceHistoryEntry(entry) {
+  if (!entry || typeof entry.id !== 'string') {
+    void loadHistory();
+    return;
+  }
+  const entries = Array.isArray(historyView?.entries) ? historyView.entries.slice() : [];
+  const index = entries.findIndex((item) => item && item.id === entry.id);
+  if (index === -1) entries.push(entry);
+  else entries[index] = entry;
+  historyView = { ...(historyView ?? {}), entries };
+  renderHistory();
+}
+
+async function saveHistoryAudio(id) {
+  const entry = historyEntryOf(id);
+  if (entry === null) return;
+  const fileName = `Speechek ${historyFileNameTime(entry.startedUtcMs)}.flac`;
+  try {
+    if ((await invoke(CMD.historySaveAudio, { id, fileName })) === true) {
+      setStatus(msg('SettingsHistoryAudioSaved'));
+    }
+  } catch (cause) {
+    setHistoryRowError(id, formatError(errorOf(cause)));
+  }
+}
+
+/** Hides one row and tells the shell only when the undo window closes: while
+ * the window is open the recording is still there, so undo is a repaint. */
+function deleteHistory(id) {
+  if (view === null || closed) return;
+  const row = historyRowOf(id);
+  if (row === null) return;
+  flushPendingHistoryDelete();
+  if (expandedHistoryId === id) collapseHistoryRow();
+  row.hidden = true;
+  pendingHistoryDelete = { id, timer: setTimeout(commitPendingHistoryDelete, HISTORY_UNDO_MS) };
+  show(historyUndo);
+  setStatus(msg('SettingsHistoryDeleted'));
+}
+
+function commitPendingHistoryDelete() {
+  const pending = pendingHistoryDelete;
+  if (pending === null) return;
+  clearTimeout(pending.timer);
+  pendingHistoryDelete = null;
+  hide(historyUndo);
+  void deleteHistoryNow(pending.id);
+}
+
+async function deleteHistoryNow(id) {
+  try {
+    await invoke(CMD.historyDelete, { id });
+    dropHistoryEntry(id);
+  } catch (cause) {
+    // The shell did not delete it, so the row comes back rather than the list
+    // claiming a deletion that did not happen.
+    const row = historyRowOf(id);
+    if (row) row.hidden = false;
+    setStatus(formatError(errorOf(cause)));
+  }
+}
+
+function undoHistoryDelete() {
+  const pending = pendingHistoryDelete;
+  if (pending === null) return;
+  clearTimeout(pending.timer);
+  pendingHistoryDelete = null;
+  hide(historyUndo);
+  const row = historyRowOf(pending.id);
+  if (row) row.hidden = false;
+}
+
+/** Settles a delete that is still inside its undo window: a second delete, a
+ * close request and the page going away all end the promise here. */
+function flushPendingHistoryDelete() {
+  if (pendingHistoryDelete !== null) commitPendingHistoryDelete();
+}
+
+function dropHistoryEntry(id) {
+  historyRetryErrors.delete(id);
+  const entries = Array.isArray(historyView?.entries) ? historyView.entries.filter((entry) => entry && entry.id !== id) : [];
+  historyView = { ...(historyView ?? {}), entries };
+  renderHistory();
+}
+
+async function clearHistory() {
+  if (view === null || closed || busy) return;
+  const agreed = await askConfirm(
+    msg('SettingsHistoryClearTitle'),
+    msg('SettingsHistoryClearQuestion'),
+    msg('SettingsHistoryClear'),
+  );
+  if (!agreed || closed) return;
+  try {
+    await invoke(CMD.historyClear, {});
+  } catch (cause) {
+    historyFailure = formatError(errorOf(cause));
+    paintHistoryError();
+    return;
+  }
+  await loadHistory();
+}
+
+/** Reads the shell's history. Not queued: it changes nothing, and a change
+ * event that arrives while one read is on its way is answered by the next. */
+async function loadHistory() {
+  if (view === null || closed || formDisabled) return;
+  const epoch = ++historyEpoch;
+  historyFailure = '';
+  let loaded = false;
+  try {
+    const next = await invoke(CMD.historyList, {});
+    if (epoch !== historyEpoch || closed) return;
+    historyView = next && typeof next === 'object' ? next : null;
+    loaded = true;
+  } catch (cause) {
+    if (epoch !== historyEpoch || closed) return;
+    historyView = null;
+    historyFailure = formatError(errorOf(cause));
+  }
+  // A read that failed is not the list: the next switch to the panel reads
+  // again instead of showing an empty history for the rest of the session.
+  historyLoaded = loaded;
+  historyStale = !loaded;
+  renderHistory();
+}
+
+/** Rebuilds the list from the newest answer. The open row keeps its player and
+ * the URL it was opened with, and a row inside its undo window stays away. */
+function renderHistory() {
+  const open = expandedHistoryId;
+  const kept = historyAudioUrl;
+  clearChildren(historyList);
+  const entries = Array.isArray(historyView?.entries) ? historyView.entries : [];
+  for (const entry of entries) {
+    if (entry && typeof entry.id === 'string') historyList.append(historyRow(entry));
+  }
+  // A retry complaint describes a recording, not a rendered row: it outlives a
+  // repaint of the same list and goes once the recording itself is gone.
+  for (const id of Array.from(historyRetryErrors.keys())) {
+    if (!entries.some((entry) => entry && entry.id === id)) historyRetryErrors.delete(id);
+  }
+  historyList.hidden = entries.length === 0;
+  historyEmpty.hidden = !(historyView !== null && entries.length === 0);
+  if (pendingHistoryDelete !== null) {
+    const row = historyRowOf(pendingHistoryDelete.id);
+    if (row) row.hidden = true;
+  }
+  if (open !== null) {
+    if (historyRowOf(open) === null) {
+      expandedHistoryId = null;
+      revokeHistoryAudio();
+    } else {
+      openHistoryRow(open, kept);
+    }
+  }
+  paintHistoryError();
+  paintHistoryControls();
+}
+
+function paintHistoryError() {
+  const stored = historyView?.storageError ? formatMessage(historyView.storageError) : '';
+  setError(historyError, historyFailure || stored);
+}
+
+/** Every history control follows the same gate as the rest of the form; Retry
+ * additionally waits for the one retry already running. */
+function paintHistoryControls() {
+  const usable = controlsReady();
+  historyLimit.disabled = !usable;
+  historyClear.disabled = !usable;
+  for (const row of Array.from(historyList.querySelectorAll('.history-row'))) {
+    const entry = historyEntryOf(row.dataset.id);
+    const hasText = typeof entry?.text === 'string' && entry.text !== '';
+    for (const button of Array.from(row.querySelectorAll('button'))) {
+      if (button.classList.contains('history-copy')) button.disabled = !usable || !hasText;
+      else if (button.classList.contains('history-retry')) button.disabled = !usable || historyRetryingId !== null;
+      else button.disabled = !usable;
+    }
+  }
+}
+
+function onHistoryChanged() {
+  if (closed) return;
+  if (section === 'history') {
+    void loadHistory();
+    return;
+  }
+  historyStale = true;
+}
+
+/**
+ * The limit is a general setting like the others, except that lowering it
+ * deletes recordings the user can still see: that one is asked about first, and
+ * a refused question puts the previous value back instead of sending it.
+ */
+function onHistoryLimitChange() {
+  if (view === null || closed || busy) return;
+  const next = Number(historyLimit.value);
+  const current = typeof view.settings?.history_limit === 'number' ? view.settings.history_limit : null;
+  if (current === null || next >= current) {
+    onGeneralChange();
+    return;
+  }
+  // How many recordings would go is only known from the list: one that was
+  // never read is read now, and the question waits for it.
+  if (!historyLoaded) {
+    void confirmHistoryLimitAfterLoad(next, current);
+    return;
+  }
+  void confirmHistoryLimit(next, current);
+}
+
+async function confirmHistoryLimitAfterLoad(next, current) {
+  await loadHistory();
+  if (closed || view === null) return;
+  await confirmHistoryLimit(next, current);
+}
+
+async function confirmHistoryLimit(next, current) {
+  const entries = Array.isArray(historyView?.entries) ? historyView.entries.length : 0;
+  if (entries <= next) {
+    onGeneralChange();
+    return;
+  }
+  const agreed = await askConfirm(
+    msg('SettingsHistoryLimitTitle'),
+    msg('SettingsHistoryLimitQuestion', { count: entries - next }),
+    msg('SettingsHistoryDeleteConfirm'),
+  );
+  if (!agreed) {
+    historyLimit.value = String(current);
+    return;
+  }
+  onGeneralChange();
+}
+
+/** Drops the painted history when the window's draft goes away: the rows, the
+ * decrypted player and any read still on its way belong to the closed window,
+ * and the next open reads the store again. */
+function forgetHistory() {
+  historyEpoch += 1;
+  expandedHistoryId = null;
+  revokeHistoryAudio();
+  if (pendingHistoryDelete !== null) {
+    clearTimeout(pendingHistoryDelete.timer);
+    pendingHistoryDelete = null;
+  }
+  historyView = null;
+  historyLoaded = false;
+  historyStale = false;
+  historyFailure = '';
+  historyRetryErrors.clear();
+  hide(historyUndo);
+  setError(historyError, '');
+  clearChildren(historyList);
+  historyList.hidden = true;
+  historyEmpty.hidden = true;
+}
+
+/* -------------------------------------------------------------------------- */
 /* Applying keys, closing and quitting                                         */
 /* -------------------------------------------------------------------------- */
 
@@ -2075,7 +2731,7 @@ function forgetDraft() {
   setError(keysError, '');
   setError(hotkeyError, '');
   setText(hotkeyState, '');
-  hotkeyInput.value = '';
+  forgetHistory();
   renderControls();
 }
 
@@ -2340,12 +2996,19 @@ async function switchSection(name, { focus = false } = {}) {
   const pending = takeEditor();
   revealIntent = false;
   if (name === section) {
+    // The panel is already on screen, but its content may not be: a first
+    // switch that failed to read, or a change that arrived while the window
+    // was away, is caught up here.
+    if (name === 'history' && (!historyLoaded || historyStale)) void loadHistory();
     if (focus) tabs[name].focus();
     return;
   }
   if (section === 'keys') invalidateReveal();
   section = name;
   renderSection();
+  // The history list is a read of the shell's store: it is fetched when its
+  // panel is first shown, and refreshed when a change arrived meanwhile.
+  if (name === 'history' && (!historyLoaded || historyStale)) void loadHistory();
   if (focus) tabs[name].focus();
   void pipelineKeys(pending);
 }
@@ -2358,9 +3021,10 @@ async function openSettings() {
   const next = await resync();
   if (next === null) return null;
   const requested = wanted ?? (SECTIONS.includes(next.selectedSection) ? next.selectedSection : 'last');
+  const target = requested === 'last' ? section : requested;
   // "last" keeps the section on screen; anything else goes through the very
   // same switch the tabs use, so no keystroke is left behind on the way.
-  await switchSection(requested);
+  await switchSection(target);
   // The window is open and takes focus: the host's device list is read here,
   // and again on every later activation.
   void refreshDevices();
@@ -2390,6 +3054,9 @@ function onCloseRequest(event) {
   const raw = payload && typeof payload === 'object' ? payload.reason : null;
   const reason = raw === 'quit' ? 'quit' : 'close';
   pendingCloseReason = reason === 'quit' ? 'quit' : pendingCloseReason === 'quit' ? 'quit' : 'close';
+  // A delete still inside its undo window is settled now: that window is about
+  // to go away, and no promise may outlive the page that made it.
+  flushPendingHistoryDelete();
   if (dialogClose.open || dialogConfirm.open || closePending || busy) return;
   void closeFlow();
 }
@@ -2453,7 +3120,7 @@ function onHotkeyKey(event) {
 function disableForm(message) {
   formDisabled = true;
   const hotkeyWasHeld = hotkeyFieldHoldsKeyboard();
-  for (const node of [languageSelect, keyReveal, keyApply, keyClear, keyCheck, actionLab, hotkeyInput, deviceSelect, dictationPrimary, dictationSecondary, muteToggle, autostartToggle]) {
+  for (const node of [languageSelect, keyReveal, keyApply, keyClear, keyCheck, actionLab, hotkeyInput, deviceSelect, dictationPrimary, dictationSecondary, muteToggle, autostartToggle, historyLimit, historyClear]) {
     node.disabled = true;
   }
   if (hotkeyWasHeld) signalHotkeyField(false);
@@ -2461,6 +3128,8 @@ function disableForm(message) {
     input.disabled = true;
   });
   keysText.readOnly = true;
+  // The history list follows the same gate as the rest of the form.
+  paintHistoryControls();
   if (message) setStatus(message);
 }
 
@@ -2579,9 +3248,8 @@ function wire() {
     pendingLanguage = languageSelect.value;
     onGeneralChange();
   });
-  tabs.general.addEventListener('click', () => void switchSection('general'));
-  tabs.keys.addEventListener('click', () => void switchSection('keys'));
   for (const name of SECTIONS) {
+    tabs[name].addEventListener('click', () => void switchSection(name));
     tabs[name].addEventListener('keydown', (event) => {
       if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft' && event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
       event.preventDefault();
@@ -2723,7 +3391,19 @@ function wire() {
     editEpoch += 1;
     acceptedEpoch = -1;
     keysText.value = '';
+    // A delete inside its undo window is settled here: the page is going away,
+    // and no promise may outlive it. The recording's player goes with it.
+    flushPendingHistoryDelete();
+    revokeHistoryAudio();
   });
+
+  historyLimit.addEventListener('change', onHistoryLimitChange);
+  historyClear.addEventListener('click', () => void clearHistory());
+  historyUndoButton.addEventListener('click', undoHistoryDelete);
+  // The row menu holds no state of its own: a click elsewhere or Escape
+  // retires it.
+  document.addEventListener('click', onHistoryOutsideClick);
+  document.addEventListener('keydown', onHistoryKey);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2758,6 +3438,7 @@ async function boot() {
     unlisteners.push(await tauri.event.listen(EVENT_CLOSE_REQUEST, onCloseRequest));
     unlisteners.push(await tauri.event.listen(EVENT_DICTATION_STATE, onDictationState));
     unlisteners.push(await tauri.event.listen(EVENT_HOTKEY_KEY, onHotkeyKey));
+    unlisteners.push(await tauri.event.listen(EVENT_HISTORY_CHANGED, onHistoryChanged));
     // The document identity comes before any report: the shell drops a report
     // it cannot place, and a focus that arrives while this is in flight is
     // reported by the handshake itself.

@@ -74,6 +74,8 @@ mod capture;
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
 mod diagnostics;
 mod dictation_language;
+mod flac;
+mod history;
 
 #[cfg(all(feature = "dev-diagnostics", not(debug_assertions)))]
 compile_error!("dev-diagnostics requires a debug build");
@@ -85,6 +87,7 @@ mod paste;
 mod preferences;
 mod profile;
 mod provider;
+mod save_dialog;
 mod secrets;
 mod settings;
 
@@ -168,10 +171,11 @@ const EVENT_DICTATION_STATE: &str = "speechek:dictation-state";
 const EVENT_SETTINGS_HOTKEY_KEY: &str = "speechek:settings-hotkey-key";
 
 /// The sections a settings request can name, as the value the watcher reads.
-/// The names the page sees are `general`, `keys` and `last`.
+/// The names the page sees are `general`, `keys`, `history` and `last`.
 const SECTION_LAST: u8 = 0;
 const SECTION_GENERAL: u8 = 1;
 const SECTION_KEYS: u8 = 2;
+const SECTION_HISTORY: u8 = 3;
 
 /// The launcher chord the settings document names could not be registered while
 /// the shell started. The shell then runs with the launcher disabled and opens
@@ -1382,6 +1386,15 @@ fn startup(app: &AppHandle, reservation: ReservedListener) {
     // their first call, and the overlay is created a few lines below.
     app.manage(Shell::new(Arc::clone(&runtime), secrets_message));
     app.manage(capture::NativeCapture::new());
+    // The recording history: one `history` folder beside the settings
+    // document, or none at all when this profile has no directory to keep it
+    // in. A dictation opens a take here before its capture starts, and the
+    // settings window reads the finished entries back.
+    app.manage(history::History::new(
+        config_path
+            .parent()
+            .map(|dir| history::HistoryStore::new(dir.join("history"))),
+    ));
     // The installer's own way to ask this shell to leave: it signals a named
     // event instead of flashing a console, and the watcher polls it on every
     // tick. A process that cannot create the event still runs - an installer
@@ -1825,6 +1838,9 @@ fn arm_overlay(app: &AppHandle) -> Result<(), String> {
         .ok_or_else(|| "the dictation was started without a configuration".to_string())?;
     let generation = overlay::show(app)?;
     inner.generation.store(generation, Ordering::SeqCst);
+    // The take of this dictation is opened before the renderer hears about it:
+    // the very first frame its capture delivers already belongs to it.
+    app.state::<history::History>().begin(generation);
     // The take's own mode and revision: read from the revision it is about to
     // pin, and never from a newer one a save could publish while it runs. The
     // revision is pinned before the renderer hears about the dictation and
@@ -1866,6 +1882,8 @@ fn cancel_arming_locked(app: &AppHandle, err: String) {
     let generation = inner.generation.load(Ordering::SeqCst);
     inner.state.lock().phase = Phase::Idle;
     retire_dictation_locked(&inner, generation);
+    // The take never became a dictation, so nothing of it is kept.
+    app.state::<history::History>().discard(generation);
     // No dictation is left to cancel, so Escape goes back to Windows.
     release_cancel_key(app);
     // The take ends as cancelled: the shell is the one that decided it, and a
@@ -2138,6 +2156,8 @@ fn cancel_dictation(app: &AppHandle, session_id: u64) {
     // The take is gone, so nothing may use the revision it pinned: the next
     // dictation starts from whatever the runtime holds by then.
     retire_dictation_locked(&inner, generation);
+    // The take was dropped unread: its recording is not kept either.
+    app.state::<history::History>().discard(generation);
     // Before the renderer is told anything: from here on a command that belongs
     // to this generation is refused, however late it arrives.
     inner.cancelled.store(generation, Ordering::SeqCst);
@@ -2425,6 +2445,7 @@ fn section_name(section: u8) -> &'static str {
     match section {
         SECTION_GENERAL => "general",
         SECTION_KEYS => "keys",
+        SECTION_HISTORY => "history",
         _ => "last",
     }
 }
@@ -2481,6 +2502,7 @@ pub(crate) fn request_settings(app: &AppHandle, request: &str) {
                 match section {
                     "general" => SECTION_GENERAL,
                     "keys" => SECTION_KEYS,
+                    "history" => SECTION_HISTORY,
                     _ => SECTION_LAST,
                 },
                 Ordering::SeqCst,
@@ -3122,6 +3144,11 @@ async fn capture_finalizing(window: WebviewWindow, app: AppHandle, generation: u
 
 /// Ends the dictation only for an explicit `"success"` or `"error"` outcome.
 ///
+/// The optional `error` is the renderer's own descriptor of why a take failed —
+/// the message it painted in the pill. The shell reads it as a catalog message
+/// and keeps it with the take's recording; a value that is not one leaves the
+/// entry to say the take was not recognized.
+///
 /// A successful dictation leaves nothing on screen: the hand-over already hid
 /// the pill, and this only makes sure it is gone. A failure brings the pill back
 /// with the reason the renderer has already written into it, for four seconds.
@@ -3134,6 +3161,7 @@ async fn finish_session(
     app: AppHandle,
     generation: u64,
     outcome: String,
+    error: Option<serde_json::Value>,
 ) -> Result<(), UiError> {
     if outcome != "success" && outcome != "error" {
         return Err(UiError::new(
@@ -3160,6 +3188,10 @@ async fn finish_session(
             }
             state.phase = Phase::Idle;
         }
+        // The take is over with the outcome the renderer reported, so its
+        // history entry is sealed here, with the reason a failed take carried.
+        let error = error.and_then(|value| serde_json::from_value::<UiMessage>(value).ok());
+        app.state::<history::History>().complete(&app, generation, error);
         inner.queued_stop.store(false, Ordering::SeqCst);
         // The shell's own terminal for this dictation, archived before the pin
         // is released and before the terminal rises. The renderer reported the
@@ -3734,6 +3766,10 @@ async fn insert_text(
         }
         state.inserted = true;
     }
+    // The transcript is kept before it is handed over: the recording in the
+    // history belongs to the take that produced it, whatever becomes of the
+    // clipboard. A late answer of a replaced session was refused above.
+    app.state::<history::History>().note_text(generation, &text);
 
     // The clipboard transaction blocks off the UI thread. Share ownership of
     // the original String with its worker and the last successful dictation.
@@ -3940,7 +3976,13 @@ pub fn run() {
             preferences::settings_update_hotkey,
             preferences::settings_update_vocabulary,
             preferences::settings_hotkey_capture,
-            preferences::settings_set_autostart
+            preferences::settings_set_autostart,
+            history::history_list,
+            history::history_audio,
+            history::history_retry,
+            history::history_delete,
+            history::history_clear,
+            history::history_save_audio
         ])
         .setup(move |app| {
             // The plugins have run by now, a second launch is already gone, and
@@ -4064,6 +4106,7 @@ mod tests {
                 language: crate::i18n::Language::En,
                 custom_vocabulary: Arc::default(),
                 dictation_languages: Arc::default(),
+                history_limit: crate::settings::DEFAULT_HISTORY_LIMIT,
             },
             keys: Arc::new(KeyRing::empty()),
             revision: 1,
@@ -4221,6 +4264,7 @@ mod tests {
                 language: crate::i18n::Language::En,
                 custom_vocabulary: Arc::default(),
                 dictation_languages: Arc::default(),
+                history_limit: crate::settings::DEFAULT_HISTORY_LIMIT,
             },
             keys: Arc::new(KeyRing::empty()),
             revision: 1,
@@ -4462,6 +4506,7 @@ mod tests {
                 language: crate::i18n::Language::En,
                 custom_vocabulary: Arc::default(),
                 dictation_languages: Arc::default(),
+                history_limit: crate::settings::DEFAULT_HISTORY_LIMIT,
             },
             keys: Arc::new(KeyRing::empty()),
             revision: 1,
@@ -4659,6 +4704,7 @@ mod tests {
                 language: crate::i18n::Language::Ru,
                 custom_vocabulary: Arc::default(),
                 dictation_languages: Arc::default(),
+                history_limit: crate::settings::DEFAULT_HISTORY_LIMIT,
             },
             keys: Arc::new(KeyRing::empty()),
             revision: 2,

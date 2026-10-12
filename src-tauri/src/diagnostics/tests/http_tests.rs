@@ -85,6 +85,7 @@ fn snapshot_with_keys(keys: &[&str], revision: u64) -> Arc<RuntimeSnapshot> {
             language: Language::En,
             custom_vocabulary: Arc::default(),
             dictation_languages: Arc::default(),
+            history_limit: crate::settings::DEFAULT_HISTORY_LIMIT,
         },
         keys: Arc::new(KeyRing::new(
             keys.iter()

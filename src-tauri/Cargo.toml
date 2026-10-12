@@ -30,6 +30,7 @@ windows = { version = "0.61.3", features = [
   "Win32_Foundation",
   "Win32_UI_WindowsAndMessaging",
   "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Security_Cryptography",
@@ -78,12 +79,17 @@ tokio-tungstenite = { version = "=0.28.0", features = ["rustls-tls-webpki-roots"
 futures-util = "0.3"
 # Needed for the loopback socket's exclusive-address option (see backend::bind_exclusive).
 socket2 = { version = "0.6", features = ["all"] }
-flacenc = { version = "=0.5.1", default-features = false, optional = true }
-claxon = { version = "=0.4.3", optional = true }
+# The FLAC codec (src/flac.rs): the lossless archive of a take and the
+# in-memory encode/decode pair. Non-optional, because the codec is part of
+# every build rather than of the Development archive alone.
+flacenc = { version = "=0.5.1", default-features = false }
+claxon = { version = "=0.4.3" }
 
 [features]
 # Local fake-provider harness only: `SPEECHEK_TEST_PROVIDER_HTTP`/`_WSS` are
 # honoured by src/provider.rs under this feature in debug builds, never in the
 # released EXE (which does not enable it).
 test-provider = []
-dev-diagnostics = ["dep:flacenc", "dep:claxon"]
+# The Development diagnostics archive (src/diagnostics.rs): a debug-only
+# feature that pulls in no dependency of its own.
+dev-diagnostics = []

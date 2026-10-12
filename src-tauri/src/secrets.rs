@@ -966,12 +966,24 @@ impl Drop for OutputBlob {
 /// machine scope, and no UI prompt even when the key material has to be
 /// re-generated.
 fn protect(plaintext: &[u8]) -> Result<Vec<u8>, SecretStoreError> {
-    let length = u32::try_from(plaintext.len()).map_err(|_| {
-        SecretStoreError::new(
+    if u32::try_from(plaintext.len()).is_err() {
+        return Err(SecretStoreError::new(
             SecretStoreKind::Invalid,
             UiMessage::new(MessageId::SecretStoreTooLarge),
+        ));
+    }
+    protect_bytes(plaintext).map_err(|_| {
+        SecretStoreError::new(
+            SecretStoreKind::Unavailable,
+            UiMessage::new(MessageId::SecretStoreEncryptFailed),
         )
-    })?;
+    })
+}
+
+/// Encrypts bytes for the current Windows user without a UI prompt.
+pub(crate) fn protect_bytes(plaintext: &[u8]) -> windows::core::Result<Vec<u8>> {
+    let length = u32::try_from(plaintext.len())
+        .map_err(|_| windows::core::Error::from(windows::Win32::Foundation::E_INVALIDARG))?;
     let input = CRYPT_INTEGER_BLOB {
         cbData: length,
         pbData: plaintext.as_ptr() as *mut u8,
@@ -990,13 +1002,7 @@ fn protect(plaintext: &[u8]) -> Result<Vec<u8>, SecretStoreError> {
             None,
             CRYPTPROTECT_UI_FORBIDDEN,
             &mut output,
-        )
-        .map_err(|_| {
-            SecretStoreError::new(
-                SecretStoreKind::Unavailable,
-                UiMessage::new(MessageId::SecretStoreEncryptFailed),
-            )
-        })?;
+        )?;
     }
     let output = OutputBlob(output);
     Ok(output.as_slice().to_vec())
@@ -1012,9 +1018,27 @@ fn unprotect(path: &Path, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, Secre
             UiMessage::new(MessageId::SecretContainerEmpty),
         ));
     }
-    let length = u32::try_from(ciphertext.len()).map_err(|_| {
-        SecretStoreError::corrupt(path, UiMessage::new(MessageId::SecretContainerDamaged))
-    })?;
+    if u32::try_from(ciphertext.len()).is_err() {
+        return Err(SecretStoreError::corrupt(
+            path,
+            UiMessage::new(MessageId::SecretContainerDamaged),
+        ));
+    }
+    unprotect_bytes(ciphertext).map_err(|_| {
+        SecretStoreError::corrupt(
+            path,
+            UiMessage::new(MessageId::SecretContainerNotDecrypted),
+        )
+    })
+}
+
+/// Decrypts bytes into a buffer that clears its plaintext on drop.
+pub(crate) fn unprotect_bytes(ciphertext: &[u8]) -> windows::core::Result<Zeroizing<Vec<u8>>> {
+    if ciphertext.is_empty() {
+        return Err(windows::core::Error::from(windows::Win32::Foundation::E_INVALIDARG));
+    }
+    let length = u32::try_from(ciphertext.len())
+        .map_err(|_| windows::core::Error::from(windows::Win32::Foundation::E_INVALIDARG))?;
     let input = CRYPT_INTEGER_BLOB {
         cbData: length,
         pbData: ciphertext.as_ptr() as *mut u8,
@@ -1033,13 +1057,7 @@ fn unprotect(path: &Path, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>, Secre
             None,
             CRYPTPROTECT_UI_FORBIDDEN,
             &mut output,
-        )
-        .map_err(|_| {
-            SecretStoreError::corrupt(
-                path,
-                UiMessage::new(MessageId::SecretContainerNotDecrypted),
-            )
-        })?;
+        )?;
     }
     let output = OutputBlob(output);
     Ok(Zeroizing::new(output.as_slice().to_vec()))
