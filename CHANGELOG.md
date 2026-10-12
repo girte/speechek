@@ -5,6 +5,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 The text of each GitHub Release is generated from the matching version section below plus a fixed install/unsigned/known-limitations/SHA-256 footer.
 
+## [0.5.0] - 2026-10-12
+
+### Added
+
+- **Recording history**: an always-on third tab in Settings keeps the last 5, 10, 20 or 50 recordings (10 by default), with audio and recognized text encrypted using Windows DPAPI for the current user. Play a recording, copy its text, retry recognition or save a decrypted FLAC file; a retry replaces the stored text only on success. Recordings that were not recognized remain available for retry; cancelled dictations, lab recordings and recordings too short for recognition are not stored. Status describes recognition, not whether text was pasted. ([#10](https://github.com/girte/speechek/issues/10))
+- Delete an individual history entry with a five-second **Undo**, or clear history with a five-second **Cancel**, without a confirmation dialog. Closing Settings normally does not cancel either pending deletion timer. ([#10](https://github.com/girte/speechek/issues/10))
+
+### Changed
+
+- Moved the interface-language selector into a compact Settings header with **?** help and removed the redundant explanatory copy. ([#11](https://github.com/girte/speechek/issues/11))
+
+### Fixed
+
+- Long **Live Smart** recordings now rotate recognition activities rather than silently reporting success with a truncated tail. Incomplete Live recognition falls back to **Smart** for the whole recording; if that fallback fails, no text is pasted. ([#6](https://github.com/girte/speechek/issues/6))
+
 ## [0.4.1] - 2026-10-12
 
 ### Changed
