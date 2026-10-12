@@ -93,17 +93,19 @@ If you copy something else while Speechek is working, your newer copy wins: Spee
 
 Live Smart pastes only the final text, never the partial results it sees along the way.
 
+For long recordings, Live Smart starts successive recognition activities in the live stream. If the live result is incomplete, Speechek sends the whole retained recording for batch recognition in **Smart** mode. This can keep the pill on **Processing** longer after you stop and needs internet access, a working key and available Gemini quota. If this fallback fails, nothing is pasted. It is recovery from an incomplete Live result, not an automatic retry on another key when Google rejects one; it doesn't make recording duration or quotas unlimited.
+
 **The lab** helps you choose. In **Settings → General settings**, click **Compare modes in real time**: you record once and see the results of all three modes side by side. One lab recording costs three Gemini requests. The lab button is unavailable while a dictation is running, and closing the lab window stops its recording.
 
 ## Settings
 
-Right-click the tray icon → **Settings**. Left-clicking the icon does nothing. The menu has just two items: **Settings** and **Exit**.
+Right-click the tray icon → **Settings**. Left-clicking the icon does nothing. The menu has just two items: **Settings** and **Exit**. The settings window has three tabs: **General settings**, **API keys** and **Recording history**.
 
 You can open settings at any time, even mid-dictation; the recording carries on. Closing the window doesn't quit Speechek. Only **Exit** in the tray menu does that, and it frees the microphone, the hotkey and the local port.
 
 Most settings apply the moment you change them. API keys are the exception: they apply only when you click **Apply keys**.
 
-If you change settings during a dictation, the current recording finishes with the settings it started with. The changes apply from the next one. The interface language is the only thing that switches immediately.
+If you change recognition settings during a dictation, the current recording finishes with the settings it started with. Those changes apply from the next one. The interface language and history retention limit apply immediately.
 
 ### Interface language
 
@@ -144,6 +146,25 @@ On the very first start Speechek picks the language you chose in the installer. 
 - If you close the window or exit with unapplied changes, Speechek asks: **Apply keys**, **Do not apply** (discards only the key changes) or **Return**.
 - If the saved key file can't be read (for example, it was copied from another Windows account), the button says **Enter keys**: you can type a new list, and Speechek asks before replacing the old one.
 
+### Recording history
+
+Open **Settings → Recording history** to find recent dictations, including failed recognition with no text. History is always on; there is no off switch. Recordings cancelled with Esc, lab recordings and recordings that are too short aren't added.
+
+**Keep the last.** Choose **5, 10, 20 or 50** recordings; the default is **10**. The limit applies immediately. If lowering it would remove older recordings, Speechek asks for confirmation first. As new recordings exceed the limit, the oldest are removed automatically.
+
+Each collapsed row shows the date, time, duration and a text preview, with copy and trash icons on the right. Status means recognition, not whether pasting succeeded: **✓ Recognized**, **✕ Not recognized** (no recognized text) or **◌ Transcribing…**. The copy icon copies the saved text to the clipboard and is disabled when there is no recognized text.
+
+Click a row to expand it: you get playback of its FLAC audio, the full recognized text, and **Retry** and **Save audio…** side by side.
+
+- **Retry** uses the mode currently selected in **General settings**; **Live Smart** is retried as batch **Smart**. It sends the saved audio to Google again, so it needs internet access, a working API key and quota. Success replaces the saved text with no undo; failure keeps the previous text. Retry never pastes automatically — use the copy icon if you want the result elsewhere.
+- **Save audio…** opens a normal file-save dialog and exports decrypted FLAC audio. **The exported file is unencrypted outside Speechek**; protect it yourself before sharing or storing it elsewhere.
+- The **trash icon** starts a **5-second countdown inside that row**. Click **Undo** before it expires to keep the recording.
+- **Clear history** starts a **5-second countdown directly on the button**, with **Cancel** and no confirmation dialog. Cancel before it expires to keep the history.
+
+Closing Settings hides the window but neither cancels these deletion countdowns nor deletes anything early. They keep their original deadlines; reopen the window before a deadline to undo or cancel for the remaining time. This describes hiding Settings, not exiting Speechek.
+
+Audio and text are encrypted with Windows DPAPI for the current user in `%APPDATA%\Speechek\history`; a portable **Development** build uses a `history` folder beside its EXE. Local encrypted storage doesn't mean Google never receives the audio: dictation and Retry still use cloud recognition. See [Privacy and limitations](#privacy-and-limitations).
+
 ## The settings file
 
 You never have to edit files by hand, since the settings window covers everything. If you want to, settings live in `%APPDATA%\Speechek\settings.json`. Paste that path into the Explorer address bar to open the folder.
@@ -163,6 +184,7 @@ You never have to edit files by hand, since the settings window covers everythin
 | `language` | `"en"` or `"ru"` | Picked on first start, see [Interface language](#interface-language) |
 | `custom_vocabulary` | A list of words and phrases that recognition leans toward; an empty list turns the vocabulary off | `[]` |
 | `dictation_languages` | Up to two different language codes from Gemini's list, for example `["ru-RU"]` or `["ru-RU", "en-US"]`; an empty list means Auto-detect | `[]` |
+| `history_limit` | `5`, `10`, `20` or `50` recordings; see [Recording history](#recording-history) | `10` |
 
 API keys are never in this file. They're stored encrypted in `secrets.bin` in the same folder.
 
@@ -185,9 +207,9 @@ Speechek writes `settings.json` and `secrets.bin` one after the other. If someth
 
 **Your recordings**
 
-- Speechek keeps your last dictations (10 by default), audio and recognized text, in `%APPDATA%\Speechek\history`, encrypted with Windows DPAPI for your user account and stored only on this computer. A normal (Production) build keeps no journals and no other copies of audio or text. Only a separate debug Development build with the explicit `dev-diagnostics` flag additionally writes a plaintext local archive; see [Building from source](#building-from-source).
-- For Smart and Verbatim, the recording is uploaded to Gemini temporarily and deleted after recognition. Speechek also asks Gemini not to store the request.
-- Live Smart streams the audio to Gemini while you speak.
+- Speechek keeps your last dictations (10 by default), audio and recognized text, in `%APPDATA%\Speechek\history`, encrypted with Windows DPAPI for your user account and stored only on this computer. A normal (Production) build keeps no journals and no other automatic copies of audio or text. **Save audio…** exports an unencrypted FLAC file to the location you choose. Only a separate debug Development build with the explicit `dev-diagnostics` flag additionally writes a plaintext local archive; see [Building from source](#building-from-source).
+- For Smart and Verbatim, the recording is uploaded to Gemini temporarily and deleted after recognition. Speechek also asks Gemini not to store the request. History **Retry** and Live Smart's incomplete-result fallback also upload saved audio for batch recognition.
+- Live Smart streams the audio to Gemini while you speak. Keeping a local history doesn't prevent this cloud transmission.
 - A custom vocabulary, if you set one, is sent to Google with every recording, in all three modes. It's plain text in `settings.json`, never in `secrets.bin`.
 
 **Limits**
@@ -229,6 +251,8 @@ By default your settings and keys stay on the PC, in case you reinstall. To remo
 **The pill warns that it's recording from the system microphone.** Your selected microphone is disconnected. Plug it back in; your choice stays saved.
 
 **The pill says "Copied — paste manually".** The text is on the clipboard: click into the field and press Ctrl+V. See [above](#when-the-text-isnt-pasted-automatically) for why.
+
+**The recognized text is no longer on the clipboard, or recognition failed.** Open [Recording history](#recording-history): copy the text from a saved row, or expand it and choose **Retry** after fixing the key or connection problem. Cancelled, lab, too-short, deleted and automatically evicted recordings aren't available there.
 
 **The pill says Smart and Verbatim fail on Google's side.** This message appears for a specific Gemini HTTP 400 error. [Google reported the outage fixed on October 7, 2026](https://github.com/googleapis/js-genai/issues/2011#issuecomment-6044792622); Speechek's live API has not been rechecked since that report. If you encounter the error, temporarily switch to **Live Smart** in General settings and report it using the form below. A fix on Google's side does not require a Speechek update.
 
