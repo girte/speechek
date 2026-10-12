@@ -2432,7 +2432,7 @@ function historyDeleteOverlay(elapsedMs, committing) {
   perimeter.setAttribute('class', 'history-overlay-perimeter');
   perimeter.setAttribute('x', '1');
   perimeter.setAttribute('y', '1');
-  perimeter.setAttribute('rx', '6');
+  perimeter.setAttribute('rx', '5');
   perimeter.setAttribute('pathLength', '100');
   perimeter.style.animationDuration = `${HISTORY_UNDO_MS}ms`;
   perimeter.style.animationDelay = `-${elapsedMs}ms`;
