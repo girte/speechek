@@ -295,7 +295,10 @@ body.settings-body [hidden] { display: none !important; }
 .history-row-head .history-delete { color: var(--accent-text); }
 .history-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
 .history-controls .settings-device-select { width: auto; max-width: 120px; }
-#history-clear { color: var(--accent-text); }
+#history-clear { display: inline-flex; align-items: center; justify-content: center; gap: 8px; box-sizing: border-box; color: var(--accent-text); }
+#history-clear.history-clear-pending { position: relative; overflow: hidden; border-color: transparent; }
+#history-clear:focus-visible { outline: 3px solid var(--accent-text); outline-offset: 2px; }
+.history-clear-countdown { display: none; font-size: 12px; font-variant-numeric: tabular-nums; }
 
 /* The covered card keeps its measured height and original content. Its border
    resumes from the absolute deadline after a list or language repaint. */
@@ -321,7 +324,7 @@ body.settings-body [hidden] { display: none !important; }
   fill: none;
   width: calc(100% - 2px);
   height: calc(100% - 2px);
-  stroke: var(--accent);
+  stroke: var(--accent-text);
   stroke-width: 2px;
   vector-effect: non-scaling-stroke;
   stroke-dasharray: 100;
@@ -391,4 +394,5 @@ body.settings-body [hidden] { display: none !important; }
   .history-overlay-frame { display: none; }
   .history-overlay-perimeter { animation: none; }
   .history-overlay-countdown { display: inline; }
+  .history-clear-countdown:not([hidden]) { display: inline; }
 }
