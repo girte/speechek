@@ -107,7 +107,7 @@ Want a different key? Type it in **Settings → General settings → Hotkey**, f
 
 ## Settings
 
-The language switch at the top of the settings window (English or Русский) changes the interface instantly, without a restart. The **General settings** tab applies right away too:
+The interface language selector in the Settings header (English or Русский) changes the interface instantly, without a restart. The **?** beside its label shows help. The **General settings** tab applies right away too:
 
 - **Recognition mode**: Live Smart, Smart or Verbatim.
 - **Dictation language**: Auto-detect (default), or one or two languages Gemini should expect — for example Russian plus English (US) for Russian speech with English terms. It's a recognition hint, not a translation; it works in all three modes and in the lab and applies from the next recording.

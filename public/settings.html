@@ -13,17 +13,21 @@
   <main class="settings-shell">
     <header class="settings-head">
       <div class="settings-head-bar">
-        <div class="brand"><span class="brand-mark" aria-hidden="true">◉</span> SPEECHEK <span class="edition" data-i18n="SettingsEdition">SETTINGS</span></div>
+        <div class="brand"><span class="brand-mark" aria-hidden="true">◉</span> SPEECHEK</div>
       </div>
-      <h1 data-i18n="SettingsTitle">Settings</h1>
-      <p class="settings-lead" data-i18n="SettingsLead">General settings apply immediately. API keys use “Apply keys”.</p>
-      <div class="settings-language">
-        <label class="settings-field-title" for="ui-language" data-i18n="UiLanguageLabel">Language</label>
-        <select id="ui-language" class="settings-device-select" aria-describedby="ui-language-help" disabled>
-          <option value="en">English</option>
-          <option value="ru">Русский</option>
-        </select>
-        <p class="settings-lead" id="ui-language-help" data-i18n="UiLanguageHelp">Select the application's interface language. The choice applies immediately and is saved. It does not affect speech recognition or the dictated text.</p>
+      <div class="settings-head-row">
+        <h1 data-i18n="SettingsTitle">Settings</h1>
+        <div class="settings-language">
+          <div class="settings-block-head">
+            <label class="settings-field-title" for="ui-language" data-i18n="UiLanguageLabel">Language</label>
+            <button type="button" class="settings-help" aria-label="Help: interface language" data-i18n-aria-label="UiLanguageHelpAria" aria-expanded="false" aria-controls="ui-language-help" aria-describedby="ui-language-help">?</button>
+            <div class="settings-help-panel" role="tooltip" id="ui-language-help" hidden data-i18n="UiLanguageHelp">Changes only the interface language. Does not affect speech recognition. Saved immediately.</div>
+          </div>
+          <select id="ui-language" class="settings-device-select" aria-describedby="ui-language-help" disabled>
+            <option value="en">English</option>
+            <option value="ru">Русский</option>
+          </select>
+        </div>
       </div>
     </header>
 

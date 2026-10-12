@@ -107,7 +107,7 @@ If you change settings during a dictation, the current recording finishes with t
 
 ### Interface language
 
-The **Language** switch sits at the top of the window: **English** or **Русский**. The choice is saved and applied at once to every window, the pill and the tray menu, with no restart. It doesn't stop a recording, doesn't touch unapplied keys, and doesn't translate your dictated text.
+The **Language** selector is in the Settings header: **English** or **Русский**. The **?** beside its label shows help. The choice is saved and applied at once to every window, the pill and the tray menu, with no restart. It doesn't stop a recording, doesn't touch unapplied keys, and doesn't translate your dictated text.
 
 On the very first start Speechek picks the language you chose in the installer. Without one, it follows the Windows display language: Russian if Windows is in Russian, English otherwise.
 

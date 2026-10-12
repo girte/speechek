@@ -27,12 +27,14 @@ body.settings-body [hidden] { display: none !important; }
 .settings-shell section { padding: 0; border-bottom: 0; }
 .settings-foot { max-width: none; color: inherit; line-height: 1.4; padding-top: 0; }
 
-.settings-head { border-bottom: 1px solid var(--line); padding-bottom: 12px; }
+.settings-head { flex: none; border-bottom: 1px solid var(--line); padding-bottom: 12px; }
 .settings-head-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-.settings-shell h1 { font-size: clamp(24px, 3.4vw, 32px); font-weight: 620; letter-spacing: -.04em; line-height: 1.1; margin: 10px 0 6px; }
-.settings-lead { color: var(--muted); font-size: 13px; line-height: 1.5; max-width: 680px; margin: 0; }
-.settings-language { display: grid; gap: 8px; margin-top: 12px; }
-.settings-language .settings-device-select { max-width: 420px; }
+.settings-head-row { display: flex; align-items: center; flex-wrap: wrap; gap: 12px 24px; margin-top: 12px; min-width: 0; }
+.settings-shell h1 { min-width: 0; font-size: 24px; font-weight: 620; letter-spacing: -.04em; line-height: 1.1; margin: 0; }
+.settings-language { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; min-width: 0; max-width: 100%; margin-left: auto; }
+.settings-language .settings-block-head { min-width: 0; margin: 0; }
+.settings-language .settings-field-title { overflow-wrap: anywhere; }
+.settings-language .settings-device-select { flex: 0 1 200px; width: 200px; min-width: 0; max-width: 100%; min-height: 40px; }
 .settings-mode-label { font-weight: inherit; }
 
 .settings-preview { margin: 16px 0 0; border: 1px solid var(--line); background: var(--surface); border-radius: 7px; padding: 16px 18px; }
@@ -379,8 +381,8 @@ body.settings-body [hidden] { display: none !important; }
   .settings-shell { padding: 14px 14px 0; }
   .history-row-head { flex-wrap: wrap; }
   .history-preview { flex-basis: 100%; }
-  .settings-shell h1 { font-size: 22px; margin: 8px 0 5px; }
-  .settings-lead { font-size: 13px; }
+  .settings-shell h1 { font-size: 22px; }
+  .settings-language { margin-left: 0; }
   .settings-foot { padding: 12px 0 14px; }
   .settings-panel .mode-picker label { flex: 1 1 auto; min-width: 120px; }
   .settings-help-panel { padding: 9px 11px; }
