@@ -5,6 +5,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 The text of each GitHub Release is generated from the matching version section below plus a fixed install/unsigned/known-limitations/SHA-256 footer.
 
+## [Unreleased]
+
+### Changed
+
+- Removed the local port setting. Windows assigns a free loopback port at every start; an old `port` line in `settings.json` is ignored and removed on the next settings save. ([#8](https://github.com/girte/speechek/issues/8))
+
+### Fixed
+
+- A busy or reserved local port (for example, `os error 10013` at Windows sign-in) no longer stops startup, because Windows chooses a free port instead of Speechek binding a fixed one. ([#8](https://github.com/girte/speechek/issues/8))
+- Installer: uninstalling now removes Windows' "disabled" startup marker together with the autostart entry, and a new installation with **Start Speechek when I sign in to Windows** checked clears a stale one, so the opt-in actually starts Speechek. The uninstaller keeps an autostart entry that points at another copy of Speechek, keeps a `%LOCALAPPDATA%\speechek.exe` link that no longer points at this installation, and removes `uninstall.exe` last, so an incomplete uninstall can still be repeated from **Installed apps**. A failed update now rolls back the uninstall record and autostart command with their quotation marks intact (previously the next installer could refuse the damaged record), and the installation stops if its rollback snapshot cannot be written. Choosing to delete settings and keys now reports a profile folder it cannot read instead of silently leaving it. ([#9](https://github.com/girte/speechek/issues/9))
+
 ## [0.4.0] - 2026-10-11
 
 ### Added

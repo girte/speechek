@@ -38,13 +38,18 @@
                      through Windows StartupApproved; none may be rewritten
       ForeignLocker  GUI run while a non-app process holds the canonical EXE;
                      must abort with the file-in-use message and touch nothing
-      Rollback       GUI run with the staged notices file locked so the commit
-                     fails after the EXE copy; the previous version must be
-                     restored and reported
+      Rollback       GUI reinstall of the installed version with writes to the
+                     Test uninstall key denied, so the metadata step fails after
+                     the files are copied; the previous files and a quoted Run
+                     command must be restored and the rollback reported
       ForceClose     GUI run over a suspended owned Test EXE (CreateProcessW
                      CREATE_SUSPENDED): it cannot answer the quit event, so the
                      installer must honour the shared 5 s grace and terminate
                      exactly the verified handle (exit code 1)
+
+    -Port fixes the fake provider fixture's own loopback port. The app under
+    test always binds a Windows-assigned port, which the app scenarios discover
+    from the started process, so there is no app port to configure.
 
     Only GateSelfTest and FixtureSelfTest are GUI-free; the default scenario is
     GateSelfTest. Every other scenario shows the native app or the installer and
@@ -476,7 +481,6 @@ function New-SmokeSecretContainer {
 function Write-SmokeSettings {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][int]$ListenPort,
         [string]$Hotkey = 'Ctrl+Shift+F10',
         [string]$Mode = 'live'
     )
@@ -484,7 +488,6 @@ function Write-SmokeSettings {
         hotkey                = $Hotkey
         mode                  = $Mode
         mute_during_recording = $false
-        port                  = $ListenPort
         input_device          = $null
     }
     Write-SpeechekUtf8NoBom -Path $Path -Text ((ConvertTo-Json -InputObject $document -Compress) + "`n")
@@ -672,6 +675,8 @@ function Get-SmokeArtifacts {
     try {
         $runValue = Get-ItemProperty -LiteralPath $RunKey -Name $TestProductName -ErrorAction SilentlyContinue
         if ($null -ne $runValue) { [void]$artifacts.Add('run: ' + $TestProductName) }
+        $approved = Get-ItemProperty -LiteralPath $StartupApprovedKey -Name $TestProductName -ErrorAction SilentlyContinue
+        if ($null -ne $approved) { [void]$artifacts.Add('startup-approved: ' + $TestProductName) }
     }
     catch { }
     return ,$artifacts.ToArray()
@@ -790,6 +795,30 @@ function Start-SmokeTestApp {
     [void]$script:StartedProcessIds.Add($process.Id)
     [void]$script:StartedProcesses.Add($process)
     return $process
+}
+
+function Wait-SmokeHttpBase {
+    param(
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
+        [int]$TimeoutSec = 30
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSec)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ($Process.HasExited) {
+            throw ('the Test executable exited early (code ' + $Process.ExitCode + '); a pre-existing Test ' +
+                   'singleton may still hold the identity.')
+        }
+        $listeners = @(Get-NetTCPConnection -State Listen -OwningProcess $Process.Id -ErrorAction SilentlyContinue |
+            Where-Object { $_.LocalAddress -eq '127.0.0.1' })
+        if ($listeners.Count -gt 1) {
+            throw "the Test executable pid $($Process.Id) has multiple 127.0.0.1 listeners; expected exactly one."
+        }
+        if ($listeners.Count -eq 1) {
+            return ('http://127.0.0.1:' + $listeners[0].LocalPort)
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    throw "the Test executable pid $($Process.Id) had no 127.0.0.1 listener within $TimeoutSec s."
 }
 
 function Wait-SmokeHealth {
@@ -1138,13 +1167,11 @@ function Invoke-FakeProvider {
     $configDir = Join-Path $outDir 'fixture-runtime'
     $configPath = Join-Path $configDir 'settings.json'
     if (-not (Test-Path -LiteralPath $configDir)) { New-Item -ItemType Directory -Path $configDir -Force | Out-Null }
-    $appPort = Get-SmokeFreePort
-    while ($appPort -eq $ListenPort) { $appPort = Get-SmokeFreePort }
-    $appBase = 'http://127.0.0.1:' + $appPort
-    Write-SmokeSettings -Path $configPath -ListenPort $appPort
+    Write-SmokeSettings -Path $configPath
     $process = Start-SmokeTestApp -ApplicationPath $debugExe -ConfigPath $configPath `
         -HttpBase $HttpBase -WsBase ('ws://127.0.0.1:' + $ListenPort)
     try {
+        $appBase = Wait-SmokeHttpBase -Process $process
         Wait-SmokeHealth -HttpBase $appBase -Process $process
         $settings = Invoke-SmokeHttp -Method 'GET' -Url ($appBase + '/api/settings')
         if ($settings.Status -ne 200) { throw "/api/settings returned $($settings.Status)." }
@@ -1175,6 +1202,9 @@ function Invoke-FreshInstall {
     param([Parameter(Mandatory = $true)][pscustomobject]$FixtureObject, [bool]$OptIn = $false)
     Write-Host "-- installer GUI: $(if ($OptIn) { 'OptIn' } else { 'FreshInstall' }) ($Language)"
     $options = @{ Desktop = $OptIn; Startup = $OptIn; Run = $false }
+    # A disabled marker left by an earlier installation must not silence the
+    # explicit opt-in.
+    if ($OptIn) { Set-SmokeRegBytes -Path $StartupApprovedKey -Name $TestProductName -Bytes $SmokeStartupDisabled }
     $result = Invoke-SmokeInstall -InstallerPath $FixtureObject.InstallerPath -Options $options
     if ($result.TimedOut) { throw 'the installer GUI did not finish within the driver timeout.' }
     $installedExe = Join-Path $InstallDir ($TestMainBinary + '.exe')
@@ -1191,6 +1221,7 @@ function Invoke-FreshInstall {
     if ($OptIn) {
         if (-not $desktopPresent) { throw 'the desktop shortcut was requested but is missing.' }
         if ($null -eq $runValue) { throw 'the autostart entry was requested but is missing.' }
+        if ($null -ne (Get-SmokeRegBytes -Path $StartupApprovedKey -Name $TestProductName)) { throw 'the opt-in install left a stale StartupApproved marker that keeps autostart disabled.' }
     }
     else {
         if ($desktopPresent) { throw 'the desktop shortcut must not be created without opt-in.' }
@@ -1234,12 +1265,18 @@ function Invoke-Uninstall {
     Write-Host "-- installer GUI: Uninstall (DeleteData=$DeleteData)"
     $uninstaller = Join-Path $InstallDir 'uninstall.exe'
     if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) { throw "uninstaller is missing: $uninstaller" }
-    if (-not (Test-Path -LiteralPath $ProfileDir)) {
+    # Installer scenarios leave a profile with only smoke markers; the
+    # keep-data check needs a settings file to prove it is left unchanged. A
+    # Test profile that never applied keys has no vault; "absent" is then the
+    # state the keep-data uninstall has to leave unchanged.
+    $settingsPath = Join-Path $ProfileDir 'settings.json'
+    $vaultPath = Join-Path $ProfileDir 'secrets.bin'
+    if (-not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
         [void](New-Item -ItemType Directory -Path $ProfileDir -Force)
-        Write-SmokeSettings -Path (Join-Path $ProfileDir 'settings.json') -ListenPort 4175
+        Write-SmokeSettings -Path $settingsPath
     }
-    $settingsBefore = Get-SpeechekSha256 (Join-Path $ProfileDir 'settings.json')
-    $vaultBefore = Get-SpeechekSha256 (Join-Path $ProfileDir 'secrets.bin')
+    $settingsBefore = Get-SpeechekSha256 $settingsPath
+    $vaultBefore = if (Test-Path -LiteralPath $vaultPath -PathType Leaf) { Get-SpeechekSha256 $vaultPath } else { $null }
     $options = @{ DeleteData = $DeleteData }
     $result = Invoke-SmokeInstall -InstallerPath $uninstaller -Options $options
     if ($result.TimedOut) { throw 'the uninstaller GUI did not finish within the driver timeout.' }
@@ -1247,13 +1284,19 @@ function Invoke-Uninstall {
         throw 'the installed executable survived the uninstall.'
     }
     if (Test-Path -LiteralPath $StartMenuLnk) { throw 'the Start Menu shortcut survived the uninstall.' }
+    if ($null -ne (Get-SmokeRunValue)) { throw 'the autostart Run value survived the uninstall.' }
+    if (Test-Path -LiteralPath $uninstaller) { throw 'uninstall.exe survived a complete uninstall.' }
+    if (Test-Path -LiteralPath $InstallDir) { throw "the installation directory survived a complete uninstall: $InstallDir" }
+    if (Test-Path -LiteralPath $UninstallKey) { throw 'the uninstall record survived a complete uninstall.' }
+    if ($null -ne (Get-SmokeRegBytes -Path $StartupApprovedKey -Name $TestProductName)) { throw 'the StartupApproved marker survived the uninstall.' }
     $profilePresent = Test-Path -LiteralPath $ProfileDir
     if ($DeleteData) {
         if ($profilePresent) { throw 'the profile survived an uninstall with the data checkbox checked.' }
     }
     else {
         if (-not $profilePresent) { throw 'the uninstall without the data checkbox removed the profile.' }
-        if ($settingsBefore -ne (Get-SpeechekSha256 (Join-Path $ProfileDir 'settings.json')) -or $vaultBefore -ne (Get-SpeechekSha256 (Join-Path $ProfileDir 'secrets.bin'))) { throw 'the keep-data uninstall modified the Test settings or fake vault.' }
+        $vaultAfter = if (Test-Path -LiteralPath $vaultPath -PathType Leaf) { Get-SpeechekSha256 $vaultPath } else { $null }
+        if ($settingsBefore -ne (Get-SpeechekSha256 $settingsPath) -or $vaultBefore -ne $vaultAfter) { throw 'the keep-data uninstall modified the Test settings or fake vault.' }
     }
     Write-Host '   ok: known files removed and the data checkbox behaved as requested'
 }
@@ -1268,13 +1311,11 @@ function Invoke-CancelCheck {
     if ([version]$FixtureObject.Version -lt [version]$installed) {
         throw "Cancel needs the installed fixture version or newer (installed $installed, fixture $($FixtureObject.Version))."
     }
-    $appPort = Get-SmokeFreePort
-    while ($appPort -eq $ListenPort) { $appPort = Get-SmokeFreePort }
-    $appBase = 'http://127.0.0.1:' + $appPort
-    Write-SmokeSettings -Path $configPath -ListenPort $appPort
+    Write-SmokeSettings -Path $configPath
     $process = Start-SmokeTestApp -ApplicationPath (Join-Path $InstallDir ($TestMainBinary + '.exe')) `
         -ConfigPath $configPath -HttpBase $HttpBase -WsBase ('ws://127.0.0.1:' + $ListenPort)
     try {
+        $appBase = Wait-SmokeHttpBase -Process $process
         Wait-SmokeHealth -HttpBase $appBase -Process $process
         $before = Get-InstalledTestVersion
         $beforeSha = Get-SpeechekSha256 (Join-Path $InstallDir ($TestMainBinary + '.exe'))
@@ -1625,6 +1666,11 @@ function Invoke-RollbackCheck {
     $exeBefore = Get-SpeechekSha256 $exePath
     $noticesPath = Join-Path $InstallDir 'THIRD-PARTY-NOTICES.txt'
     $noticesBefore = Get-SpeechekSha256 $noticesPath
+    # The rollback rewrites the Run value from its snapshot even on an update; a
+    # quoted command proves the snapshot keeps the quotation marks.
+    $runBefore = Get-SmokeRunValue
+    $quotedRun = '"' + $exePath + '"'
+    Set-ItemProperty -LiteralPath $RunKey -Name $TestProductName -Value $quotedRun
     $origDacl = [SmokeRegSec]::GetDacl((Get-SmokeUninstallSubKey))
     [System.IO.File]::WriteAllBytes($script:SmokeAclBackupPath, $origDacl)
     $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
@@ -1646,6 +1692,7 @@ function Invoke-RollbackCheck {
         if ((Get-InstalledTestVersion) -ne $installed) { throw 'the rolled-back run changed the installed version.' }
         if ((Get-SpeechekSha256 $exePath) -ne $exeBefore) { throw 'the rollback did not restore the previous executable bytes.' }
         if ((Get-SpeechekSha256 $noticesPath) -ne $noticesBefore) { throw 'the rollback did not restore the previous notices bytes.' }
+        if ((Get-SmokeRunValue) -cne $quotedRun) { throw "the rollback did not restore the quoted autostart command: $((Get-SmokeRunValue))" }
         Write-Host "   ok: metadata failure rolled back the files; the previous version is intact ('$($result.Fatal)')"
     }
     finally {
@@ -1653,6 +1700,8 @@ function Invoke-RollbackCheck {
         Remove-Item -LiteralPath $script:SmokeAclBackupPath -Force -ErrorAction SilentlyContinue
         # Prove the write access is really back before the next scenario runs.
         Set-ItemProperty -LiteralPath $UninstallKey -Name 'DisplayVersion' -Value $installed -ErrorAction Stop
+        if ($null -eq $runBefore) { Remove-ItemProperty -LiteralPath $RunKey -Name $TestProductName -ErrorAction SilentlyContinue }
+        else { Set-ItemProperty -LiteralPath $RunKey -Name $TestProductName -Value $runBefore }
     }
 }
 

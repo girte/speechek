@@ -117,8 +117,6 @@ The language switch at the top of the settings window (English or Русский
 - **Hotkey.**
 - **Custom vocabulary**: words and phrases recognition should lean toward — names, brands, terms and abbreviations as they should be spelled, one per line. It works in Live Smart, Smart and Verbatim and in the lab, and it biases recognition rather than replacing text. Leaving the field or pressing Ctrl+Enter (plain Enter adds a line) saves the list; it applies from the next recording and can be edited during a dictation. Up to 1000 terms, and Google recommends keeping the list at 100 or fewer.
 
-The only exception is the local port, which you'll hardly ever need: it applies after a restart.
-
 API keys are different: they take effect only after you click **Apply keys**.
 
 <details>

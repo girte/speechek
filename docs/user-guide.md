@@ -132,8 +132,6 @@ On the very first start Speechek picks the language you chose in the installer. 
 
 **Start Speechek when signing in to Windows.** The same autostart setting as the installer's checkbox. If you disabled Speechek in Windows startup apps, turning this on enables it again. If Speechek can't read its autostart entry (for example, another program's entry has the same name), the switch is greyed out and says so instead of guessing.
 
-**Local port.** The port Speechek's windows use internally. Default `4173`; you'll rarely need to touch it. A new value is saved immediately but applies after a restart. If the port is busy at startup, Speechek borrows a free one for that session and tells you.
-
 **Custom vocabulary.** Words and phrases you want recognition to lean toward: names, brands, terms and abbreviations as they should be spelled, one per line. It works in Live Smart, Smart and Verbatim and in the lab, and it biases recognition instead of replacing text. The list is saved when you leave the field or press Ctrl+Enter (a plain Enter starts a new line); there is no separate button. It applies from the next recording, and you can edit it during a dictation — the recording already running keeps the list it started with. The field shows the saved list, with empty lines and exact, case-sensitive repeats removed; `Speechek` and `speechek` are two different terms. Up to 1000 terms after that, and a longer list is refused with an error while the previous vocabulary stays in use. Above 100 terms Speechek suggests a shorter list: that is Google's own recommendation for recognition.
 
 ### API keys
@@ -161,7 +159,6 @@ You never have to edit files by hand, since the settings window covers everythin
 | `hotkey` | A key or combination, same rules as in [General settings](#general-settings) | `"F2"` |
 | `mode` | `"live"` (Live Smart), `"smart"`, `"verbatim"` | `"live"` |
 | `mute_during_recording` | `true` or `false` | `false` |
-| `port` | A whole number from 1 to 65535 | `4173` |
 | `input_device` | A microphone ID as Windows reports it, or `null` for the system default | `null` |
 | `language` | `"en"` or `"ru"` | Picked on first start, see [Interface language](#interface-language) |
 | `custom_vocabulary` | A list of words and phrases that recognition leans toward; an empty list turns the vocabulary off | `[]` |
@@ -169,7 +166,9 @@ You never have to edit files by hand, since the settings window covers everythin
 
 API keys are never in this file. They're stored encrypted in `secrets.bin` in the same folder.
 
-If `settings.json` is broken (bad JSON, a duplicated field, a port out of range), Speechek shows an error at startup and doesn't start. It never overwrites your file; fix it and start Speechek again. Missing keys or a hotkey taken by another program don't stop the app: it starts and opens the settings tab where you can fix the problem.
+Speechek's windows use a local server on `127.0.0.1`. Windows chooses a free port at every start; there is nothing to configure. An old `port` line in `settings.json` is ignored and removed the next time you save settings.
+
+If `settings.json` is broken (bad JSON or a duplicated field), Speechek shows an error at startup and doesn't start. It never overwrites your file; fix it and start Speechek again. Missing keys or a hotkey taken by another program don't stop the app: it starts and opens the settings tab where you can fix the problem.
 
 Speechek writes `settings.json` and `secrets.bin` one after the other. If something interrupts the save between the two, the settings window warns that the save was only partial. Speechek keeps running on your previous settings, and the next successful apply rewrites both files and clears the warning.
 
@@ -236,8 +235,6 @@ By default your settings and keys stay on the PC, in case you reinstall. To remo
 **An error says the key was rejected by Google.** The key was deleted, restricted or mistyped. Check it in AI Studio, and click **Check keys** after fixing the list.
 
 **An error mentions Google HTTP 429.** The quota for that key's project is used up. Wait until it resets (daily limits reset at midnight Pacific time) or add a key from another project, which has its own quota.
-
-**Settings say the port is busy and another one is used.** Something else took port 4173 before Speechek started. Speechek works normally on the temporary port; nothing to do. If it keeps happening, pick another port in General settings.
 
 **Still stuck?** Open an issue using the [bug report form](https://github.com/girte/speechek/issues/new/choose). Never attach your API keys, `secrets.bin`, `settings.json` or audio recordings.
 

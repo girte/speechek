@@ -1,6 +1,5 @@
 //! Build flavors: one compile-time table fixing the identity, the location of
-//! the settings profile, the first-run launcher chord and the first-run
-//! loopback port of a build.
+//! the settings profile and the first-run launcher chord of a build.
 //!
 //! A shipped executable is always [`BuildFlavor::Production`]; a debug build
 //! is a separate flavor, so a development or test run can never touch the
@@ -15,14 +14,14 @@
 //! identity even when a debug executable is started by double-clicking it.
 //!
 //! * [`BuildFlavor::Production`] - the distributed shell:
-//!   `app.speechek.desktop`, `%APPDATA%/Speechek`, `F2`, port `4173`.
+//!   `app.speechek.desktop`, `%APPDATA%/Speechek`, `F2`.
 //! * [`BuildFlavor::Development`] - a portable debug build that talks to the
 //!   real provider: `app.speechek.dev`, `settings.json` and `secrets.bin`
 //!   beside the executable it runs from (never `%APPDATA%`),
-//!   `Ctrl+Shift+F9`, port `4174`.
+//!   `Ctrl+Shift+F9`.
 //! * [`BuildFlavor::Test`] - a debug build with the local fake-provider
 //!   harness (`--features test-provider`): `app.speechek.test`,
-//!   `%APPDATA%/Speechek-Test`, `Ctrl+Shift+F10`, port `4175`.
+//!   `%APPDATA%/Speechek-Test`, `Ctrl+Shift+F10`.
 
 /// Which build this is. [`ACTIVE`] fixes the variant at compile time, so one
 /// process can never be two flavors and a released build cannot be talked into
@@ -40,8 +39,8 @@ pub(crate) enum BuildFlavor {
 
 /// The values one flavor fixes: the bundle identifier and product name the
 /// shell runs under, the `%APPDATA%` directory its settings document lives in
-/// for the flavors that keep one, and the launcher chord and loopback port its
-/// first-run document spells out.
+/// for the flavors that keep one, and the launcher chord its first-run
+/// document spells out.
 pub(crate) struct ProfileDefaults {
     pub(crate) identifier: &'static str,
     pub(crate) title: &'static str,
@@ -50,12 +49,10 @@ pub(crate) struct ProfileDefaults {
     /// its executable instead.
     pub(crate) directory: &'static str,
     pub(crate) hotkey: &'static str,
-    pub(crate) port: u16,
 }
 
 /// The compile-time flavor table: the single source of every value above, so a
-/// profile directory, a first-run chord and a port are never written down
-/// twice.
+/// profile directory and a first-run chord are never written down twice.
 pub(crate) const fn defaults(flavor: BuildFlavor) -> ProfileDefaults {
     match flavor {
         BuildFlavor::Production => ProfileDefaults {
@@ -63,7 +60,6 @@ pub(crate) const fn defaults(flavor: BuildFlavor) -> ProfileDefaults {
             title: "Speechek",
             directory: "Speechek",
             hotkey: "F2",
-            port: 4173,
         },
         BuildFlavor::Development => ProfileDefaults {
             identifier: "app.speechek.dev",
@@ -73,14 +69,12 @@ pub(crate) const fn defaults(flavor: BuildFlavor) -> ProfileDefaults {
             // runs from, so no profile directory is named here.
             directory: "",
             hotkey: "Ctrl+Shift+F9",
-            port: 4174,
         },
         BuildFlavor::Test => ProfileDefaults {
             identifier: "app.speechek.test",
             title: "Speechek Test",
             directory: "Speechek-Test",
             hotkey: "Ctrl+Shift+F10",
-            port: 4175,
         },
     }
 }

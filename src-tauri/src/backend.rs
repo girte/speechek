@@ -1,16 +1,15 @@
 //! Speechek's in-process loopback backend.
 //!
-//! One Axum service owns the loopback socket this process reserved: the
-//! configured port, or a temporary one when it was already taken. It hands the
-//! fifteen `public/` files to the overlay, lab and settings windows from memory
-//! and proxies transcription to Gemini through [`crate::provider`] and
-//! [`crate::live`].
+//! One Axum service owns the exclusively bound ephemeral loopback socket this
+//! process reserved. It hands the fifteen `public/` files to the overlay, lab
+//! and settings windows from memory and proxies transcription to Gemini
+//! through [`crate::provider`] and [`crate::live`].
 //!
 //! Four properties outrank the rest:
 //!
-//! * The port is claimed exclusively, after a connect probe, with
-//!   `SO_EXCLUSIVEADDRUSE`. Windows otherwise lets a second process bind (and
-//!   silently share) a port that somebody is already serving.
+//! * The socket is claimed exclusively with `SO_EXCLUSIVEADDRUSE`: Windows
+//!   otherwise lets a second process bind (and silently share) a port that
+//!   somebody is already serving.
 //! * A key rotates only for an *accepted* request. Every rejection - origin,
 //!   mode, content type, WAV shape, busy server - happens before a key is
 //!   chosen, so malformed traffic never consumes a turn of the rotation.
@@ -27,7 +26,7 @@
 //! shared recorder and comparison lab.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
@@ -84,8 +83,6 @@ const MAX_CONCURRENT_BATCH: usize = 2;
 /// Message size cap for `/api/live`: one message may not exceed 2 MiB.
 const MAX_WS_PAYLOAD: usize = 1 << 21;
 
-/// The connect probe answers within a second or the port counts as free.
-const PROBE_TIMEOUT: Duration = Duration::from_millis(1_000);
 /// Bound on draining spawned work while the backend shuts down.
 const DRAIN_TIMEOUT: Duration = Duration::from_millis(1_500);
 
@@ -292,8 +289,7 @@ struct AppState {
     /// Two concurrent batch transcriptions, mirroring `MAX_CONCURRENT_BATCH`.
     batches: Arc<Semaphore>,
     /// The loopback origins allowed to drive the audio endpoints, derived once
-    /// from the port this backend really serves: the configured one, or the
-    /// temporary one the reservation fell back to.
+    /// from the port the operating system assigned to the reserved socket.
     allowed_origins: [String; 3],
 }
 
@@ -313,9 +309,9 @@ impl Backend {
     ///
     /// Returns only once the listener is owned by the runtime thread and
     /// accepting, so the caller may create windows and register hotkeys
-    /// immediately afterwards. The port is neither probed nor bound again here:
-    /// the reservation is the single place that decides it, so nothing can take
-    /// the port between that decision and the accept loop.
+    /// immediately afterwards. The single bound socket is the reservation's, so
+    /// the operating system assigned the port before any window existed and
+    /// nothing can take it between that decision and the accept loop.
     pub fn start(
         reservation: ReservedListener,
         runtime: Arc<SharedRuntime>,
@@ -323,11 +319,7 @@ impl Backend {
         #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
         diagnostics: Arc<Diagnostics>,
     ) -> Result<Self, UiError> {
-        let ReservedListener {
-            listener,
-            actual_port,
-            ..
-        } = reservation;
+        let ReservedListener { listener, port } = reservation;
 
         let state = Arc::new(AppState {
             runtime,
@@ -335,7 +327,7 @@ impl Backend {
             #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
             diagnostics,
             batches: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH)),
-            allowed_origins: loopback_origins(actual_port),
+            allowed_origins: loopback_origins(port),
         });
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -357,7 +349,7 @@ impl Backend {
                         Err(error) => {
                             let _ = ready_tx.send(Err(UiError::new("BACKEND_SERVE",
                                 UiMessage::new(MessageId::BackendServeFailed)
-                                    .with_arg("port", json!(actual_port))
+                                    .with_arg("port", json!(port))
                                     .with_arg("detail", json!(error.to_string())))));
                             return;
                         }
@@ -417,191 +409,62 @@ impl Drop for Backend {
     }
 }
 
-/// The loopback socket a start serves from: bound once by [`reserve`], after the
-/// port was decided, and held until [`Backend::start`] hands it to the runtime
-/// thread. Nothing between the decision and the accept loop binds the port
-/// again, so no other process can take it in between and the page origin is the
-/// port the backend really serves.
+/// An exclusively bound ephemeral loopback socket, held until the runtime owns it.
 pub struct ReservedListener {
     listener: TcpListener,
-    /// The port the socket actually answers on; it differs from
-    /// `configured_port` only when that one was taken.
-    actual_port: u16,
-    /// The port the settings document named for this start.
-    configured_port: u16,
-    /// Set when `configured_port` was already in use and a temporary loopback
-    /// port was claimed instead. The saved value is not changed: the next start
-    /// tries the configured port again.
-    fallback: bool,
+    port: u16,
 }
 
 impl ReservedListener {
-    /// The port the socket answers on.
-    pub fn actual_port(&self) -> u16 {
-        self.actual_port
-    }
-
-    /// The port the settings document named for this start.
-    pub fn configured_port(&self) -> u16 {
-        self.configured_port
-    }
-
-    /// Whether the configured port was taken and a temporary one is in use.
-    pub fn fallback(&self) -> bool {
-        self.fallback
+    /// The port assigned by the operating system.
+    pub fn port(&self) -> u16 {
+        self.port
     }
 }
 
-/// Claim the loopback socket the shell will serve from.
-///
-/// `configured_port` is the port the settings document names; it is claimed
-/// exclusively, after the same connect probe Windows needs, and *only* a port
-/// that is genuinely in use makes this fall back to a temporary loopback port,
-/// whose number is read from the socket itself. A bind that fails for any other
-/// reason, and a configured port of 0, are returned as errors: an unusable
-/// stored value must never turn into a random port, and a missing socket exists
-/// nowhere else to fall back to.
-pub fn reserve(configured_port: u16) -> Result<ReservedListener, UiError> {
-    if configured_port == 0 {
-        return Err(UiError::new("BACKEND_INVALID_PORT", UiMessage::new(MessageId::BackendPortZero)));
-    }
-
-    // Windows lets a second process bind a port that is already being served, so
-    // an occupied port has to be detected by connecting to it; without this
-    // probe two backends would share the port and requests would land on either
-    // one. The probe is only the cheap test: `bind_exclusive` refuses an
-    // occupied port on its own through `SO_EXCLUSIVEADDRUSE`.
-    if port_in_use(configured_port) {
-        return reserve_fallback(configured_port);
-    }
-
-    match bind_exclusive(configured_port) {
-        Ok(listener) => finish_reservation(listener, configured_port, false),
-        Err(BindError::InUse) => reserve_fallback(configured_port),
-        Err(BindError::Fatal(message)) => Err(message),
-    }
+/// Claim an exclusive OS-assigned loopback socket before any window exists.
+pub fn reserve() -> Result<ReservedListener, UiError> {
+    let listener = bind_exclusive(0)?;
+    let port = listener.local_addr().map_err(|error| {
+        UiError::new("BACKEND_PORT_READ", UiMessage::new(MessageId::BackendPortReadFailed)
+            .with_arg("detail", json!(error.to_string())))
+    })?.port();
+    Ok(ReservedListener { listener, port })
 }
 
-/// Claim a temporary loopback port for a start whose configured port is taken.
-fn reserve_fallback(configured_port: u16) -> Result<ReservedListener, UiError> {
-    match bind_exclusive(0) {
-        Ok(listener) => finish_reservation(listener, configured_port, true),
-        // Port zero is never in use; a second `InUse` is the system saying it
-        // has no temporary port to give, which is as fatal as a taken one.
-        Err(BindError::InUse) => Err(UiError::new("BACKEND_NO_FALLBACK",
-            UiMessage::new(MessageId::BackendNoFallbackPort)
-                .with_arg("port", json!(configured_port)))),
-        Err(BindError::Fatal(message)) => Err(message),
-    }
-}
-
-/// The reservation for a socket that is bound but not yet served: the actual
-/// port is read from the socket, so `fallback` reports the port the operating
-/// system really gave rather than one this code assumed.
-fn finish_reservation(
-    listener: TcpListener,
-    configured_port: u16,
-    fallback: bool,
-) -> Result<ReservedListener, UiError> {
-    let actual_port = listener
-        .local_addr()
-        .map_err(|error| UiError::new("BACKEND_PORT_READ", UiMessage::new(MessageId::BackendPortReadFailed)
-            .with_arg("detail", json!(error.to_string()))))?
-        .port();
-    Ok(ReservedListener {
-        listener,
-        actual_port,
-        configured_port,
-        fallback,
-    })
-}
-
-/// Windows lets a second process bind a port that is already being served, so an
-/// occupied port has to be detected by connecting to it: without this probe two
-/// backends would share the port and requests would land on either one.
-fn port_in_use(port: u16) -> bool {
-    let address = SocketAddr::V4(SocketAddrV4::new(HOST, port));
-    match TcpStream::connect_timeout(&address, PROBE_TIMEOUT) {
-        Ok(stream) => {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-            true
-        }
-        Err(_) => false,
-    }
-}
-
-/// How a bind attempt failed: the address is taken (a fallback may follow) or
-/// something else went wrong (a fallback must not follow).
-enum BindError {
-    /// Another socket holds the address.
-    InUse,
-    /// A message to show; the failure is not a taken port.
-    Fatal(UiError),
-}
-
-/// Bind and listen on the loopback port, refusing to share it.
-fn bind_exclusive(port: u16) -> Result<TcpListener, BindError> {
+/// Bind and listen on loopback without allowing another process to share it.
+fn bind_exclusive(port: u16) -> Result<TcpListener, UiError> {
     let address = SocketAddrV4::new(HOST, port);
     let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).map_err(|error| {
-        BindError::Fatal(UiError::new("BACKEND_SOCKET", UiMessage::new(MessageId::BackendSocketCreateFailed)
-            .with_arg("detail", json!(error.to_string()))))
+        UiError::new("BACKEND_SOCKET", UiMessage::new(MessageId::BackendSocketCreateFailed)
+            .with_arg("detail", json!(error.to_string())))
     })?;
-
-    // `SO_REUSEADDR` is deliberately never enabled: on Windows it is exactly the
-    // option that lets a later process steal a bound port, and on every other
-    // platform the default already refuses a second bind.
+    // Never enable SO_REUSEADDR: Windows otherwise permits a later bind to steal it.
     #[cfg(windows)]
-    set_exclusive_address_use(&socket).map_err(BindError::Fatal)?;
+    set_exclusive_address_use(&socket)?;
     #[cfg(not(windows))]
     socket.set_reuse_address(false).map_err(|error| {
-        BindError::Fatal(UiError::new("BACKEND_SOCKET_CONFIG", UiMessage::new(MessageId::BackendSocketConfigureFailed)
-            .with_arg("detail", json!(error.to_string()))))
+        UiError::new("BACKEND_SOCKET_CONFIG", UiMessage::new(MessageId::BackendSocketConfigureFailed)
+            .with_arg("detail", json!(error.to_string())))
     })?;
-
     socket.bind(&address.into()).map_err(|error| {
-        if is_address_in_use(&error) {
-            BindError::InUse
-        } else {
-            BindError::Fatal(UiError::new("BACKEND_BIND", UiMessage::new(MessageId::BackendBindFailed)
-                .with_arg("port", json!(port)).with_arg("detail", json!(error.to_string()))))
-        }
+        UiError::new("BACKEND_BIND", UiMessage::new(MessageId::BackendBindFailed)
+            .with_arg("detail", json!(error.to_string())))
     })?;
     socket.listen(128).map_err(|error| {
-        BindError::Fatal(UiError::new("BACKEND_LISTEN", UiMessage::new(MessageId::BackendListenFailed)
-            .with_arg("port", json!(port)).with_arg("detail", json!(error.to_string()))))
+        UiError::new("BACKEND_LISTEN", UiMessage::new(MessageId::BackendListenFailed)
+            .with_arg("detail", json!(error.to_string())))
     })?;
     socket.set_nonblocking(true).map_err(|error| {
-        BindError::Fatal(UiError::new("BACKEND_PREPARE", UiMessage::new(MessageId::BackendPrepareFailed)
-            .with_arg("port", json!(port)).with_arg("detail", json!(error.to_string()))))
+        UiError::new("BACKEND_PREPARE", UiMessage::new(MessageId::BackendPrepareFailed)
+            .with_arg("detail", json!(error.to_string())))
     })?;
     Ok(socket.into())
 }
 
-/// Whether a bind failed because somebody else holds the address.
-///
-/// `std` maps the Win32/Winsock code to `AddrInUse`, and the raw Winsock code
-/// is checked as well: `socket2` reports the bind's own error, and the fallback
-/// must not be skipped over a code `std` happens to leave as `Uncategorized`.
-fn is_address_in_use(error: &io::Error) -> bool {
-    if error.kind() == io::ErrorKind::AddrInUse {
-        return true;
-    }
-    #[cfg(windows)]
-    if error.raw_os_error() == Some(WSAEADDRINUSE) {
-        return true;
-    }
-    false
-}
-
-/// `WSAEADDRINUSE`: the Winsock code for "this address is already bound", which
-/// is what `SO_EXCLUSIVEADDRUSE` produces when the probe could not see the
-/// owner.
-#[cfg(windows)]
-const WSAEADDRINUSE: i32 = 10048;
-
 /// `SO_EXCLUSIVEADDRUSE` makes every later bind of this port fail, including one
-/// that asks for `SO_REUSEADDR`. That is the Windows-only half of "one backend
-/// per port"; the connect probe covers the other half.
+/// that asks for `SO_REUSEADDR`: the one socket this process bound is the only
+/// one that may serve the assigned port.
 #[cfg(windows)]
 fn set_exclusive_address_use(socket: &Socket) -> Result<(), UiError> {
     use std::os::windows::io::AsRawSocket;
@@ -645,14 +508,14 @@ pub(crate) fn diagnostic_test_router(
     runtime: Arc<SharedRuntime>,
     provider: Arc<Provider>,
     diagnostics: Arc<Diagnostics>,
-    actual_port: u16,
+    port: u16,
 ) -> Router {
     router(Arc::new(AppState {
         runtime,
         provider,
         diagnostics,
         batches: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH)),
-        allowed_origins: loopback_origins(actual_port),
+        allowed_origins: loopback_origins(port),
     }))
 }
 
@@ -1501,13 +1364,13 @@ fn status_code(status: u16) -> StatusCode {
 
 /// The only origins allowed to drive the audio endpoints: the three spellings
 /// of the loopback host, on the port this backend really serves. Derived from
-/// the reservation's actual port rather than fixed, because a start whose
-/// configured port was taken serves a temporary one instead.
-fn loopback_origins(actual_port: u16) -> [String; 3] {
+/// the reservation's port rather than fixed, because the operating system
+/// assigns it at every start.
+fn loopback_origins(port: u16) -> [String; 3] {
     [
-        format!("http://127.0.0.1:{actual_port}"),
-        format!("http://localhost:{actual_port}"),
-        format!("http://[::1]:{actual_port}"),
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
+        format!("http://[::1]:{port}"),
     ]
 }
 
@@ -1670,7 +1533,7 @@ fn normalize_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpStream;
+    use std::net::{SocketAddr, TcpStream};
 
     fn test_snapshot(language: Language, revision: u64, keys: crate::secrets::KeyRing) -> Arc<RuntimeSnapshot> {
         Arc::new(RuntimeSnapshot {
@@ -1678,7 +1541,6 @@ mod tests {
                 hotkey: "F2".to_owned(),
                 mode: "smart".to_owned(),
                 mute_during_recording: false,
-                port: 4175,
                 input_device: None,
                 language,
                 custom_vocabulary: Arc::default(),
@@ -1759,14 +1621,6 @@ mod tests {
             "[redacted] / synthetic-current-key");
     }
 
-    /// A listener holding an ephemeral loopback port, and the port it holds:
-    /// the "already in use" side of every reservation test.
-    fn held_port() -> (TcpListener, u16) {
-        let held = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a loopback port");
-        let port = held.local_addr().expect("the held address").port();
-        (held, port)
-    }
-
     /// Whether a connection to `port` on the loopback succeeds, which a bound
     /// listening socket answers even before the backend's accept loop runs.
     fn accepts(port: u16) -> bool {
@@ -1777,106 +1631,18 @@ mod tests {
         .is_ok()
     }
 
-    /// A free configured port is claimed as named: the reservation reports it as
-    /// both configured and actual, is not a fallback, and the socket really
-    /// listens - the backend never binds it a second time, so this socket is the
-    /// one requests will reach.
+    /// A reservation holds the exclusive ephemeral socket until it is dropped:
+    /// the port is nonzero, the socket really listens, and after the drop the
+    /// same port can be bound again by this process.
     #[test]
-    fn a_free_configured_port_is_reserved_as_it_was_named() {
-        let (held, port) = held_port();
-        drop(held);
-
-        let reserved = reserve(port).expect("a free port is reserved");
-
-        assert_eq!(reserved.configured_port(), port);
-        assert_eq!(reserved.actual_port(), port, "the actual port is the named one");
-        assert!(!reserved.fallback(), "a free port is not a fallback");
+    fn an_ephemeral_reservation_listens_and_releases_its_port() {
+        let reserved = reserve().expect("an ephemeral port is reserved");
+        let port = reserved.port();
+        assert_ne!(port, 0, "the OS assigned a nonzero port");
         assert!(accepts(port), "the reserved socket accepts connections");
-    }
-
-    /// A configured port somebody else is serving falls back to a temporary
-    /// loopback port: the configured value stays what the document names, the
-    /// actual port is a different, live port, and the fallback is reported.
-    #[test]
-    fn a_port_in_use_falls_back_to_a_temporary_port() {
-        let (held, port) = held_port();
-
-        let reserved = reserve(port).expect("a taken port falls back");
-
-        assert_eq!(reserved.configured_port(), port, "the saved value is kept");
-        assert!(reserved.fallback(), "the reservation had to fall back");
-        assert_ne!(reserved.actual_port(), port, "a temporary port was claimed");
-        assert!(accepts(reserved.actual_port()), "the temporary socket listens");
         drop(reserved);
-        drop(held);
-    }
-
-    /// A configured port of 0 names no port at all: it is refused before any
-    /// socket exists rather than turned into a random one, because an unusable
-    /// stored value must never move the server somewhere nobody asked for.
-    #[test]
-    fn a_configured_port_of_zero_is_refused() {
-        let error = match reserve(0) {
-            Err(error) => error,
-            Ok(_) => panic!("port zero names no loopback port"),
-        };
-        assert_eq!(error.code, "BACKEND_INVALID_PORT");
-        assert_eq!(error.ui.key, MessageId::BackendPortZero);
-    }
-
-    /// A bind on a port somebody serves reads as `InUse` - the only failure that
-    /// may fall back - even though Windows would otherwise let a second bind
-    /// succeed. A free port binds at the requested number instead.
-    #[test]
-    fn a_bind_on_a_held_port_is_reported_as_in_use() {
-        let (held, port) = held_port();
-        match bind_exclusive(port) {
-            Err(BindError::InUse) => {}
-            Err(BindError::Fatal(message)) => {
-                panic!("a held port has to read as in use, not as: {message}")
-            }
-            Ok(_) => panic!("a held exclusive port must not be bindable"),
-        }
-        drop(held);
-
-        let (free, port) = held_port();
-        drop(free);
-        let listener = match bind_exclusive(port) {
-            Ok(listener) => listener,
-            Err(_) => panic!("a free port binds"),
-        };
-        assert_eq!(listener.local_addr().expect("the bound address").port(), port);
-    }
-
-    /// Both spellings of "address already in use" are recognised, so a fallback
-    /// is never skipped because the Winsock code arrived raw; any other failure
-    /// is not mistaken for a taken port.
-    #[test]
-    fn the_in_use_classifier_covers_both_the_kind_and_the_winsock_code() {
-        assert!(is_address_in_use(&io::Error::from(io::ErrorKind::AddrInUse)));
-        #[cfg(windows)]
-        assert!(is_address_in_use(&io::Error::from_raw_os_error(WSAEADDRINUSE)));
-        assert!(!is_address_in_use(&io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "not a taken port",
-        )));
-    }
-
-    /// Dropping a reservation returns its port: the exit path releases the
-    /// socket, and the next start can claim the same configured port again
-    /// instead of being pushed onto a fallback by a leak.
-    #[test]
-    fn dropping_a_reservation_releases_the_configured_port() {
-        let (held, port) = held_port();
-        drop(held);
-
-        let reserved = reserve(port).expect("a free port is reserved");
-        assert_eq!(reserved.actual_port(), port);
-        drop(reserved);
-
-        let again = reserve(port).expect("the port is claimable again");
-        assert_eq!(again.actual_port(), port);
-        assert!(!again.fallback(), "the port was released, not still held");
+        let again = bind_exclusive(port).expect("dropping the reservation releases its port");
+        assert_eq!(again.local_addr().expect("the rebound address").port(), port);
     }
 
     fn origin_header(origin: &'static str) -> HeaderMap {
@@ -1887,10 +1653,10 @@ mod tests {
 
     /// The audio endpoints answer loopback origins on the port the reservation
     /// really claimed and nothing else: the three loopback host spellings are
-    /// accepted for that port, while the old fixed port, a neighbouring port, a
-    /// scheme the shell never serves, a lookalike host and a path are foreign.
+    /// accepted for that port, while another port, a scheme the shell never
+    /// serves, a lookalike host and a path are foreign.
     #[test]
-    fn origins_are_allowed_only_on_the_actual_port() {
+    fn origins_are_allowed_only_on_the_bound_port() {
         let allowed = loopback_origins(43117);
 
         for origin in [

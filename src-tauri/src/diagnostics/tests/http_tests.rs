@@ -81,7 +81,6 @@ fn snapshot_with_keys(keys: &[&str], revision: u64) -> Arc<RuntimeSnapshot> {
             hotkey: "F2".to_owned(),
             mode: "live".to_owned(),
             mute_during_recording: false,
-            port: 4175,
             input_device: None,
             language: Language::En,
             custom_vocabulary: Arc::default(),

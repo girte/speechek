@@ -150,11 +150,7 @@ impl std::error::Error for SettingsUiError {}
 
 /// What the settings page draws, for one draft revision. The nested `settings`
 /// keeps the document's own names: `hotkey`, `mode`, `mute_during_recording`,
-/// `port`, `input_device`, `language`, `custom_vocabulary` and
-/// `dictation_languages`. Its `port` is the value the next start will use -
-/// editable, saved immediately, applied by a restart - while `startup_port`,
-/// `running_port` and `port_fallback` describe the socket this run already
-/// owns and never follow an edit.
+/// `input_device`, `language`, `custom_vocabulary` and `dictation_languages`.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SettingsView {
@@ -172,17 +168,6 @@ pub struct SettingsView {
     pub runtime_revision: u64,
     /// The values the page shows for the two form sections.
     pub settings: Settings,
-    /// The port this run claimed from the settings document before the shell
-    /// existed. Fixed for the whole run: the editable `settings.port` may move
-    /// on while the socket cannot, and a conflict has to name the port the
-    /// start really asked for.
-    pub startup_port: u16,
-    /// The port the backend really serves for this run. Equal to
-    /// [`Self::startup_port`] unless that one was taken.
-    pub running_port: u16,
-    /// Whether the configured port was taken at start and a temporary port is
-    /// served until the next start.
-    pub port_fallback: bool,
     /// Whether the key section holds a list that still needs a decision before
     /// the window may be dropped: viewing the saved list, or retyping it, is
     /// not a change and never sets this.
@@ -434,7 +419,7 @@ impl KeyPlan {
 /// contract fixes it, and the page never passes it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ApplyScope {
-    /// The general form: mode, mute, port, device, language, dictation languages.
+    /// The general form: mode, mute, device, language, dictation languages.
     General,
     /// The chord the page typed in the hotkey field.
     Hotkey,
@@ -527,20 +512,6 @@ fn read_key_draft(
 /* State                                                                      */
 /* -------------------------------------------------------------------------- */
 
-/// The port facts of one run, fixed when the socket was reserved before any
-/// window existed. The settings window reports them and they never follow the
-/// editable document: the socket cannot move without a restart, while the saved
-/// port may be edited by the same window that shows these.
-#[derive(Clone, Copy)]
-pub(crate) struct StartupPorts {
-    /// The port the start claimed from the settings document.
-    pub configured: u16,
-    /// The port the backend really serves; differs only in a fallback.
-    pub actual: u16,
-    /// Whether the configured port was taken at start.
-    pub fallback: bool,
-}
-
 /// Everything the settings commands share. Handed to Tauri as managed state
 /// beside the shell's own.
 pub struct PreferencesState {
@@ -548,9 +519,6 @@ pub struct PreferencesState {
     pub(crate) runtime: Arc<SharedRuntime>,
     /// The one provider instance, used by the key check only.
     pub(crate) provider: Arc<Provider>,
-    /// The port facts of this run, for the window's fallback and restart
-    /// notices.
-    ports: StartupPorts,
     /// The resolved `settings.json` this draft edits.
     pub(crate) config_path: PathBuf,
     /// The container beside it.
@@ -590,14 +558,12 @@ impl PreferencesState {
         runtime: Arc<SharedRuntime>,
         provider: Arc<Provider>,
         secret_error: Option<SecretStoreError>,
-        ports: StartupPorts,
     ) -> Self {
         Self {
             secrets_path: secrets::secrets_path(&config_path),
             config_path,
             runtime,
             provider,
-            ports,
             hotkey_error: Mutex::new(None),
             pending_section: Mutex::new(SECTION_LAST.to_owned()),
             closing: AtomicBool::new(false),
@@ -679,10 +645,8 @@ impl PreferencesState {
         SECTION_LAST.to_owned()
     }
 
-    /// What the page draws for one draft. The general values are always the
-    /// running document's - the page never owns a copy the shell could fall
-    /// behind - while the port facts of this run are fixed at reservation and
-    /// are reported as they were.
+    /// What the page draws for one draft: the running document's values, never
+    /// a copy the shell could fall behind.
     fn view(
         &self,
         app: &AppHandle,
@@ -700,9 +664,6 @@ impl PreferencesState {
             revision: draft.revision,
             runtime_revision: snapshot.revision,
             settings: snapshot.settings.clone(),
-            startup_port: self.ports.configured,
-            running_port: self.ports.actual,
-            port_fallback: self.ports.fallback,
             dirty: reading.changed,
             key_count: reading.count,
             keys_changed: reading.changed,
@@ -813,15 +774,13 @@ fn open_blocking(app: &AppHandle) -> Result<SettingsView, SettingsUiError> {
 /// across a chord change cannot put the old one back. The retired `compare_all`
 /// is absent too - a payload that still carries it is read as an unknown field
 /// and ignored. Every managed value the general section owns is part of the
-/// page's contract: the command refuses a payload that omits the mute switch,
-/// the port or the chosen device instead of reading a value the page never sent
-/// as `false`, as a port nobody chose or as "system default".
+/// page's contract: the command refuses a payload that omits the mute switch or
+/// the chosen device instead of reading a value the page never sent as `false`
+/// or as "system default".
 #[derive(Deserialize)]
 pub struct GeneralSettings {
     pub mode: String,
     pub mute_during_recording: bool,
-    /// The port the document should name for the next start, in `1..=65535`.
-    pub port: u16,
     /// The chosen input device id, or `null` for the system default device.
     /// `null` is a value of the contract; an omitted field is refused.
     #[serde(deserialize_with = "input_device_choice")]
@@ -876,20 +835,6 @@ where
     }
 
     deserializer.deserialize_option(ChoiceVisitor)
-}
-
-/// The general form's port, as the document will carry it: a whole number in
-/// `1..=65535`. Deserialization has already refused a fraction, a string and
-/// anything above the range, so zero is the one value left to refuse here.
-fn usable_port(port: u16) -> Result<u16, SettingsUiError> {
-    if port == 0 {
-        return Err(SettingsUiError::field(
-            "PORT_INVALID",
-            UiMessage::new(MessageId::PortInvalid),
-            "port",
-        ));
-    }
-    Ok(port)
 }
 
 /// The vocabulary field's text as the document will carry it: one term per
@@ -968,9 +913,8 @@ fn update_general_blocking(
     let _session = inner.session.lock();
     ensure_running(&state)?;
     // The page's values are checked before anything is planned for the draft:
-    // a port or a device the document would refuse never reaches the draft,
-    // the files or the runtime.
-    let port = usable_port(request.port)?;
+    // a device the document would refuse never reaches the draft, the files or
+    // the runtime.
     let input_device = usable_input_device(request.input_device)?;
     let dictation_languages = usable_dictation_languages(request.dictation_languages)?;
     let snapshot = inner.runtime.snapshot();
@@ -978,7 +922,6 @@ fn update_general_blocking(
         hotkey: snapshot.settings.hotkey.clone(),
         mode: request.mode,
         mute_during_recording: request.mute_during_recording,
-        port,
         input_device,
         language: request.language,
         custom_vocabulary: Arc::clone(&snapshot.settings.custom_vocabulary),
@@ -1101,7 +1044,6 @@ fn update_hotkey_blocking(
         hotkey,
         mode: snapshot.settings.mode.clone(),
         mute_during_recording: snapshot.settings.mute_during_recording,
-        port: snapshot.settings.port,
         input_device: snapshot.settings.input_device.clone(),
         language: snapshot.settings.language,
         custom_vocabulary: Arc::clone(&snapshot.settings.custom_vocabulary),
@@ -1817,10 +1759,9 @@ fn apply_keys_blocking(
 /// that only the hotkey scope may change still has to be one the grammar can
 /// express.
 ///
-/// The port and the chosen device are ordinary values of this rule: a general
-/// change carries them from the page, while a chord or key change keeps the
-/// ones that are running, so no other form can silently undo a port or a
-/// microphone the user chose.
+/// The chosen device is an ordinary value of this rule: a general change
+/// carries it from the page, while a chord or key change keeps the one that is
+/// running, so no other form can silently undo the microphone the user chose.
 fn planned_for_scope(
     scope: ApplyScope,
     planned: Settings,
@@ -1832,7 +1773,6 @@ fn planned_for_scope(
             hotkey: snapshot.hotkey.clone(),
             mode: planned.mode,
             mute_during_recording: planned.mute_during_recording,
-            port: planned.port,
             input_device: planned.input_device,
             language: planned.language,
             custom_vocabulary: Arc::clone(&snapshot.custom_vocabulary),
@@ -1853,7 +1793,6 @@ fn planned_for_scope(
             })?,
             mode: snapshot.mode.clone(),
             mute_during_recording: snapshot.mute_during_recording,
-            port: snapshot.port,
             input_device: snapshot.input_device.clone(),
             language: snapshot.language,
             custom_vocabulary: Arc::clone(&snapshot.custom_vocabulary),
@@ -2587,7 +2526,6 @@ mod tests {
             hotkey: "F2".to_owned(),
             mode: mode.to_owned(),
             mute_during_recording: false,
-            port: settings::DEFAULT_PORT,
             input_device: None,
             language: Language::En,
             custom_vocabulary: Arc::default(),
@@ -2687,46 +2625,16 @@ mod tests {
     }
 
     /// The general form's own values are checked against the rule the settings
-    /// document is read with, before anything is planned or written: zero is not
-    /// a port, a negative, a fraction, a string or a number above the range never
-    /// deserializes into the command at all, and a device id is either the system
-    /// default, an id `cpal::DeviceId` can parse, or a refusal that names the
-    /// field and quotes nothing. A refused value therefore leaves the running
-    /// port, the stored device and the files exactly as they were.
+    /// document is read with, before anything is planned or written: a device id
+    /// is either the system default, an id `cpal::DeviceId` can parse, or a
+    /// refusal that names the field and quotes nothing. A refused value
+    /// therefore leaves the stored device and the files exactly as they were.
     #[test]
-    fn the_general_form_refuses_a_port_or_a_device_it_cannot_store() {
-        assert_eq!(usable_port(1).expect("the lowest port"), 1);
-        assert_eq!(usable_port(65535).expect("the highest port"), 65535);
-
-        // Zero is the only port a `u16` accepts that is not a port, so it is the
-        // value this check is for.
-        let zero: GeneralSettings = serde_json::from_str(
-            r#"{"mode":"smart","mute_during_recording":true,"port":0,"input_device":null,"language":"en","dictation_languages":[]}"#,
-        )
-        .expect("zero is a u16");
-        let error = usable_port(zero.port).expect_err("zero is not a port");
-        assert_eq!(error.code, "PORT_INVALID");
-        assert_eq!(error.field.as_deref(), Some("port"));
-
-        // A value that is not a whole number in range never becomes a parsed
-        // payload: the command is refused before its body runs.
-        for payload in [
-            r#"{"mode":"smart","mute_during_recording":true,"port":65536,"input_device":null,"language":"en","dictation_languages":[]}"#,
-            r#"{"mode":"smart","mute_during_recording":true,"port":-1,"input_device":null,"language":"en","dictation_languages":[]}"#,
-            r#"{"mode":"smart","mute_during_recording":true,"port":"4173","input_device":null,"language":"en","dictation_languages":[]}"#,
-            r#"{"mode":"smart","mute_during_recording":true,"port":4173.5,"input_device":null,"language":"en","dictation_languages":[]}"#,
-        ] {
-            assert!(
-                serde_json::from_str::<GeneralSettings>(payload).is_err(),
-                "the port in {payload} is not a whole number in range"
-            );
-        }
-
+    fn the_general_form_refuses_a_device_it_cannot_store() {
         // Required fields are not silently replaced by defaults.
         for payload in [
             r#"{"mode":"smart","language":"en"}"#,
             r#"{"mode":"smart","mute_during_recording":true,"language":"en"}"#,
-            r#"{"mode":"smart","mute_during_recording":true,"port":4173,"language":"en"}"#,
             r#"{"mode":"smart","mute_during_recording":true,"input_device":null,"language":"en"}"#,
         ] {
             assert!(serde_json::from_str::<GeneralSettings>(payload).is_err());
@@ -2755,17 +2663,16 @@ mod tests {
         }
     }
 
-    /// A general change owns the port and the device the page shows, so saving a
-    /// new microphone or a new port is exactly what travels; a chord or a key
-    /// change keeps the ones that are running, so no other form can put back an
-    /// old port or an old microphone behind the user's back.
+    /// A general change owns the device the page shows, so saving a new
+    /// microphone is exactly what travels; a chord or a key change keeps the
+    /// one that is running, so no other form can put back an old microphone
+    /// behind the user's back.
     #[test]
-    fn choosing_a_chord_or_keys_keeps_the_running_port_and_device() {
+    fn choosing_a_chord_or_keys_keeps_the_running_device() {
         let running = Settings {
             hotkey: "F2".to_owned(),
             mode: "smart".to_owned(),
             mute_during_recording: false,
-            port: 43118,
             input_device: Some("wasapi:card-one".to_owned()),
             language: Language::En,
             custom_vocabulary: Arc::default(),
@@ -2779,7 +2686,6 @@ mod tests {
                 hotkey: "stale".to_owned(),
                 mode: "verbatim".to_owned(),
                 mute_during_recording: true,
-                port: 43119,
                 input_device: None,
                 language: Language::Ru,
                 custom_vocabulary: Arc::default(),
@@ -2793,7 +2699,6 @@ mod tests {
             general.hotkey, "F2",
             "the chord still comes from the running revision"
         );
-        assert_eq!(general.port, 43119);
         assert_eq!(general.input_device, None);
         assert_eq!(
             general.language,
@@ -2801,13 +2706,12 @@ mod tests {
             "the general scope owns the planned language"
         );
 
-        // A key change takes the whole running revision: a port or a device a
-        // page might still be holding is not part of its business.
+        // A key change takes the whole running revision: a device a page might
+        // still be holding is not part of its business.
         let page_copy = Settings {
             hotkey: "stale".to_owned(),
             mode: "verbatim".to_owned(),
             mute_during_recording: true,
-            port: 43119,
             input_device: None,
             language: Language::En,
             custom_vocabulary: Arc::default(),
@@ -2817,8 +2721,8 @@ mod tests {
             .expect("a keys plan");
         assert_eq!(keys, running);
 
-        // A chord change repairs the chord and keeps the running port and
-        // device, even when the page sent something else.
+        // A chord change repairs the chord and keeps the running device, even
+        // when the page sent something else.
         let hotkey = planned_for_scope(
             ApplyScope::Hotkey,
             Settings {
@@ -2831,7 +2735,6 @@ mod tests {
         .expect("a hotkey plan");
         assert_eq!(hotkey.hotkey, "Ctrl+Shift+F9");
         assert_eq!(hotkey.mode, "smart");
-        assert_eq!(hotkey.port, 43118);
         assert_eq!(hotkey.input_device.as_deref(), Some("wasapi:card-one"));
         assert_eq!(
             hotkey.language,
@@ -2918,7 +2821,7 @@ mod tests {
             assert_eq!(error.field.as_deref(), Some("dictation_languages"));
         }
 
-        let without = r#"{"mode":"smart","mute_during_recording":false,"port":43118,"input_device":null,"language":"ru"}"#;
+        let without = r#"{"mode":"smart","mute_during_recording":false,"input_device":null,"language":"ru"}"#;
         assert!(
             serde_json::from_str::<GeneralSettings>(without).is_err(),
             "an omitted list is refused, not read as Auto-detect"
@@ -2933,7 +2836,6 @@ mod tests {
         let complete: GeneralSettings = serde_json::from_value(serde_json::json!({
             "mode": "smart",
             "mute_during_recording": false,
-            "port": 43118,
             "input_device": null,
             "language": "ru",
             "dictation_languages": [],
@@ -2942,19 +2844,19 @@ mod tests {
         assert_eq!(complete.language, Language::Ru);
 
         let missing =
-            r#"{"mode":"smart","mute_during_recording":false,"port":43118,"input_device":null,"dictation_languages":[]}"#;
+            r#"{"mode":"smart","mute_during_recording":false,"input_device":null,"dictation_languages":[]}"#;
         assert!(
             serde_json::from_str::<GeneralSettings>(missing).is_err(),
             "an omitted language is refused, not defaulted"
         );
 
-        let unsupported = r#"{"mode":"smart","mute_during_recording":false,"port":43118,"input_device":null,"language":"de","dictation_languages":[]}"#;
+        let unsupported = r#"{"mode":"smart","mute_during_recording":false,"input_device":null,"language":"de","dictation_languages":[]}"#;
         assert!(
             serde_json::from_str::<GeneralSettings>(unsupported).is_err(),
             "a language the interface does not ship is refused"
         );
 
-        let duplicate = r#"{"mode":"smart","mute_during_recording":false,"port":43118,"input_device":null,"language":"ru","language":"en","dictation_languages":[]}"#;
+        let duplicate = r#"{"mode":"smart","mute_during_recording":false,"input_device":null,"language":"ru","language":"en","dictation_languages":[]}"#;
         assert!(
             serde_json::from_str::<GeneralSettings>(duplicate).is_err(),
             "a duplicated language is refused, not coerced"
@@ -3023,7 +2925,6 @@ mod tests {
             hotkey: "F2".to_owned(),
             mode: "verbatim".to_owned(),
             mute_during_recording: true,
-            port: 43118,
             input_device: None,
             language: Language::En,
             custom_vocabulary: Arc::default(),
@@ -3055,7 +2956,7 @@ mod tests {
         );
         assert_eq!(
             fs::read_to_string(&config).expect("the written document"),
-            "\u{feff}{\r\n  // режим\r\n  \"mute_during_recording\": true,\r\n  \"port\": 43118,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"verbatim\"\r\n  \r\n}\r\n",
+            "\u{feff}{\r\n  // режим\r\n  \"mute_during_recording\": true,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"verbatim\"\r\n  \r\n}\r\n",
             "the retired property is gone and every other byte survived"
         );
     }
@@ -3354,11 +3255,6 @@ mod tests {
             runtime,
             Arc::new(Provider::new()),
             None,
-            StartupPorts {
-                configured: settings::DEFAULT_PORT,
-                actual: settings::DEFAULT_PORT,
-                fallback: false,
-            },
         );
         (scratch, state)
     }

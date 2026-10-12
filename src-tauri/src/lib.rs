@@ -64,7 +64,7 @@
 //! settings window can repair it and a press can name the reason instead of
 //! recording a take nothing can recognize. The released shell is one executable
 //! with no console, so every remaining startup failure — an unreadable settings
-//! document, a loopback port taken by another program — is shown in a native
+//! document, a loopback socket that cannot be bound — is shown in a native
 //! message box.
 
 mod audio;
@@ -112,7 +112,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use backend::ReservedListener;
-use preferences::{PreferencesState, SettingsUiError, StartupPorts};
+use preferences::{PreferencesState, SettingsUiError};
 
 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
 use crate::diagnostics::{
@@ -133,8 +133,8 @@ pub(crate) const LAB_LABEL: &str = "lab";
 
 /// The `WebviewUrl::App` paths the restricted windows load. The port they are
 /// served on is not part of them: [`is_app_page`] derives the real URL from the
-/// running `build.dev_url`, which `run` pins to the port the reservation
-/// claimed — the configured one, or the temporary one it fell back to.
+/// running `build.dev_url`, which `run` pins to the port the operating system
+/// assigned to this start's reservation.
 ///
 /// The laboratory names its page with a leading slash on purpose: Tauri skips
 /// the join for the literal path `index.html` and would load the base itself,
@@ -341,8 +341,8 @@ fn record_paste_result(
 /* -------------------------------------------------------------------------- */
 
 /// The exact URL `WebviewUrl::App(page)` resolves to for the running shell: the
-/// page joined onto `build.dev_url`, which `run` pins to the loopback origin the
-/// reservation claimed, or onto the custom-protocol base when no dev URL is
+/// page joined onto `build.dev_url`, which `run` pins to the loopback origin of
+/// the socket this run reserved, or onto the custom-protocol base when no dev URL is
 /// configured. This mirrors the join Tauri performs when it opens a window, so a
 /// gate and the document it guards agree about the one URL that is allowed.
 ///
@@ -369,7 +369,7 @@ fn resolved_app_page(dev_url: Option<&Url>, page: &str) -> Url {
 ///
 /// Both halves are checked: the label, because a label is not a secret, and the
 /// whole URL — scheme, host, port and path, with no query and no fragment — so a
-/// lookalike path or the URL of a previous run's port never matches. These
+/// lookalike path or another start's port never matches. These
 /// windows drive the microphone, the clipboard and the key store.
 fn app_page_matches(
     label: &str,
@@ -1046,7 +1046,6 @@ fn runtime_context(snapshot: &RuntimeSnapshot) -> serde_json::Value {
         "dictation_languages": settings.dictation_languages,
         "mute": settings.mute_during_recording,
         "hotkey": settings.hotkey,
-        "port": settings.port,
         "build": build_flavor(),
         "version": env!("CARGO_PKG_VERSION"),
         "commit": option_env!("SPEECHEK_DIAGNOSTIC_COMMIT").filter(|value| !value.is_empty()),
@@ -1313,11 +1312,9 @@ fn nested_cause(cause: &UiMessage) -> serde_json::Value {
 /// reason behind) and the launcher chord (a chord that cannot be registered
 /// leaves the launcher disabled, never a silently chosen one).
 ///
-/// The socket is passed in already bound, because `run` claimed it before the
-/// shell was built; the port is not chosen here. The document read here is the
-/// one the preflight read, so a saved port that changed in between — the
-/// first-run template written, a hand edit — stops the run with a native dialog
-/// before the backend or any window exists rather than serving another port.
+/// The socket is passed in already bound, because `run` reserved it before the
+/// shell was built; the port is the one the operating system assigned and is
+/// not chosen here, so no document can disagree with it.
 ///
 /// The order is what the rest of the shell needs:
 /// * the managed state exists before the first webview, or an overlay that loads
@@ -1353,20 +1350,6 @@ fn startup(app: &AppHandle, reservation: ReservedListener) {
         Ok(settings) => settings,
         Err(err) => fatal(startup_ui_language(), &err.ui),
     };
-
-    // The socket is already listening on the port the preflight read, so the
-    // settings document has to agree: writing the first-run template or a hand
-    // edit between the reads can change the saved port. Refuse before the backend
-    // and windows exist instead of running elsewhere than the file says;
-    // a restart applies the value currently in the file.
-    if settings.port != reservation.configured_port() {
-        fatal(
-            startup_ui_language(),
-            &UiMessage::new(MessageId::StartupPortMismatch)
-                .with_arg("port", serde_json::json!(settings.port))
-                .with_arg("claimed", serde_json::json!(reservation.configured_port())),
-        );
-    }
 
     // The key list travels beside the settings document, sealed for this
     // Windows user. A container that is absent, foreign or unreadable is not a
@@ -1407,33 +1390,17 @@ fn startup(app: &AppHandle, reservation: ReservedListener) {
         Ok(signal) => { app.manage(signal); },
         Err(err) => eprintln!("{APP_TITLE}: {err}."),
     }
-    // The port facts come from the reservation, before the backend takes it:
-    // the settings window reports the port this start asked for and the port
-    // that is really served, and neither follows the editable document.
-    let ports = StartupPorts {
-        configured: reservation.configured_port(),
-        actual: reservation.actual_port(),
-        fallback: reservation.fallback(),
-    };
+    // The settings window needs nothing about the port: the socket is this
+    // run's, and the editable document cannot move it.
     app.manage(PreferencesState::new(
         config_path,
         Arc::clone(&runtime),
         Arc::clone(&provider),
         secrets_error,
-        ports,
     ));
 
     // The in-process backend serves the socket this run reserved before a single
-    // window exists; `start` returns once that socket is accepting. A start that
-    // fell back serves the temporary port until the next restart, and keeps the
-    // saved one for that restart.
-    if reservation.fallback() {
-        eprintln!(
-            "speechek: port {} was in use at start; serving http://127.0.0.1:{} until the next start",
-            reservation.configured_port(),
-            reservation.actual_port()
-        );
-    }
+    // window exists; `start` returns once that socket is accepting.
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
     app.manage(Arc::clone(&diagnostics));
     let running = match backend::Backend::start(
@@ -2610,8 +2577,8 @@ fn create_settings_window(app: &AppHandle) {
     // and "the page asks by itself". The builder takes the only handler the
     // window offers for that.
     let loaded = app.clone();
-    // The one URL this window may be on, derived from the running dev URL so a
-    // start on the temporary port of a fallback is matched too.
+    // The one URL this window may be on, derived from the running dev URL so
+    // whatever port this start was given is matched too.
     let nav_url = resolved_app_page(app.config().build.dev_url.as_ref(), SETTINGS_PAGE_PATH);
     let load_url = nav_url.clone();
     let window = WebviewWindowBuilder::new(
@@ -3880,18 +3847,24 @@ async fn insert_text(
 /* Startup                                                                     */
 /* -------------------------------------------------------------------------- */
 
+/// Why the run could not claim its loopback socket, as the descriptor for the
+/// native dialog `setup` shows before any window exists.
+fn reservation_failure(error: &UiError) -> UiMessage {
+    UiMessage::new(MessageId::StartupReserveFailed)
+        .with_arg("detail", nested_cause(&error.ui))
+}
+
 /// Builds the shell: the single-instance guard, then configuration, backend,
 /// launcher, tray, hidden overlay and the watcher, and the exit path that gives
 /// the backend's port back.
 ///
-/// The loopback port is decided before the shell is built — the settings
-/// document is read, and the socket bound, while no window can exist — so the
-/// origin the three windows are served from and the socket the backend answers
-/// on are one decision, with no gap another process could bind into. A failure
-/// to preflight or reserve is not reported here: Tauri is built first so the
-/// single-instance plugin can hand a second launch to the shell that is running,
-/// and the failure becomes the native dialog in `setup` below, before any window
-/// exists.
+/// The loopback socket is reserved before the shell is built, while no window
+/// can exist, so the origin the three windows are served from and the socket
+/// the backend answers on are one decision, with no gap another process could
+/// bind into. A failure to reserve is not reported here: Tauri is built first
+/// so the single-instance plugin can hand a second launch to the shell that is
+/// running, and the failure becomes the native dialog in `setup` below, before
+/// any window exists.
 ///
 /// A startup problem that cannot be repaired is fatal and shows a native
 /// dialog: a shell that runs without the backend its pages are served from is
@@ -3902,30 +3875,8 @@ async fn insert_text(
 /// The command list below is the same inventory the build script declares to
 /// Tauri: a label capability only closes the commands the manifest names, so both
 /// lists have to agree with each other and with `src-tauri/build.rs`.
-/// Why the run could not claim its loopback socket, before any window exists:
-/// a settings document the preflight refused, or a port the reservation could
-/// not bind. Both become one native dialog in `setup`.
-enum StartupFailure {
-    Config(settings::ConfigError),
-    Reserve(UiError),
-}
-
-impl StartupFailure {
-    /// The reason as a descriptor for the native dialog.
-    fn ui(&self) -> UiMessage {
-        match self {
-            StartupFailure::Config(error) => error.ui.clone(),
-            StartupFailure::Reserve(error) => {
-                UiMessage::new(MessageId::StartupReserveFailed)
-                    .with_arg("detail", nested_cause(&error.ui))
-            }
-        }
-    }
-}
 pub fn run() {
-    let reservation: Result<ReservedListener, StartupFailure> = settings::preflight_port()
-        .map_err(StartupFailure::Config)
-        .and_then(|port| backend::reserve(port).map_err(StartupFailure::Reserve));
+    let reservation: Result<ReservedListener, UiError> = backend::reserve();
 
     let mut context = tauri::generate_context!();
     // The flavor owns the identity the shell runs under: a debug build must not
@@ -3944,10 +3895,9 @@ pub fn run() {
     if let Ok(reserved) = &reservation {
         // Built without `custom-protocol`, this shell resolves `WebviewUrl::App`
         // against `build.dev_url` and treats those URLs as local to the ACL, so
-        // overriding it here is what makes the three windows load from the
-        // backend that owns the port — the configured one, or the temporary one
-        // it fell back to.
-        let origin = format!("http://127.0.0.1:{}/", reserved.actual_port());
+        // overriding it here is what makes the three windows load from the port
+        // this start's socket was given.
+        let origin = format!("http://127.0.0.1:{}/", reserved.port());
         context.config_mut().build.dev_url =
             Some(Url::parse(&origin).expect("a loopback origin is always a valid URL"));
     }
@@ -3997,7 +3947,7 @@ pub fn run() {
             // no window exists yet, so the deferred failure is reported here.
             let reservation = match reservation {
                 Ok(reservation) => reservation,
-                Err(failure) => fatal(startup_ui_language(), &failure.ui()),
+                Err(error) => fatal(startup_ui_language(), &reservation_failure(&error)),
             };
             startup(app.handle(), reservation);
             Ok(())
@@ -4110,7 +4060,6 @@ mod tests {
                 hotkey: "F2".to_owned(),
                 mode: "live".to_owned(),
                 mute_during_recording: false,
-                port: crate::settings::DEFAULT_PORT,
                 input_device: None,
                 language: crate::i18n::Language::En,
                 custom_vocabulary: Arc::default(),
@@ -4184,9 +4133,9 @@ mod tests {
     }
 
     /// A page gate resolves its URL from the dev URL the shell is really serving
-    /// from, not from a fixed port: the page of a start that fell back to a
-    /// temporary port is accepted, and the same page on any other port, under
-    /// another host, with a query, a fragment or a lookalike path is refused.
+    /// from, not from a fixed port: the page on this start's own port is
+    /// accepted, and the same page on any other port, under another host, with
+    /// a query, a fragment or a lookalike path is refused.
     #[test]
     fn a_page_gate_follows_the_running_dev_url() {
         let dev_url = Url::parse("http://127.0.0.1:43117/").expect("a loopback dev URL");
@@ -4201,7 +4150,7 @@ mod tests {
         ));
 
         for foreign in [
-            "http://127.0.0.1:4173/settings.html", // the old fixed port
+            "http://127.0.0.1:4173/settings.html", // a port this start did not get
             "http://127.0.0.1:43118/settings.html", // a neighbouring port
             "http://localhost:43117/settings.html", // another loopback host
             "http://127.0.0.1:43117/overlay.html",  // the other restricted page
@@ -4268,7 +4217,6 @@ mod tests {
                 hotkey: "F2".to_owned(),
                 mode: "live".to_owned(),
                 mute_during_recording: false,
-                port: crate::settings::DEFAULT_PORT,
                 input_device: None,
                 language: crate::i18n::Language::En,
                 custom_vocabulary: Arc::default(),
@@ -4510,7 +4458,6 @@ mod tests {
                 hotkey: "F2".to_owned(),
                 mode: "live".to_owned(),
                 mute_during_recording: false,
-                port: crate::settings::DEFAULT_PORT,
                 input_device: None,
                 language: crate::i18n::Language::En,
                 custom_vocabulary: Arc::default(),
@@ -4708,7 +4655,6 @@ mod tests {
                 hotkey: "Ctrl+Shift+F9".to_owned(),
                 mode: "verbatim".to_owned(),
                 mute_during_recording: true,
-                port: 65_535,
                 input_device: Some("wasapi:card-two".to_owned()),
                 language: crate::i18n::Language::Ru,
                 custom_vocabulary: Arc::default(),

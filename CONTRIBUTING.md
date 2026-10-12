@@ -29,13 +29,13 @@ The official portable preview is built exactly that way by `scripts/prepare-prev
 
 The debug build is **portable**: double-click `src-tauri\target\debug\speechek.exe` to run it — no installer, shortcuts, uninstall entry or registry write. The Development profile keeps its `settings.json` and `secrets.bin` beside that EXE (inside `src-tauri\target\debug`), separate from the installed production app, which keeps them under `%APPDATA%\Speechek`; the two profiles never read each other's files.
 
-The three build profiles never share files, hotkeys or ports:
+The three build profiles never share files or hotkeys. Each runs a local server on `127.0.0.1`, with a free port chosen by Windows at every start:
 
-| Profile | Settings and keys | Default hotkey | First port | Interface language on first start |
-| --- | --- | --- | --- | --- |
-| Production (installed) | `%APPDATA%\Speechek` | `F2` | `4173` | Installer choice (`1033` English / `1049` Russian), else Windows UI language |
-| Development (debug EXE) | Beside the EXE | `Ctrl+Shift+F9` | `4174` | Ignores installer registry entries; Windows UI language |
-| Test | `%APPDATA%\Speechek-Test` or an absolute `SPEECHEK_CONFIG_PATH` | `Ctrl+Shift+F10` | `4175` | Reads only its own isolated installer entry, never Production's |
+| Profile | Settings and keys | Default hotkey | Interface language on first start |
+| --- | --- | --- | --- |
+| Production (installed) | `%APPDATA%\Speechek` | `F2` | Installer choice (`1033` English / `1049` Russian), else Windows UI language |
+| Development (debug EXE) | Beside the EXE | `Ctrl+Shift+F9` | Ignores installer registry entries; Windows UI language |
+| Test | `%APPDATA%\Speechek-Test` or an absolute `SPEECHEK_CONFIG_PATH` | `Ctrl+Shift+F10` | Reads only its own isolated installer entry, never Production's |
 
 A saved `language` in the profile always wins; changing it in the app never writes the installer registry value. The uninstaller removes only the Production profile, and the installer closes only a copy running from the install folder.
 
@@ -49,7 +49,7 @@ set RUSTFLAGS=
 
 Official releases are produced by the scripts in `scripts/` — see [docs/releasing.md](docs/releasing.md). Do not hand-assemble a release or create extra target directories to work around a locked executable.
 
-`tauri build` is **not** equivalent to the commands above: it enables custom-protocol, while the embedded WebView loads `devUrl` (default `http://127.0.0.1:4173`, the actual runtime port otherwise) served by the app itself.
+`tauri build` is **not** equivalent to the commands above: it enables custom-protocol, while the embedded WebView loads `devUrl` served by the app itself. The `devUrl` in `tauri.conf.json` is only a placeholder; at runtime the EXE replaces it with `http://127.0.0.1:<port>/`, using the port Windows assigned for that start.
 
 ## Check and test
 
@@ -128,7 +128,7 @@ The `dev-diagnostics` feature adds a debug-only local archive used to investigat
 1. **Escape cancels** a dictation before the text is handed to paste: it hides the overlay, stops capture and prevents late responses from pasting or changing the clipboard. The Finalizing → Pasting transition is synchronised with cancellation under one session lock; once the Windows Ctrl+V has been sent it cannot be recalled.
 2. **Stop on the hotkey is not cancel**: stop finishes recording and keeps the "processing" overlay until the result is ready; cancel hides the overlay and discards the result. Late frames, errors and responses from a previous generation must not affect a new session.
 3. **Keys live only in `secrets.bin`**, protected with DPAPI for the current user. HTTP exposes only ordinary settings; keys are sent to the settings window only via the explicit "show keys" command. Never use real keys or speech in automated checks and never commit them.
-4. **General settings apply immediately** (mode, mute, microphone, text hotkey); the local port is saved immediately and applied after a restart. API keys are applied only with the "apply keys" button. A started dictation keeps the snapshot captured at its start.
+4. **General settings apply immediately** (mode, mute, microphone, text hotkey). API keys are applied only with the "apply keys" button. A started dictation keeps the snapshot captured at its start.
 5. Keep the `/api/settings`, `/api/transcribe`, `/api/live` and `createRecorder` contracts; provider errors must not expose keys or turn intermediate Live text into final text.
 6. When you change hotkeys, file locations, user actions or the build, update the documentation in the same change.
 

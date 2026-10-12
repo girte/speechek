@@ -151,33 +151,14 @@ body.settings-body [hidden] { display: none !important; }
 .settings-hotkey-state { color: var(--accent-text); font-size: 13px; line-height: 1.5; margin: 8px 0 0; min-height: 1.5em; }
 .settings-hotkey-state:empty { margin-top: 0; }
 
-/* The port field: a narrow numeric text field with its own line, which carries
-   the temporary-port and restart notices. It never moves a control: the line
-   keeps its height, so a notice appearing above the footer does not shift the
-   fields the user is about to reach. */
-.settings-port-input {
-  width: 100%;
-  max-width: 160px;
-  font-family: Consolas, "Cascadia Code", monospace;
-  font-size: 16px;
-  padding: 10px 16px;
-  color: var(--text);
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: 7px;
-}
-.settings-port-input:focus-visible { outline: 3px solid var(--accent-text); outline-offset: 2px; }
-.settings-port-notice { color: var(--accent-text); font-size: 13px; line-height: 1.5; margin: 8px 0 0; min-height: 1.5em; }
-.settings-port-notice:empty { margin-top: 0; }
 /* The vocabulary field's own line for its term count and its recommendation:
-   like the port's notice it keeps a line of its own, so a count never shifts
-   the fields below it. */
+   it keeps a line of its own, so a count never shifts the fields below it. */
 .settings-vocabulary-notice { color: var(--accent-text); font-size: 13px; line-height: 1.5; margin: 8px 0 0; min-height: 1.5em; }
 .settings-vocabulary-notice:empty { margin-top: 0; }
 
 /* The device picker: the host's input devices plus the system-default entry.
-   Like the port field it has a line of its own for the unavailable-device
-   notice, so an absent device never shifts the fields below it. */
+   It has a line of its own for the unavailable-device notice, so an absent
+   device never shifts the fields below it. */
 .settings-device-select {
   width: 100%;
   max-width: 420px;

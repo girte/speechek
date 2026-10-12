@@ -475,10 +475,10 @@ Function ${Prefix}SpeechekOpenVerifiedProcess
     System::Call 'kernel32::GetLastError() i .r0'
     ${If} $0 = 87
     ${OrIf} $0 = 1168
-      Goto speck_${Tag}_proc_done ; the process is gone
+      Goto speck_${Tag}_proc_release ; the process is gone
     ${EndIf}
     StrCpy $SpeechekProcFatal 1
-    Goto speck_${Tag}_proc_done
+    Goto speck_${Tag}_proc_release ; restores $0-$2 from the stack
   ${EndIf}
 
   ; Full image path of the owning process.
@@ -660,8 +660,6 @@ Function ${Prefix}SpeechekOpenVerifiedProcess
     Pop $2
     Pop $1
     Pop $0
-
-  speck_${Tag}_proc_done:
 FunctionEnd
 
 ; Closes the installed Speechek instance in front of a replacement or an

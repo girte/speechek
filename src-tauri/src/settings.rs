@@ -7,8 +7,9 @@
 //! byte, and a replacement is written as a same-directory temporary file that
 //! is moved over the original, so a reader never sees a partial document. The
 //! API keys live in `secrets.bin` beside this file; the runtime never reads
-//! paths to plaintext key files from settings. The obsolete root `compare_all`
-//! property is ignored on read and removed on the next save.
+//! paths to plaintext key files from settings. The obsolete root properties
+//! `compare_all` and `port` are ignored on read and removed on the next save;
+//! `port` takes the comment block the shipped template wrote with it.
 //!
 //! No diagnostic ever echoes a value read from a configuration file - only
 //! paths, line numbers, field names and property names.
@@ -83,15 +84,23 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 /// development flavor.
 const SETTINGS_FILE_NAME: &str = "settings.json";
 
-/// The local loopback port a document that does not name one is read with, and
-/// the value the first-run document of this build spells out: the active
-/// flavor's table value, so a debug build never claims the released shell's
-/// port.
-pub(crate) const DEFAULT_PORT: u16 = profile::defaults(profile::ACTIVE).port;
-
 /// Annotated first-run template, embedded at build time so the executable needs
 /// no file beside it.
 const SETTINGS_EXAMPLE: &str = include_str!("../../config/settings.example.json");
+
+/// The six comment lines the shipped template wrote in front of the `port`
+/// property it also shipped, without their line endings: a document saved with
+/// CRLF matches them, and the migration removes the document's own bytes. The
+/// lines are the released template's own, not a translation of them, because
+/// only an unchanged block is one this migration may take out of a user's file.
+const OBSOLETE_PORT_COMMENTS: [&str; 6] = [
+    "  // port: порт внутреннего сервера Speechek на 127.0.0.1, целое число от 1",
+    "  // до 65535. Значение ниже — production-умолчание 4173; debug-профили",
+    "  // используют 4174 (Development) и 4175 (Test). Новое значение применяется",
+    "  // после перезапуска приложения. Если при запуске порт занят, Speechek",
+    "  // временно откроется на свободном порту и покажет это в окне настроек, не",
+    "  // перезаписывая сохранённое значение.",
+];
 
 /// The byte order mark a UTF-8 document may start with. [`decode_utf8_bytes`]
 /// drops it from the content it hands back; [`read_settings_text`] and
@@ -178,38 +187,36 @@ const HOTKEY_NAMED_KEYS: &[&str] = &[
 
 /// Launcher settings. `/api/settings` publishes `hotkey` and `mode` and nothing
 /// else; the settings window reads this same struct, `mute_during_recording`,
-/// `port`, `input_device`, `language`, `custom_vocabulary` and
-/// `dictation_languages` included.
+/// `input_device`, `language`, `custom_vocabulary` and `dictation_languages`
+/// included.
 ///
-/// `mute_during_recording`, `port`, `input_device`, `language`,
-/// `custom_vocabulary` and `dictation_languages` are the managed values a
-/// document may omit: a file written before each existed has no such property,
-/// and it reads as the documented default there - `false`, the active flavor's
-/// default port, the system default input device, the language this profile
-/// would otherwise start in, an empty vocabulary and no language hints
-/// (Auto-detect) - not as a guess about a value the user chose.
+/// `mute_during_recording`, `input_device`, `language`, `custom_vocabulary` and
+/// `dictation_languages` are the managed values a document may omit: a file
+/// written before each existed has no such property, and it reads as the
+/// documented default there - `false`, the system default input device, the
+/// language this profile would otherwise start in, an empty vocabulary and no
+/// language hints (Auto-detect) - not as a guess about a value the user chose.
 /// The patch writes the properties into the document on the next change, so the
 /// values a page chose survive the save rather than being read back as missing
 /// and refused.
 ///
-/// `port` is the local loopback port the next start uses; changing it while the
-/// shell runs leaves the current server where it is, so the stored value is the
-/// desired one and a restart is what applies it. `input_device` is a
-/// `cpal::DeviceId` in its `Display`/`FromStr` form, or `None` for the system
-/// default input device; the device is looked up when a recording opens, so a
-/// stored id whose device is not connected keeps its stored value and is warned
-/// about instead of being silently replaced.
+/// `input_device` is a `cpal::DeviceId` in its `Display`/`FromStr` form, or
+/// `None` for the system default input device; the device is looked up when a
+/// recording opens, so a stored id whose device is not connected keeps its
+/// stored value and is warned about instead of being silently replaced.
 ///
-/// `compare_all` is not part of this struct: a document may still carry the
-/// root property from when it was managed, and it is ignored when the file is
-/// read and removed by the next [`patch_settings_document`].
+/// The loopback port is not part of this struct: Windows assigns a free one at
+/// every start, so there is nothing to store and nothing to configure.
+/// `compare_all` and `port` are no longer managed values either: a document may
+/// still carry either root property from when it was managed, and both are
+/// ignored when the file is read and removed by the next
+/// [`patch_settings_document`] - `port` together with the comment block the
+/// shipped template wrote in front of it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     pub hotkey: String,
     pub mode: String,
     pub mute_during_recording: bool,
-    /// The loopback port read at the next start, in `1..=65535`.
-    pub port: u16,
     /// The selected input device id, or `None` for the system default device.
     pub input_device: Option<String>,
     /// The interface language, in its lowercase wire spelling. A document that
@@ -390,15 +397,13 @@ fn acl_read_failed(path: &Path, reason: UiMessage) -> ConfigError {
 
 /// Reads and validates the settings file: `hotkey` and `mode` are both
 /// required, so a half-written file stops the launcher instead of running with
-/// a value nobody chose. `mute_during_recording`, `port` and `input_device` may
-/// be absent - the documented defaults of a file written before they existed
-/// (`false`, the active flavor's default port, the system default input
-/// device) - but a value that is
-/// present has to be a JSON boolean, an integer in `1..=65535` or `null` / a
-/// non-empty device id string. An obsolete root `compare_all` property is
-/// ignored here and removed by the next patch. Whole-line `//` comments are
-/// allowed so the file can be annotated; inline comments and trailing commas
-/// are not.
+/// a value nobody chose. `mute_during_recording` and `input_device` may be
+/// absent - the documented defaults of a file written before they existed
+/// (`false`, the system default input device) - but a value that is present has
+/// to be a JSON boolean or `null` / a non-empty device id string. Obsolete root
+/// `compare_all` and `port` properties are ignored here and removed by the next
+/// patch. Whole-line `//` comments are allowed so the file can be annotated;
+/// inline comments and trailing commas are not.
 ///
 /// The hotkey is read as a non-empty string and is *not* checked against the
 /// shortcut grammar here: [`validate_hotkey`] does that when the launcher
@@ -545,17 +550,17 @@ pub fn startup_language(config_path: Option<&Path>) -> Language {
 }
 
 /// Replaces the launcher values in `raw` and removes the obsolete root
-/// `compare_all` property, preserving comments, byte order mark, line endings,
-/// property order and every unknown property byte for byte.
+/// `compare_all` and `port` properties, preserving comments, byte order mark,
+/// line endings, property order and every unknown property byte for byte.
 ///
-/// Only managed values are edited; `compare_all` is removed with its separator
-/// comma. A required property that is missing or repeated is an error rather
-/// than a guessed default, while `mute_during_recording`, `port`,
+/// Only managed values are edited; an obsolete property leaves with its
+/// separator comma, and `port` takes the comment block the released template
+/// wrote with it. A required property that is missing or repeated is an error
+/// rather than a guessed default, while `mute_during_recording`,
 /// `input_device`, `language`, `custom_vocabulary` and `dictation_languages`
-/// are inserted together
-/// when missing, in that fixed order in front of the first property using its
-/// indentation and line ending. The result is read back and compared with
-/// `settings` before it is returned.
+/// are inserted together when missing, in that fixed order in front of the
+/// first property using its indentation and line ending. The result is read
+/// back and compared with `settings` before it is returned.
 ///
 /// The result is the whole document: a leading byte order mark in `raw` is kept
 /// in front of it, so the caller writes [`patch_settings_document`]'s text as
@@ -580,9 +585,6 @@ pub fn patch_settings_document(raw: &str, settings: &Settings) -> Result<String,
     let mode = ts_trim(&settings.mode);
     if !matches!(mode, "live" | "smart" | "verbatim") {
         return Err(invalid("mode"));
-    }
-    if settings.port == 0 {
-        return Err(invalid("port"));
     }
     if settings
         .input_device
@@ -612,14 +614,9 @@ pub fn patch_settings_document(raw: &str, settings: &Settings) -> Result<String,
         .ok_or_else(|| ConfigError::new(UiMessage::new(MessageId::ConfigDocumentNotObject)))?;
 
     // The values already in the document are read through the same rule the
-    // loader uses, so a stored port or device that could never be used refuses
-    // the write: it is repaired in the settings window, not silently rewritten
-    // here with a value nobody chose.
-    if let Some(member) = single_member(&members, "port")? {
-        if member_port(member, &masked).is_none() {
-            return Err(invalid("port"));
-        }
-    }
+    // loader uses, so a device that could never be used refuses the write: it is
+    // repaired in the settings window, not silently rewritten here with a value
+    // nobody chose.
     if let Some(member) = single_member(&members, "input_device")? {
         let usable = match member_value(member, &masked) {
             Value::Null => true,
@@ -668,10 +665,6 @@ pub fn patch_settings_document(raw: &str, settings: &Settings) -> Result<String,
             settings.mute_during_recording.to_string(),
         )),
     }
-    match single_member(&members, "port")? {
-        Some(member) => edits.push((member.value_span.clone(), settings.port.to_string())),
-        None => missing.push(("port", settings.port.to_string())),
-    }
     let device = match &settings.input_device {
         Some(device) => json_string(device),
         None => "null".to_owned(),
@@ -699,9 +692,15 @@ pub fn patch_settings_document(raw: &str, settings: &Settings) -> Result<String,
     }
     member_insertion_edits(body, &masked, &members, &missing, &mut edits);
 
-    // Retire the obsolete setting without changing unrelated document bytes.
-    if let Some(member) = single_member(&members, "compare_all")? {
-        member_removal_edits(&masked, member, &mut edits);
+    // Obsolete root properties are retired without changing unrelated bytes;
+    // `port` takes the comment block the released template wrote with it.
+    for (name, comments) in [
+        ("compare_all", None),
+        ("port", Some(&OBSOLETE_PORT_COMMENTS[..])),
+    ] {
+        if let Some(member) = single_member(&members, name)? {
+            member_removal_edits(&masked, body, member, comments, &mut edits);
+        }
     }
 
     let patched = splice(body, &mut edits);
@@ -710,7 +709,8 @@ pub fn patch_settings_document(raw: &str, settings: &Settings) -> Result<String,
 }
 
 /// Reads a patched document back and refuses a patch that fails to round-trip
-/// settings or still carries the obsolete `compare_all` property.
+/// settings or still carries an obsolete root property - `compare_all` or
+/// `port` - so a patch never reports success on a file it failed to migrate.
 fn verify_patched(document: &str, settings: &Settings) -> Result<(), ConfigError> {
     let text = strip_comment_lines(document_body(document));
     if !matches!(serde_json::from_str::<Value>(&text), Ok(Value::Object(_))) {
@@ -726,7 +726,6 @@ fn verify_patched(document: &str, settings: &Settings) -> Result<(), ConfigError
         hotkey: ts_trim(&settings.hotkey).to_owned(),
         mode: ts_trim(&settings.mode).to_owned(),
         mute_during_recording: settings.mute_during_recording,
-        port: settings.port,
         input_device: settings.input_device.clone(),
         language: settings.language,
         custom_vocabulary: Arc::clone(&settings.custom_vocabulary),
@@ -737,10 +736,13 @@ fn verify_patched(document: &str, settings: &Settings) -> Result<(), ConfigError
             MessageId::ConfigPatchReadbackMismatch,
         )));
     }
-    if single_member(&members, "compare_all")?.is_some() {
-        return Err(ConfigError::new(UiMessage::new(
-            MessageId::ConfigCompareAllNotRemoved,
-        )));
+    for name in ["compare_all", "port"] {
+        if single_member(&members, name)?.is_some() {
+            return Err(ConfigError::new(
+                UiMessage::new(MessageId::ConfigObsoletePropertyNotRemoved)
+                    .with_arg("name", text_arg(name)),
+            ));
+        }
     }
     Ok(())
 }
@@ -752,27 +754,121 @@ fn verify_patched(document: &str, settings: &Settings) -> Result<(), ConfigError
 /// may sit between the comma and the property, and every byte of the user's
 /// document except the property and that one comma has to survive. `document`
 /// is the masked text, so a comment line cannot hide the comma.
-fn member_removal_edits<'a>(
+///
+/// `block`, when given, is the comment block the released template wrote in
+/// front of the property. The property then leaves with the whole block - the
+/// six shipped comment lines, its own line and the blank line the block closed
+/// with - so a document that shipped with it and the document the shipped
+/// template writes today are the same file once the migration is done.
+/// `original` holds the document's own bytes, because `document` has its
+/// comment lines blanked and the block being looked for is made of comments.
+fn member_removal_edits(
     document: &str,
-    member: &'a RootMember,
+    original: &str,
+    member: &RootMember,
+    block: Option<&[&str]>,
     edits: &mut Vec<(Range<usize>, String)>,
 ) {
     let bytes = document.as_bytes();
-    edits.push((member.name_span.start..member.value_span.end, String::new()));
-
     let after = skip_json_whitespace(bytes, member.value_span.end);
-    if bytes.get(after) == Some(&b',') {
+    let comma_after = bytes.get(after) == Some(&b',');
+
+    if let Some(comments) = block {
+        if let Some(start) = shipped_comment_block(original, member, comments) {
+            let line = line_end(original, start_of_line(original, member.name_span.start));
+            // The blank line the block closed with belongs to the block, not to
+            // the property that follows it.
+            let end = if line_content(original, line).trim().is_empty() {
+                line_end(original, line)
+            } else {
+                line
+            };
+            edits.push((start..end, String::new()));
+            // A property that is not the last one already leaves with the comma
+            // after its value; as the last one, the separator is the comma
+            // before the block, even though comment lines sit between them.
+            if !comma_after {
+                if let Some(comma) = comma_before(bytes, start) {
+                    edits.push((comma..comma + 1, String::new()));
+                }
+            }
+            return;
+        }
+    }
+
+    edits.push((member.name_span.start..member.value_span.end, String::new()));
+    if comma_after {
         edits.push((after..after + 1, String::new()));
     } else if let Some(comma) = comma_before(bytes, member.name_span.start) {
         edits.push((comma..comma + 1, String::new()));
     }
 }
 
+/// Where the shipped comment block in front of `member` begins, when the
+/// document carries it exactly: the lines above the property reproduce
+/// `comments` linewise, ignoring only each line's own ending, and the property
+/// shares its line with nothing but its value and its separator comma. `None`
+/// means the block is not the shipped one - a line was translated, edited or
+/// written by the user - or the property is not alone on its line, and the
+/// property then leaves without any comment.
+fn shipped_comment_block(document: &str, member: &RootMember, comments: &[&str]) -> Option<usize> {
+    let start = start_of_line(document, member.name_span.start);
+    let tail = document[member.value_span.end..content_end(document, start)].trim();
+    if !(tail.is_empty() || tail == ",") {
+        return None;
+    }
+    let mut begin = start;
+    for wanted in comments.iter().rev() {
+        if begin == 0 {
+            return None;
+        }
+        begin = start_of_line(document, begin - 1);
+        if line_content(document, begin) != *wanted {
+            return None;
+        }
+    }
+    Some(begin)
+}
+
+/// The byte index where the line holding `index` begins.
+fn start_of_line(document: &str, index: usize) -> usize {
+    document[..index].rfind('\n').map_or(0, |newline| newline + 1)
+}
+
+/// The byte index just past the line ending of the line that begins at `start`:
+/// where the next line begins, or the end of the document when that line is the
+/// last one and carries no ending.
+fn line_end(document: &str, start: usize) -> usize {
+    match document[start..].find('\n') {
+        Some(offset) => start + offset + 1,
+        None => document.len(),
+    }
+}
+
+/// The byte index where the line that begins at `start` ends without its line
+/// ending, so `document[start..content_end]` is the line's own text whatever
+/// ending it carries.
+fn content_end(document: &str, start: usize) -> usize {
+    let mut end = line_end(document, start);
+    if end > start && document.as_bytes()[end - 1] == b'\n' {
+        end -= 1;
+        if end > start && document.as_bytes()[end - 1] == b'\r' {
+            end -= 1;
+        }
+    }
+    end
+}
+
+/// The line that begins at `start`, without its line ending.
+fn line_content(document: &str, start: usize) -> &str {
+    &document[start..content_end(document, start)]
+}
+
 /// Adds the single edit that gives a document the properties it does not carry
 /// yet. Each missing property is written as `"name": value` in the order given,
 /// and all of them go into one insertion in front of the first root property,
 /// with that property's own indentation and line ending: a document from before
-/// `mute_during_recording`, `port`, `input_device`, `language`,
+/// `mute_during_recording`, `input_device`, `language`,
 /// `custom_vocabulary` or `dictation_languages` existed has no
 /// such values to write, and one edit keeps the spans of several zero-width
 /// insertions from piling up at the same offset. Every other byte - the
@@ -871,7 +967,6 @@ fn requirement(name: &str) -> UiMessage {
     let key = match name {
         "hotkey" => MessageId::ConfigHotkeyRequirement,
         "mode" => MessageId::ConfigModeRequirement,
-        "port" => MessageId::ConfigPortRequirement,
         "input_device" => MessageId::ConfigInputDeviceRequirement,
         "language" => MessageId::ConfigLanguageRequirement,
         "custom_vocabulary" => MessageId::ConfigCustomVocabularyRequirement,
@@ -882,16 +977,16 @@ fn requirement(name: &str) -> UiMessage {
 }
 
 /// The managed properties of a document, each typed and checked.
-/// `mute_during_recording`, `port`, `input_device`, `language`,
-/// `custom_vocabulary` and `dictation_languages` are the ones that may be
-/// absent - a document written before them reads as `false`, the active
-/// flavor's default port, the system default input device, the default
-/// language, an empty vocabulary and no language hints there -
-/// while every other missing or malformed
-/// property refuses the document. The obsolete root `compare_all`
-/// is not read at all: the patch removes it, so it never becomes a value.
-/// `config_path` names the file a problem belongs to when the caller has one;
-/// the patch readback describes itself without a path. A value is never quoted.
+/// `mute_during_recording`, `input_device`, `language`, `custom_vocabulary` and
+/// `dictation_languages` are the ones that may be absent - a document written
+/// before them reads as `false`, the system default input device, the default
+/// language, an empty vocabulary and no language hints there - while every
+/// other missing or malformed property refuses the document. The obsolete root
+/// `compare_all` and `port` are not read at all: the patch removes them, so
+/// neither ever becomes a value, and a document that carries one of them twice
+/// is refused because it could not be migrated unambiguously. `config_path`
+/// names the file a problem belongs to when the caller has one; the patch
+/// readback describes itself without a path. A value is never quoted.
 fn settings_from_members(
     members: &[RootMember],
     document: &str,
@@ -934,12 +1029,12 @@ fn settings_from_members(
         .filter(|value| matches!(value.as_str(), "live" | "smart" | "verbatim"))
         .ok_or_else(|| invalid("mode"))?;
 
-    // The obsolete `compare_all` is not a value, but a document that carries it
-    // more than once is one the patch could not migrate either, so it is refused
-    // with the wording a repeated managed property gets rather than loading into
-    // a file the writer will not touch.
-    if let Err(error) = single_member(members, "compare_all") {
-        return Err(named(error.ui));
+    // An obsolete value is never read as one, but a document that carries it
+    // twice is refused: the patch could not migrate it unambiguously.
+    for name in ["compare_all", "port"] {
+        if let Err(error) = single_member(members, name) {
+            return Err(named(error.ui));
+        }
     }
 
     let mute_during_recording = match single_member(members, "mute_during_recording") {
@@ -949,14 +1044,6 @@ fn settings_from_members(
         // The property is optional and its absence is the documented default,
         // so an annotated file from before the switch still loads.
         Ok(None) => false,
-        Err(error) => return Err(named(error.ui)),
-    };
-
-    let port = match single_member(members, "port") {
-        Ok(Some(port)) => member_port(port, document).ok_or_else(|| invalid("port"))?,
-        // A document written before the port was managed reads with the default
-        // the first-run template documents.
-        Ok(None) => DEFAULT_PORT,
         Err(error) => return Err(named(error.ui)),
     };
 
@@ -1006,7 +1093,6 @@ fn settings_from_members(
         hotkey,
         mode,
         mute_during_recording,
-        port,
         input_device,
         language,
         custom_vocabulary,
@@ -1020,16 +1106,6 @@ fn member_string(member: &RootMember, document: &str) -> Option<String> {
     member_value(member, document)
         .as_str()
         .map(|value| ts_trim(value).to_owned())
-}
-
-/// The value of a `port` member as the loopback port it names: a whole number
-/// in `1..=65535`, and `None` for any other JSON value - a string, a fraction, a
-/// boolean, a null or a number outside the range a port can have.
-fn member_port(member: &RootMember, document: &str) -> Option<u16> {
-    member_value(member, document)
-        .as_u64()
-        .and_then(|value| u16::try_from(value).ok())
-        .filter(|port| *port > 0)
 }
 
 /// The interface language a member spells: the lowercase wire value `"en"` or
@@ -1182,7 +1258,7 @@ fn splice(document: &str, edits: &mut Vec<(Range<usize>, String)>) -> String {
 /// and a release build reads neither it nor any variable.
 ///
 /// Nothing here touches the disk: [`create_default_if_missing`] writes the
-/// first-run document, and a preflight on top of this must not create one.
+/// first-run document.
 pub fn settings_path() -> Result<PathBuf, ConfigError> {
     // One flavor is compiled in, so exactly one of these selections exists in
     // a given build: a release build reads no environment path at all, and the
@@ -1317,80 +1393,13 @@ fn dev_executable_error(reason: UiMessage) -> ConfigError {
     )
 }
 
-/// The loopback port the next start should claim, resolved before the shell is
-/// built and without touching anything on disk.
-///
-/// The document is the one [`settings_path`] names - beside the development
-/// executable, the test flavor's override or `%APPDATA%` document, the
-/// production profile otherwise. A document that is not there yet reads as
-/// [`DEFAULT_PORT`], the port the flavor's first-run document spells out; a
-/// document that is there is read through the same reader the startup uses, so
-/// a stored port that cannot be served, or a document that cannot be read at
-/// all, stops this run instead of being replaced by a port nobody chose.
-/// Nothing here creates or rewrites a file: writing the first-run document and
-/// re-reading the port are the shell's startup, and the port returned here is
-/// checked against that re-read before a socket is served or a window exists.
-pub fn preflight_port() -> Result<u16, ConfigError> {
-    match preflight_document(settings_path()?) {
-        None => Ok(DEFAULT_PORT),
-        Some(path) => {
-            read_settings_document(&path, MessageId::SettingsFileRole).map(|settings| settings.port)
-        }
-    }
-}
-
-/// [`preflight_port`] with the flavor, both environment values and the
-/// executable path as arguments, for the regression matrix: the compiled-in
-/// flavor and the process environment are never consulted, and the same
-/// arguments resolve exactly the document [`settings_path`] would.
-#[cfg(test)]
-fn preflight_port_from(
-    flavor: BuildFlavor,
-    config_override: Option<&OsStr>,
-    appdata: Option<&OsStr>,
-    executable: Option<&Path>,
-) -> Result<u16, ConfigError> {
-    match preflight_document_from(flavor, config_override, appdata, executable)? {
-        None => Ok(profile::defaults(flavor).port),
-        Some(path) => {
-            read_settings_document(&path, MessageId::SettingsFileRole).map(|settings| settings.port)
-        }
-    }
-}
-
-/// The settings document that startup will read, resolved the way
-/// [`settings_path`] resolves it, but without writing anything. Test-only: the
-/// runtime path goes through [`settings_path`], so the environment and the
-/// executable path are read in one place.
-#[cfg(test)]
-fn preflight_document_from(
-    flavor: BuildFlavor,
-    config_override: Option<&OsStr>,
-    appdata: Option<&OsStr>,
-    executable: Option<&Path>,
-) -> Result<Option<PathBuf>, ConfigError> {
-    Ok(preflight_document(resolve_settings_path(
-        flavor,
-        config_override,
-        appdata,
-        executable,
-    )?))
-}
-
-/// The document under `path`, when an entry is there to read: `None` means the
-/// startup will write the flavor's first-run document, whose port is
-/// [`DEFAULT_PORT`].
-fn preflight_document(path: PathBuf) -> Option<PathBuf> {
-    fs::symlink_metadata(&path).is_ok().then_some(path)
-}
-
 /// Creates the settings file for a first run: the flavor's annotated template
 /// (embedded at build time, then brought to the active flavor's first-run
-/// hotkey and port) as `settings.json`, written with `create_new` so nothing
-/// that exists is ever overwritten. Returns `true` when the default file was
-/// written, which tells the caller to continue startup with the settings window
-/// open on the key section; `false` means the existing file is left exactly as
-/// it was found.
+/// hotkey and language) as `settings.json`, written with `create_new` so
+/// nothing that exists is ever overwritten. Returns `true` when the default
+/// file was written, which tells the caller to continue startup with the
+/// settings window open on the key section; `false` means the existing file is
+/// left exactly as it was found.
 ///
 /// The key container is not created here: `secrets.bin` is written by the first
 /// explicit key apply of the settings window, so an installation without keys
@@ -1426,8 +1435,8 @@ pub fn create_default_if_missing(path: &Path) -> Result<bool, ConfigError> {
 }
 
 /// The annotated document [`create_default_if_missing`] writes: the production
-/// template brought to the flavor's first-run hotkey and port and to the
-/// language this profile starts in.
+/// template brought to the flavor's first-run hotkey and to the language this
+/// profile starts in.
 ///
 /// The template itself stays the production one: it is the document the
 /// distributed shell ships and the file a user reads. The flavor's own values
@@ -1451,14 +1460,10 @@ fn first_run_document(
         MessageId::SettingsTemplateRole,
         language,
     )?;
-    if settings.hotkey == defaults.hotkey
-        && settings.port == defaults.port
-        && settings.language == language
-    {
+    if settings.hotkey == defaults.hotkey && settings.language == language {
         return Ok(Cow::Borrowed(SETTINGS_EXAMPLE));
     }
     settings.hotkey = defaults.hotkey.to_owned();
-    settings.port = defaults.port;
     settings.language = language;
     Ok(Cow::Owned(patch_settings_document(
         SETTINGS_EXAMPLE,
@@ -2803,12 +2808,13 @@ mod tests {
     use super::*;
 
     /// A byte order mark, CRLF and nested unknown values survive the patch.
-    /// The obsolete `compare_all` property disappears, while unrelated root
-    /// properties and user comments remain unchanged.
+    /// The obsolete `compare_all` and `port` properties disappear - each line
+    /// keeps only its own indentation - while unrelated root properties and user
+    /// comments remain unchanged.
     #[test]
     fn patching_a_marked_commented_document_keeps_every_other_byte() {
         let document = "\u{feff}// Speechek settings\r\n{\r\n  // Этот файл сохранён в UTF-8 с BOM.\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": \"wasapi:card-one\",\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"compare_all\": false,\r\n\r\n  // Заметки пользователя и вложенный объект.\r\n  \"notes\": {\r\n    \"text\": \"keep this value\",\r\n    \"nested\": [1, 2, { \"deep\": true }]\r\n  },\r\n  \"trailing\": null,\r\n  // Дополнительное поле пользователя.\r\n  \"extra\": \"kept\"\r\n}\r\n";
-        let expected = "\u{feff}// Speechek settings\r\n{\r\n  // Этот файл сохранён в UTF-8 с BOM.\r\n  \"hotkey\": \"Ctrl+Shift+F9\",\r\n  \"mode\": \"verbatim\",\r\n  \"mute_during_recording\": true,\r\n  \"port\": 43118,\r\n  \"input_device\": \"wasapi:card-two\",\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [\"Speechek\"],\r\n  \"dictation_languages\": [\"ru-RU\",\"en-US\"],\r\n  \r\n\r\n  // Заметки пользователя и вложенный объект.\r\n  \"notes\": {\r\n    \"text\": \"keep this value\",\r\n    \"nested\": [1, 2, { \"deep\": true }]\r\n  },\r\n  \"trailing\": null,\r\n  // Дополнительное поле пользователя.\r\n  \"extra\": \"kept\"\r\n}\r\n";
+        let expected = "\u{feff}// Speechek settings\r\n{\r\n  // Этот файл сохранён в UTF-8 с BOM.\r\n  \"hotkey\": \"Ctrl+Shift+F9\",\r\n  \"mode\": \"verbatim\",\r\n  \"mute_during_recording\": true,\r\n  \r\n  \"input_device\": \"wasapi:card-two\",\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [\"Speechek\"],\r\n  \"dictation_languages\": [\"ru-RU\",\"en-US\"],\r\n  \r\n\r\n  // Заметки пользователя и вложенный объект.\r\n  \"notes\": {\r\n    \"text\": \"keep this value\",\r\n    \"nested\": [1, 2, { \"deep\": true }]\r\n  },\r\n  \"trailing\": null,\r\n  // Дополнительное поле пользователя.\r\n  \"extra\": \"kept\"\r\n}\r\n";
 
         let patched = patch_settings_document(
             document,
@@ -2816,7 +2822,6 @@ mod tests {
                 hotkey: "Ctrl+Shift+F9".to_owned(),
                 mode: "verbatim".to_owned(),
                 mute_during_recording: true,
-                port: 43118,
                 input_device: Some("wasapi:card-two".to_owned()),
                 language: Language::En,
                 custom_vocabulary: Arc::from(vec!["Speechek".to_owned()]),
@@ -2829,17 +2834,16 @@ mod tests {
     }
 
     /// The optional values a document may not carry: a file from before them
-    /// still loads as the documented defaults - `false`, the active flavor's
-    /// default port, the system default input device, the detected language,
-    /// an empty vocabulary and no dictation languages - and the first patch that
-    /// changes them writes all six properties into the document in one
-    /// insertion, in front of the first property and in that property's
-    /// indentation and CRLF, in the fixed order `mute_during_recording`,
-    /// `port`, `input_device`, `language`, `custom_vocabulary`,
-    /// `dictation_languages`, instead of readback refusing values the file does
-    /// not hold. Later patches replace the same bytes in place, and every other
-    /// byte of the document survives, including an unknown property between
-    /// them.
+    /// still loads as the documented defaults - `false`, the system default
+    /// input device, the detected language, an empty vocabulary and no
+    /// dictation languages - and the first patch that changes them writes all
+    /// five properties into the document in one insertion, in front of the
+    /// first property and in that property's indentation and CRLF, in the fixed
+    /// order `mute_during_recording`, `input_device`, `language`,
+    /// `custom_vocabulary`, `dictation_languages`, instead of readback refusing
+    /// values the file does not hold. Later patches replace the same bytes in
+    /// place, and every other byte of the document survives, including an
+    /// unknown property between them.
     #[test]
     fn a_document_without_the_optional_values_gains_them_in_one_patch() {
         let path = Path::new("settings.json");
@@ -2853,7 +2857,6 @@ mod tests {
         )
             .expect("a document from before the optional values");
         assert!(!loaded.mute_during_recording);
-        assert_eq!(loaded.port, DEFAULT_PORT);
         assert_eq!(loaded.input_device, None);
         assert!(loaded.custom_vocabulary.is_empty());
         assert!(loaded.dictation_languages.is_empty());
@@ -2862,7 +2865,6 @@ mod tests {
             hotkey: "F2".to_owned(),
             mode: "live".to_owned(),
             mute_during_recording: true,
-            port: 43118,
             input_device: Some("wasapi:card-one".to_owned()),
             language: Language::En,
             custom_vocabulary: Arc::from(vec!["Speechek".to_owned()]),
@@ -2871,7 +2873,7 @@ mod tests {
         let on_document = patch_settings_document(document, &switched_on).expect("a patch");
         assert_eq!(
             on_document,
-            "{\r\n  \"mute_during_recording\": true,\r\n  \"port\": 43118,\r\n  \"input_device\": \"wasapi:card-one\",\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [\"Speechek\"],\r\n  \"dictation_languages\": [\"ru-RU\"],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": { \"keep\": true }\r\n}\r\n"
+            "{\r\n  \"mute_during_recording\": true,\r\n  \"input_device\": \"wasapi:card-one\",\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [\"Speechek\"],\r\n  \"dictation_languages\": [\"ru-RU\"],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": { \"keep\": true }\r\n}\r\n"
         );
         assert_eq!(
             parse_settings_document_with_language(&on_document, path, MessageId::SettingsFileRole, Language::En)
@@ -2883,7 +2885,6 @@ mod tests {
             hotkey: "F2".to_owned(),
             mode: "live".to_owned(),
             mute_during_recording: false,
-            port: DEFAULT_PORT,
             input_device: None,
             language: Language::En,
             custom_vocabulary: Arc::default(),
@@ -2893,9 +2894,7 @@ mod tests {
             patch_settings_document(&on_document, &switched_off).expect("a patch");
         assert_eq!(
             off_document,
-            format!(
-                "{{\r\n  \"mute_during_recording\": false,\r\n  \"port\": {DEFAULT_PORT},\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": {{ \"keep\": true }}\r\n}}\r\n"
-            )
+            "{\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"notes\": { \"keep\": true }\r\n}\r\n"
         );
         assert_eq!(
             parse_settings_document_with_language(&off_document, path, MessageId::SettingsFileRole, Language::En)
@@ -2912,13 +2911,12 @@ mod tests {
     #[test]
     fn an_obsolete_compare_all_is_ignored_on_read_and_removed_by_the_next_patch() {
         let path = Path::new("settings.json");
-        let with = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"compare_all\": true,\r\n  \"notes\": 1\r\n}\r\n";
-        let without = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"notes\": 1\r\n}\r\n";
+        let with = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"compare_all\": true,\r\n  \"notes\": 1\r\n}\r\n";
+        let without = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"notes\": 1\r\n}\r\n";
         let expected = Settings {
             hotkey: "F2".to_owned(),
             mode: "smart".to_owned(),
             mute_during_recording: false,
-            port: 4173,
             input_device: None,
             language: Language::En,
             custom_vocabulary: Arc::default(),
@@ -2943,7 +2941,7 @@ mod tests {
         let patched = patch_settings_document(with, &expected).expect("a patch");
         assert_eq!(
             patched,
-            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \r\n  \"notes\": 1\r\n}\r\n"
+            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \r\n  \"notes\": 1\r\n}\r\n"
         );
         assert_eq!(
             parse_settings_document_with_language(&patched, path, MessageId::SettingsFileRole, Language::En)
@@ -2952,10 +2950,10 @@ mod tests {
         );
 
         // Writing: as the last property it loses the comma before it instead.
-        let last = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"compare_all\": true\r\n}\r\n";
+        let last = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"compare_all\": true\r\n}\r\n";
         assert_eq!(
             patch_settings_document(last, &expected).expect("a patch"),
-            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 4173,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": []\r\n  \r\n}\r\n"
+            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"smart\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": []\r\n  \r\n}\r\n"
         );
 
         // A repeated obsolete property cannot be migrated by the same rule the
@@ -2967,6 +2965,180 @@ mod tests {
             .expect_err("a repeated obsolete property must refuse the patch");
     }
 
+    /// The shipped template as the version that still managed `port` wrote it:
+    /// the block of six comment lines with the property under them, at the place
+    /// that version kept them. The lines come from the constant the migration
+    /// removes, so the fixture and the removal cannot drift apart, and the
+    /// anchor assertion fails if the template stops holding what the block
+    /// followed.
+    fn with_released_port_block(template: &str) -> String {
+        let released = template.replace(
+            "  \"mute_during_recording\": false,\n\n  // input_device:",
+            &format!(
+                "  \"mute_during_recording\": false,\n\n{}\n  \"port\": 4173,\n\n  // input_device:",
+                OBSOLETE_PORT_COMMENTS.join("\n")
+            ),
+        );
+        assert_ne!(released, template, "the template holds the port block's anchor");
+        released
+    }
+
+    /// Migrating the document the released template shipped is byte-for-byte the
+    /// template that ships today, so a profile that already saved the released
+    /// file ends up with the file a new installation starts from; the obsolete
+    /// property is not a value in either document.
+    #[test]
+    fn a_document_that_shipped_with_port_migrates_to_the_shipped_template() {
+        let path = Path::new("settings.example.json");
+        let released = with_released_port_block(SETTINGS_EXAMPLE);
+        assert!(
+            !SETTINGS_EXAMPLE.contains("\"port\""),
+            "the shipped template no longer carries the property"
+        );
+
+        let before = parse_settings_document_with_language(
+            &released,
+            path,
+            MessageId::SettingsTemplateRole,
+            Language::En,
+        )
+        .expect("the released template");
+        let after = parse_settings_document_with_language(
+            SETTINGS_EXAMPLE,
+            path,
+            MessageId::SettingsTemplateRole,
+            Language::En,
+        )
+        .expect("the shipped template");
+        assert_eq!(before, after, "the obsolete port is not a value");
+
+        assert_eq!(
+            patch_settings_document(&released, &before).expect("a patch"),
+            SETTINGS_EXAMPLE,
+            "the migrated document is the shipped template exactly"
+        );
+    }
+
+    /// An obsolete root `port` is ignored on read and removed by the next patch
+    /// together with the comment block the released template wrote with it: the
+    /// six comment lines, the property's own line and the blank line that closed
+    /// the block. The block is matched linewise, so the document's own line
+    /// endings - here CRLF - decide nothing.
+    #[test]
+    fn an_obsolete_port_is_ignored_on_read_and_removed_by_the_next_patch() {
+        let path = Path::new("settings.json");
+        let block = OBSOLETE_PORT_COMMENTS.join("\r\n");
+        let with = format!(
+            "{{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n\r\n{block}\r\n  \"port\": 5000,\r\n\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"notes\": \"kept\"\r\n}}\r\n"
+        );
+        let without = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"notes\": \"kept\"\r\n}\r\n";
+
+        let loaded = parse_settings_document_with_language(
+            &with,
+            path,
+            MessageId::SettingsFileRole,
+            Language::En,
+        )
+        .expect("a document that still carries the port");
+        assert_eq!(
+            loaded,
+            parse_settings_document_with_language(
+                without,
+                path,
+                MessageId::SettingsFileRole,
+                Language::En,
+            )
+            .expect("the same document without the property"),
+            "the obsolete port is not a value"
+        );
+        assert_eq!(
+            patch_settings_document(&with, &loaded).expect("a patch"),
+            without,
+            "the block and the property leave, every other byte stays"
+        );
+
+        // As the last property the block still leaves, and the comma that
+        // separated the property from the property before the block goes with
+        // it, so the document stays readable.
+        let last = format!(
+            "{{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"notes\": \"kept\",\r\n\r\n{block}\r\n  \"port\": 5000\r\n}}\r\n"
+        );
+        assert_eq!(
+            patch_settings_document(&last, &loaded).expect("a patch"),
+            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"notes\": \"kept\"\r\n\r\n}\r\n"
+        );
+    }
+
+    /// A repeated obsolete `port` cannot be migrated unambiguously, so neither
+    /// the loader nor the patch accepts it.
+    #[test]
+    fn a_repeated_obsolete_port_is_refused() {
+        let path = Path::new("settings.json");
+        let base = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": []\n}\n";
+        let settings = parse_settings_document_with_language(
+            base,
+            path,
+            MessageId::SettingsFileRole,
+            Language::En,
+        )
+        .expect("a document with every managed value");
+        let repeated = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": [],\n  \"port\": 4173,\n  \"port\": 4174\n}\n";
+
+        let error = parse_settings_document_with_language(
+            repeated,
+            path,
+            MessageId::SettingsFileRole,
+            Language::En,
+        )
+        .expect_err("a repeated obsolete property");
+        assert!(
+            serde_json::to_string(&error.ui)
+                .expect("a message serializes")
+                .contains("ConfigPropertyRepeated"),
+            "{:?}",
+            error.ui
+        );
+
+        let error = patch_settings_document(repeated, &settings)
+            .expect_err("a repeated obsolete property must refuse the patch");
+        assert_eq!(error.ui.key, MessageId::ConfigPropertyRepeated);
+    }
+
+    /// Only the released comment block leaves with the property: a comment the
+    /// user wrote above the block survives where it was, and a comment written
+    /// between the block and the property keeps the whole block, because the
+    /// property then no longer stands under the shipped lines.
+    #[test]
+    fn a_user_comment_around_an_obsolete_port_survives() {
+        let path = Path::new("settings.json");
+        let block = OBSOLETE_PORT_COMMENTS.join("\n");
+        let settings = parse_settings_document_with_language(
+            "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": []\n}\n",
+            path,
+            MessageId::SettingsFileRole,
+            Language::En,
+        )
+        .expect("a document with every managed value");
+
+        let above = format!(
+            "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  // моя заметка\n{block}\n  \"port\": 43118,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": []\n}}\n"
+        );
+        assert_eq!(
+            patch_settings_document(&above, &settings).expect("a patch"),
+            "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  // моя заметка\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": []\n}\n"
+        );
+
+        let inside = format!(
+            "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n{block}\n  // моя заметка\n  \"port\": 43118,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": []\n}}\n"
+        );
+        assert_eq!(
+            patch_settings_document(&inside, &settings).expect("a patch"),
+            format!(
+                "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n{block}\n  // моя заметка\n  \n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": []\n}}\n"
+            )
+        );
+    }
+
     /// `null` is the stored form of the system default input device - a value
     /// that says "use the system device", not a missing property - and a
     /// well-formed device id is kept as it stands even when no connected device
@@ -2976,7 +3148,7 @@ mod tests {
     #[test]
     fn a_null_device_is_the_system_default_and_a_stored_id_is_kept() {
         let path = Path::new("settings.json");
-        let default_device = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 5000,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": []\n}\n";
+        let default_device = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": [],\n  \"dictation_languages\": []\n}\n";
         let loaded = parse_settings_document_with_language(
             default_device,
             path,
@@ -2984,14 +3156,13 @@ mod tests {
             Language::En,
         )
             .expect("a null device");
-        assert_eq!(loaded.port, 5000);
         assert_eq!(loaded.input_device, None);
         assert_eq!(
             patch_settings_document(default_device, &loaded).expect("a patch"),
             default_device
         );
 
-        let chosen = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 5000,\n  \"input_device\": \"wasapi:card-one\",\n  \"language\": \"en\",\n  \"custom_vocabulary\": [\"Speechek\"],\n  \"dictation_languages\": [\"ru-RU\",\"en-US\"]\n}\n";
+        let chosen = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": \"wasapi:card-one\",\n  \"language\": \"en\",\n  \"custom_vocabulary\": [\"Speechek\"],\n  \"dictation_languages\": [\"ru-RU\",\"en-US\"]\n}\n";
         let loaded = parse_settings_document_with_language(
             chosen,
             path,
@@ -3008,46 +3179,31 @@ mod tests {
         );
     }
 
-    /// A `port` or `input_device` that is present has to be usable: a string, a
-    /// fraction, zero, a number above the port range, a negative number, a null
-    /// port, a non-string device, an empty string and a string no `cpal::DeviceId`
-    /// can parse all refuse the document; a repeated property with either name is
-    /// refused rather than one of the two values winning. No message quotes the
-    /// value it refused, and neither the loader nor the patch substitutes one.
+    /// An `input_device` that is present has to be usable: a number, a boolean,
+    /// an object, an empty string and a string no `cpal::DeviceId` can parse all
+    /// refuse the document; a repeated property is refused rather than one of the
+    /// two values winning. No message quotes the value it refused, and neither
+    /// the loader nor the patch substitutes one.
     #[test]
-    fn a_port_or_a_device_that_is_not_usable_is_refused() {
+    fn a_device_that_is_not_usable_is_refused() {
         let path = Path::new("settings.json");
-        let document_with = |property: &str, value: &str| {
+        let document_with = |value: &str| {
             format!(
-                "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"{property}\": {value}\n}}\n"
+                "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": {value}\n}}\n"
             )
         };
         let settings = Settings {
             hotkey: "F2".to_owned(),
             mode: "live".to_owned(),
             mute_during_recording: false,
-            port: DEFAULT_PORT,
             input_device: None,
             language: Language::En,
             custom_vocabulary: Arc::default(),
             dictation_languages: Arc::default(),
         };
 
-        for value in ["\"4173\"", "4173.5", "0", "65536", "-1", "null", "true"] {
-            let document = document_with("port", value);
-            parse_settings_document_with_language(
-                &document,
-                path,
-                MessageId::SettingsFileRole,
-                Language::En,
-            )
-                .expect_err("an unusable port");
-            patch_settings_document(&document, &settings)
-                .expect_err("an unusable port must refuse the patch");
-        }
-
         for value in ["5", "\"\"", "\"not-a-device-id\"", "\"wasapi:\"", "true", "{}"] {
-            let document = document_with("input_device", value);
+            let document = document_with(value);
             parse_settings_document_with_language(
                 &document,
                 path,
@@ -3061,33 +3217,24 @@ mod tests {
 
         // A repeated property is refused by both paths instead of one of the two
         // values winning.
-        for (property, first, second) in [
-            ("port", "4173", "4174"),
-            (
-                "input_device",
-                "\"wasapi:card-one\"",
-                "\"wasapi:card-two\"",
-            ),
-        ] {
-            let document = format!(
-                "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"{property}\": {first},\n  \"{property}\": {second}\n}}\n"
-            );
-            parse_settings_document_with_language(
-                &document,
-                path,
-                MessageId::SettingsFileRole,
-                Language::En,
-            )
-                .expect_err("a repeated property");
-            patch_settings_document(&document, &settings)
-                .expect_err("a repeated property must refuse the patch");
-        }
+        let document = format!(
+            "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": \"wasapi:card-one\",\n  \"input_device\": \"wasapi:card-two\"\n}}\n"
+        );
+        parse_settings_document_with_language(
+            &document,
+            path,
+            MessageId::SettingsFileRole,
+            Language::En,
+        )
+            .expect_err("a repeated property");
+        patch_settings_document(&document, &settings)
+            .expect_err("a repeated property must refuse the patch");
     }
 
     /// A general change carries every managed value: patching with a new hotkey,
-    /// mode and mute switch writes the chosen port and device too, so a port or a
-    /// device stored by an earlier save is never left behind under a new
-    /// configuration while unknown properties keep their bytes.
+    /// mode and mute switch writes the chosen device too, and the port an
+    /// earlier version managed is retired, so an old value is never left behind
+    /// under a new configuration while unknown properties keep their bytes.
     #[test]
     fn a_general_change_does_not_leave_an_old_port_or_device_behind() {
         let path = Path::new("settings.json");
@@ -3096,7 +3243,6 @@ mod tests {
             hotkey: "Ctrl+Shift+F9".to_owned(),
             mode: "verbatim".to_owned(),
             mute_during_recording: true,
-            port: 43118,
             input_device: Some("wasapi:new".to_owned()),
             language: Language::En,
             custom_vocabulary: Arc::from(vec!["NewTerm".to_owned()]),
@@ -3106,7 +3252,7 @@ mod tests {
         let patched = patch_settings_document(document, &changed).expect("a patch");
         assert_eq!(
             patched,
-            "{\n  \"hotkey\": \"Ctrl+Shift+F9\",\n  \"mode\": \"verbatim\",\n  \"mute_during_recording\": true,\n  \"port\": 43118,\n  \"input_device\": \"wasapi:new\",\n  \"language\": \"en\",\n  \"custom_vocabulary\": [\"NewTerm\"],\n  \"dictation_languages\": [\"ru-RU\",\"en-US\"],\n  \"notes\": \"kept\"\n}\n"
+            "{\n  \"hotkey\": \"Ctrl+Shift+F9\",\n  \"mode\": \"verbatim\",\n  \"mute_during_recording\": true,\n  \n  \"input_device\": \"wasapi:new\",\n  \"language\": \"en\",\n  \"custom_vocabulary\": [\"NewTerm\"],\n  \"dictation_languages\": [\"ru-RU\",\"en-US\"],\n  \"notes\": \"kept\"\n}\n"
         );
         assert!(!patched.contains("5000"), "the old port is gone");
         assert!(!patched.contains("wasapi:old"), "the old device is gone");
@@ -3138,7 +3284,6 @@ mod tests {
         assert_eq!(loaded.hotkey, production.hotkey);
         assert_eq!(loaded.mode, "live");
         assert!(!loaded.mute_during_recording);
-        assert_eq!(loaded.port, production.port);
         assert_eq!(loaded.input_device, None);
         assert_eq!(loaded.language, Language::En);
         assert!(loaded.custom_vocabulary.is_empty());
@@ -3194,14 +3339,13 @@ mod tests {
         let path = Path::new("settings.json");
         let document_with = |value: &str| {
             format!(
-                "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 4173,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": {value},\n  \"dictation_languages\": []\n}}\n"
+                "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": {value},\n  \"dictation_languages\": []\n}}\n"
             )
         };
         let settings = Settings {
             hotkey: "F2".to_owned(),
             mode: "live".to_owned(),
             mute_during_recording: false,
-            port: 4173,
             input_device: None,
             language: Language::En,
             custom_vocabulary: Arc::from(vec!["Speechek".to_owned(), "Кубернетес".to_owned()]),
@@ -3267,7 +3411,7 @@ mod tests {
     #[test]
     fn stored_dictation_languages_round_trip_and_an_invalid_list_is_refused() {
         let path = Path::new("settings.json");
-        let base = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 4173,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": []";
+        let base = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"custom_vocabulary\": []";
         let without = format!("{base}\n}}\n");
         let document_with = |value: &str| format!("{base},\n  \"dictation_languages\": {value}\n}}\n");
         let read = |document: &str| {
@@ -3322,26 +3466,38 @@ mod tests {
         }
     }
 
-    /// Readback refuses a document that still carries the retired property, so a
-    /// patch can never report success on a file it failed to migrate even when
-    /// the managed values themselves read back correctly.
+    /// Readback refuses a document that still carries an obsolete root property,
+    /// so a patch can never report success on a file it failed to migrate even
+    /// when the managed values themselves read back correctly.
     #[test]
-    fn readback_refuses_a_residual_compare_all() {
+    fn readback_refuses_a_residual_obsolete_property() {
         let settings = Settings {
             hotkey: "F2".to_owned(),
             mode: "live".to_owned(),
             mute_during_recording: false,
-            port: DEFAULT_PORT,
             input_device: None,
             language: Language::En,
             custom_vocabulary: Arc::default(),
             dictation_languages: Arc::default(),
         };
-        verify_patched(
-            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"compare_all\": true\r\n}\r\n",
-            &settings,
-        )
-        .expect_err("a residual compare_all must refuse the readback");
+        for name in ["compare_all", "port"] {
+            let document = format!(
+                "{{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"{name}\": true\r\n}}\r\n"
+            );
+            let error = verify_patched(&document, &settings)
+                .expect_err("a residual obsolete property must refuse the readback");
+            assert_eq!(error.ui.key, MessageId::ConfigObsoletePropertyNotRemoved);
+            assert_eq!(
+                error
+                    .ui
+                    .args
+                    .as_ref()
+                    .and_then(|args| args.get("name"))
+                    .and_then(|value| value.as_str()),
+                Some(name),
+                "the refusal names the property it could not remove"
+            );
+        }
 
         // The same document without the property passes, so the refusal is about
         // the residual property and not about the settings it carries.
@@ -3381,7 +3537,6 @@ mod tests {
             hotkey: "F2".to_owned(),
             mode: "live".to_owned(),
             mute_during_recording: true,
-            port: DEFAULT_PORT,
             input_device: None,
             language: Language::En,
             custom_vocabulary: Arc::default(),
@@ -3408,7 +3563,6 @@ mod tests {
                 hotkey: "F2".to_owned(),
                 mode: "live".to_owned(),
                 mute_during_recording: false,
-                port: DEFAULT_PORT,
                 input_device: None,
                 language: Language::En,
                 custom_vocabulary: Arc::default(),
@@ -3432,7 +3586,6 @@ mod tests {
                 hotkey: "F2".to_owned(),
                 mode: "smart".to_owned(),
                 mute_during_recording: true,
-                port: 43118,
                 input_device: Some("wasapi:card-one".to_owned()),
                 language: Language::En,
                 custom_vocabulary: Arc::default(),
@@ -3445,14 +3598,9 @@ mod tests {
         let pinned_snapshot = runtime.resolve(Some(9)).expect("the pinned take");
         assert_eq!(pinned_snapshot.settings.mode, "live");
         assert!(!pinned_snapshot.settings.mute_during_recording);
-        assert_eq!(pinned_snapshot.settings.port, DEFAULT_PORT);
         assert_eq!(pinned_snapshot.settings.input_device, None);
         let current = runtime.resolve(None).expect("current");
         assert_eq!(current.settings.mode, "smart");
-        assert_eq!(
-            current.settings.port, 43118,
-            "the next session sees the published port"
-        );
         assert_eq!(
             current.settings.input_device.as_deref(),
             Some("wasapi:card-one"),
@@ -3551,311 +3699,39 @@ mod tests {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
-    /// The port the shell reserves comes from the document this start will read,
-    /// and the preflight only reads: a stored port is returned as spelled, a
-    /// document written before the port existed - or one that is not there yet -
-    /// reads as the first-run default, and every byte of the file survives the
-    /// question. Nothing is created for a profile that does not exist.
+
+    /// Writing the first-run document touches Speechek's own profile only: a
+    /// directory another application keeps beside it, and the document in it,
+    /// are never read, and an existing Speechek document is left as it is.
     #[test]
-    fn the_preflight_reads_the_port_the_startup_will_use() {
-        let scratch = Scratch::new("preflight-read");
-        assert_eq!(
-            preflight_port_from(
-                profile::ACTIVE,
-                None,
-                Some(scratch.appdata().as_os_str()),
-                active_executable(&scratch).as_deref(),
-            )
-            .expect("an absent profile"),
-            DEFAULT_PORT,
-            "no document yet reads as the default the flavor's first run documents"
-        );
-        assert!(
-            !scratch.target().exists(),
-            "the preflight creates no profile directory"
-        );
-
-        let without_port: &[u8] =
-            b"// Speechek settings\r\n{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\"\r\n}\r\n";
-        fs::create_dir_all(scratch.target()).expect("the profile directory");
-        fs::write(scratch.target_settings(), without_port).expect("the document");
-        assert_eq!(
-            preflight_port_from(
-                profile::ACTIVE,
-                None,
-                Some(scratch.appdata().as_os_str()),
-                active_executable(&scratch).as_deref(),
-            )
-            .expect("a document without a port"),
-            DEFAULT_PORT
-        );
-        assert_eq!(
-            fs::read(scratch.target_settings()).expect("the document"),
-            without_port,
-            "the document keeps every byte"
-        );
-
-        let named = "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"port\": 43118\r\n}\r\n";
-        fs::write(scratch.target_settings(), named).expect("the document");
-        assert_eq!(
-            preflight_port_from(
-                profile::ACTIVE,
-                None,
-                Some(scratch.appdata().as_os_str()),
-                active_executable(&scratch).as_deref(),
-            )
-            .expect("a stored port"),
-            43118
-        );
-        assert_eq!(
-            fs::read(scratch.target_settings()).expect("the document"),
-            named.as_bytes()
-        );
-    }
-
-    /// Port selection uses only Speechek's settings document, even when other
-    /// directories exist alongside its profile.
-    #[test]
-    fn the_preflight_ignores_unrelated_sibling_directories() {
-        let scratch = Scratch::new("preflight-siblings");
+    fn the_first_run_document_leaves_unrelated_directories_alone() {
+        let scratch = Scratch::new("first-run-siblings");
         let unrelated = scratch.appdata().join("another-application");
         fs::create_dir_all(&unrelated).expect("the unrelated directory");
         fs::write(unrelated.join(SETTINGS_FILE_NAME), b"not a settings document")
             .expect("the unrelated document");
-
-        assert_eq!(
-            preflight_port_from(
-                profile::ACTIVE,
-                None,
-                Some(scratch.appdata().as_os_str()),
-                active_executable(&scratch).as_deref(),
-            )
-            .expect("no Speechek profile yet"),
-            DEFAULT_PORT
-        );
-        assert!(!scratch.target().exists());
 
         assert!(create_default_if_missing(&scratch.target_settings())
             .expect("the first-run Speechek profile"));
         assert_eq!(
             load_settings(&scratch.target_settings())
                 .expect("the first-run settings")
-                .port,
-            DEFAULT_PORT
+                .hotkey,
+            profile::defaults(profile::ACTIVE).hotkey,
+            "the first-run document carries the active flavor's own chord"
         );
         assert!(!create_default_if_missing(&scratch.target_settings())
             .expect("an existing Speechek profile"));
-        fs::write(
-            scratch.target_settings(),
-            b"{\"hotkey\":\"F2\",\"mode\":\"live\",\"port\":43118}",
-        )
-        .expect("the settings document");
-        assert_eq!(
-            preflight_port_from(
-                profile::ACTIVE,
-                None,
-                Some(scratch.appdata().as_os_str()),
-                active_executable(&scratch).as_deref(),
-            )
-            .expect("the Speechek port"),
-            43118
-        );
         assert_eq!(
             fs::read(unrelated.join(SETTINGS_FILE_NAME)).expect("the unrelated document"),
             b"not a settings document"
         );
     }
 
-    /// A port the loader would refuse, and a document that is not a document,
-    /// refuse the preflight as well: the run stops before a socket exists
-    /// instead of serving on a port nobody named, and the file it read keeps
-    /// every byte so the user can repair it in the settings window.
-    #[test]
-    fn an_unusable_stored_port_or_document_refuses_the_preflight() {
-        let scratch = Scratch::new("preflight-invalid");
-        fs::create_dir_all(scratch.target()).expect("the profile directory");
-
-        let mut documents: Vec<String> = Vec::new();
-        for value in ["\"4173\"", "4173.5", "0", "65536", "-1", "null", "true"] {
-            documents.push(format!(
-                "{{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"port\": {value}\r\n}}\r\n"
-            ));
-        }
-        documents.push(
-            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"port\": 4173,\r\n  \"port\": 4174\r\n}\r\n".to_string(),
-        );
-        documents.push("{ this is not json }\r\n".to_string());
-
-        for document in &documents {
-            fs::write(scratch.target_settings(), document).expect("the document");
-            preflight_port_from(
-                profile::ACTIVE,
-                None,
-                Some(scratch.appdata().as_os_str()),
-                active_executable(&scratch).as_deref(),
-            )
-            .expect_err("an unusable document refuses the preflight");
-            assert_eq!(
-                fs::read(scratch.target_settings()).expect("the document"),
-                document.as_bytes(),
-                "the refused document is not rewritten"
-            );
-        }
-    }
-
-    /// The override belongs to the test flavor: a relative path is refused
-    /// with the variable's name, an empty value is no override at all, and an
-    /// absolute one names the document whether it exists yet or not - even
-    /// without `%APPDATA%`. The development flavor ignores the same override
-    /// and reads beside its executable, and production ignores it and still
-    /// needs `%APPDATA%`, so neither can be moved off the profile it
-    /// documents. The preflight and the resolver name exactly the same
-    /// document.
-    #[test]
-    fn the_preflight_reads_the_debug_override_exactly_like_the_settings_path() {
-        let scratch = Scratch::new("preflight-override");
-        let appdata = Some(scratch.appdata().as_os_str());
-        let executable = scratch.executable();
-        let executable_arg = Some(executable.as_path());
-        let dev_document = scratch.target_of(BuildFlavor::Development).join(SETTINGS_FILE_NAME);
-        let elsewhere = scratch.appdata().join("elsewhere.json");
-
-        // The test flavor takes the absolute override, with or without
-        // `%APPDATA%`, and refuses a relative one with the variable's name.
-        preflight_port_from(
-            BuildFlavor::Test,
-            Some(Path::new("relative.json").as_os_str()),
-            appdata,
-            None,
-        )
-        .expect_err("a relative override");
-
-        assert_eq!(
-            preflight_port_from(BuildFlavor::Test, Some(OsStr::new("  ")), appdata, None)
-                .expect("an empty override is not one"),
-            profile::defaults(BuildFlavor::Test).port
-        );
-
-        assert_eq!(
-            preflight_document_from(
-                BuildFlavor::Test,
-                Some(elsewhere.as_os_str()),
-                appdata,
-                None,
-            )
-            .expect("an override to a document that is not there yet"),
-            None
-        );
-        let named =
-            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"port\": 43118\r\n}\r\n";
-        fs::write(&elsewhere, named).expect("the override document");
-        assert_eq!(
-            preflight_document_from(
-                BuildFlavor::Test,
-                Some(elsewhere.as_os_str()),
-                appdata,
-                None,
-            )
-            .expect("the override document"),
-            Some(elsewhere.clone())
-        );
-        assert_eq!(
-            preflight_port_from(BuildFlavor::Test, Some(elsewhere.as_os_str()), appdata, None)
-                .expect("the override document"),
-            43118
-        );
-        assert_eq!(
-            fs::read(&elsewhere).expect("the override document"),
-            named.as_bytes()
-        );
-        // The override alone suffices: `%APPDATA%` is not consulted at all.
-        assert_eq!(
-            preflight_port_from(BuildFlavor::Test, Some(elsewhere.as_os_str()), None, None)
-                .expect("the override without %APPDATA%"),
-            43118
-        );
-
-        // The development flavor ignores the same override: it reads beside
-        // the executable it was given, creates nothing for a document that is
-        // not there yet, and the overridden document is never selected.
-        assert_eq!(
-            preflight_port_from(BuildFlavor::Development, None, None, executable_arg)
-                .expect("no development document yet"),
-            profile::defaults(BuildFlavor::Development).port
-        );
-        assert!(
-            !dev_document.exists() && !scratch.dev_bin().exists(),
-            "the preflight creates no development document"
-        );
-        assert_eq!(
-            preflight_document_from(
-                BuildFlavor::Development,
-                Some(elsewhere.as_os_str()),
-                appdata,
-                executable_arg,
-            )
-            .expect("the development document"),
-            None
-        );
-        fs::create_dir_all(scratch.dev_bin()).expect("the development directory");
-        fs::write(&dev_document, named).expect("the development document");
-        assert_eq!(
-            preflight_document_from(
-                BuildFlavor::Development,
-                Some(elsewhere.as_os_str()),
-                appdata,
-                executable_arg,
-            )
-            .expect("the development document"),
-            Some(dev_document.clone())
-        );
-        assert_eq!(
-            preflight_port_from(
-                BuildFlavor::Development,
-                Some(elsewhere.as_os_str()),
-                None,
-                executable_arg,
-            )
-            .expect("the development port"),
-            43118
-        );
-        assert_eq!(
-            fs::read(&dev_document).expect("the development document"),
-            named.as_bytes(),
-            "the development document is read and left as it is"
-        );
-
-        // Production ignores the override, relative or absolute, and the
-        // executable path with it, and still needs `%APPDATA%`.
-        let production_document = scratch.appdata().join("production.json");
-        fs::write(
-            &production_document,
-            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"port\": 43119\r\n}\r\n",
-        )
-        .expect("the ignored document");
-        assert_eq!(
-            preflight_port_from(
-                BuildFlavor::Production,
-                Some(production_document.as_os_str()),
-                appdata,
-                executable_arg,
-            )
-            .expect("production ignores the override"),
-            profile::defaults(BuildFlavor::Production).port
-        );
-        preflight_port_from(
-            BuildFlavor::Production,
-            Some(production_document.as_os_str()),
-            None,
-            None,
-        )
-        .expect_err("production still needs %APPDATA%");
-    }
-
-    /// The flavor table is the single source of the identities, hotkeys and
-    /// first-run ports, every row is distinct, only the development row names
-    /// no `%APPDATA%` directory, and the compiled-in flavor matches the kind
-    /// of build this test runs in.
+    /// The flavor table is the single source of the identities and hotkeys,
+    /// every row is distinct, only the development row names no `%APPDATA%`
+    /// directory, and the compiled-in flavor matches the kind of build this
+    /// test runs in.
     #[test]
     fn the_flavor_table_holds_each_builds_own_identity() {
         let production = profile::defaults(BuildFlavor::Production);
@@ -3863,14 +3739,12 @@ mod tests {
         assert_eq!(production.title, "Speechek");
         assert_eq!(production.directory, "Speechek");
         assert_eq!(production.hotkey, "F2");
-        assert_eq!(production.port, 4173);
 
         let development = profile::defaults(BuildFlavor::Development);
         let test = profile::defaults(BuildFlavor::Test);
         assert_eq!(development.identifier, "app.speechek.dev");
         assert_eq!(development.title, "Speechek Dev");
         assert_eq!(development.hotkey, "Ctrl+Shift+F9");
-        assert_eq!(development.port, 4174);
         assert_eq!(
             development.directory, "",
             "the development flavor resolves beside its executable, not through %APPDATA%"
@@ -3879,7 +3753,6 @@ mod tests {
         assert_eq!(test.title, "Speechek Test");
         assert_eq!(test.directory, "Speechek-Test");
         assert_eq!(test.hotkey, "Ctrl+Shift+F10");
-        assert_eq!(test.port, 4175);
 
         for (left, right) in [
             (&production, &development),
@@ -3889,14 +3762,11 @@ mod tests {
             assert_ne!(left.identifier, right.identifier);
             assert_ne!(left.title, right.title);
             assert_ne!(left.hotkey, right.hotkey);
-            assert_ne!(left.port, right.port);
         }
         assert!(
             !production.directory.is_empty() && !test.directory.is_empty(),
             "the flavors that resolve through %APPDATA% name their directory"
         );
-
-        assert_eq!(DEFAULT_PORT, profile::defaults(profile::ACTIVE).port);
 
         #[cfg(not(debug_assertions))]
         assert_eq!(profile::ACTIVE, BuildFlavor::Production);
@@ -4046,20 +3916,16 @@ mod tests {
         .expect_err("production still needs %APPDATA%");
     }
 
-    /// The preflight and the first run agree on one document per flavor: the
+    /// The first run and the resolver agree on one document per flavor: the
     /// resolver names the flavor's own file - beside the executable for the
-    /// development flavor, under `%APPDATA%` for production and test - the
-    /// preflight reports it missing and creates nothing, a stored port in that
-    /// flavor's document is what it reads, and the active flavor's first-run
-    /// document loads with that flavor's own chord and port.
+    /// development flavor, under `%APPDATA%` for production and test - and the
+    /// active flavor's first-run document loads with that flavor's own chord.
     #[test]
-    fn the_preflight_and_the_first_run_document_agree_per_flavor() {
-        let scratch = Scratch::new("preflight-agreement");
+    fn the_first_run_document_resolves_one_document_per_flavor() {
+        let scratch = Scratch::new("first-run-agreement");
         let appdata = Some(scratch.appdata().as_os_str());
         let executable = scratch.executable();
         let executable_arg = Some(executable.as_path());
-        let named =
-            "{\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"port\": 43118\r\n}\r\n";
 
         for flavor in [
             BuildFlavor::Production,
@@ -4069,29 +3935,10 @@ mod tests {
             let path = resolve_settings_path(flavor, None, appdata, executable_arg)
                 .expect("the flavor's document");
             assert_eq!(path, scratch.target_of(flavor).join(SETTINGS_FILE_NAME));
-            assert_eq!(
-                preflight_document_from(flavor, None, appdata, executable_arg)
-                    .expect("a missing document"),
-                None
-            );
             assert!(
                 !path.exists() && !scratch.target_of(flavor).exists(),
-                "the preflight creates no profile directory"
+                "resolving the document creates no profile directory"
             );
-
-            fs::create_dir_all(scratch.target_of(flavor)).expect("the flavor's directory");
-            fs::write(&path, named).expect("the document");
-            assert_eq!(
-                preflight_document_from(flavor, None, appdata, executable_arg)
-                    .expect("the document"),
-                Some(path.clone())
-            );
-            assert_eq!(
-                preflight_port_from(flavor, None, appdata, executable_arg)
-                    .expect("the stored port"),
-                43118
-            );
-            assert_eq!(fs::read(&path).expect("the document"), named.as_bytes());
         }
 
         // The key container follows the resolved document: a development run
@@ -4108,10 +3955,8 @@ mod tests {
             );
         }
 
-        // A clean profile for the active flavor: nothing there reads as the
-        // flavor's first-run default, writing the first-run document makes the
-        // same port the one the startup will reserve, and the document is a
-        // valid settings file the settings window would not reformat.
+        // A clean profile for the active flavor: writing the first-run document
+        // produces a valid settings file the settings window would not reformat.
         let fresh = Scratch::new("first-run");
         let fresh_appdata = Some(fresh.appdata().as_os_str());
         let flavor = profile::ACTIVE;
@@ -4124,21 +3969,10 @@ mod tests {
             fresh.target_of(flavor).join(SETTINGS_FILE_NAME),
             "the active flavor resolves the document its own source names"
         );
-        assert_eq!(
-            preflight_port_from(flavor, None, fresh_appdata, fresh_executable.as_deref())
-                .expect("no document yet"),
-            DEFAULT_PORT
-        );
         assert!(create_default_if_missing(&path).expect("the first-run document"));
         assert!(!create_default_if_missing(&path).expect("an existing document"));
-        assert_eq!(
-            preflight_port_from(flavor, None, fresh_appdata, fresh_executable.as_deref())
-                .expect("the first-run port"),
-            DEFAULT_PORT
-        );
         let first_run = load_settings(&path).expect("the first-run document loads");
         assert_eq!(first_run.hotkey, defaults.hotkey);
-        assert_eq!(first_run.port, defaults.port);
         assert_eq!(first_run.mode, "live");
         assert!(!first_run.mute_during_recording);
         assert_eq!(first_run.input_device, None);
@@ -4164,10 +3998,10 @@ mod tests {
         }
     }
 
-    /// The first-run document: a flavor's own chord, port and language are
-    /// written into the annotated template, and the two debug flavors do not
-    /// share one document. A template that already spells every wanted value is
-    /// returned unchanged.
+    /// The first-run document: a flavor's own chord and language are written
+    /// into the annotated template, and the two debug flavors do not share one
+    /// document. A template that already spells every wanted value is returned
+    /// unchanged.
     #[test]
     fn the_first_run_document_moves_only_the_flavor_values() {
         let document = first_run_document(BuildFlavor::Production, Language::En)
@@ -4206,7 +4040,6 @@ mod tests {
             )
             .expect("the debug first-run document");
             assert_eq!(loaded.hotkey, defaults.hotkey);
-            assert_eq!(loaded.port, defaults.port);
             assert_eq!(
                 loaded.language,
                 Language::Ru,
@@ -4240,7 +4073,7 @@ mod tests {
     #[test]
     fn an_old_document_gains_the_language_in_place() {
         let path = Path::new("settings.json");
-        let document = "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 5000,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n";
+        let document = "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n";
 
         let loaded =
             parse_settings_document_with_language(document, path, MessageId::SettingsFileRole, Language::Ru)
@@ -4250,7 +4083,7 @@ mod tests {
         let patched = patch_settings_document(document, &loaded).expect("a patch");
         assert_eq!(
             patched,
-            "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"language\": \"ru\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 5000,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n"
+            "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"language\": \"ru\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n"
         );
 
         let reread =
@@ -4262,7 +4095,7 @@ mod tests {
         let english = patch_settings_document(&patched, &switched).expect("a patch");
         assert_eq!(
             english,
-            "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"port\": 5000,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n"
+            "\u{feff}// старый файл\r\n{\r\n  // комментарий\r\n  \"language\": \"en\",\r\n  \"custom_vocabulary\": [],\r\n  \"dictation_languages\": [],\r\n  \"hotkey\": \"F2\",\r\n  \"mode\": \"live\",\r\n  \"mute_during_recording\": false,\r\n  \"input_device\": null,\r\n  \"notes\": \"kept\"\r\n}\r\n"
         );
         assert_eq!(
             parse_settings_document_with_language(&english, path, MessageId::SettingsFileRole, Language::Ru)
@@ -4281,14 +4114,13 @@ mod tests {
         let path = Path::new("settings.json");
         let base = |language: &str| {
             format!(
-                "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 4173,\n  \"input_device\": null,\n  \"language\": {language}\n}}\n"
+                "{{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": null,\n  \"language\": {language}\n}}\n"
             )
         };
         let settings = Settings {
             hotkey: "F2".to_owned(),
             mode: "live".to_owned(),
             mute_during_recording: false,
-            port: DEFAULT_PORT,
             input_device: None,
             language: Language::En,
             custom_vocabulary: Arc::default(),
@@ -4303,7 +4135,7 @@ mod tests {
                 .expect_err("an unusable language must refuse the patch");
         }
 
-        let repeated = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"port\": 4173,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"language\": \"ru\"\n}\n";
+        let repeated = "{\n  \"hotkey\": \"F2\",\n  \"mode\": \"live\",\n  \"mute_during_recording\": false,\n  \"input_device\": null,\n  \"language\": \"en\",\n  \"language\": \"ru\"\n}\n";
         parse_settings_document_with_language(repeated, path, MessageId::SettingsFileRole, Language::En)
             .expect_err("a repeated language");
         patch_settings_document(repeated, &settings)

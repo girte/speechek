@@ -79,8 +79,6 @@ const TYPING_IDLE_MS = 350;
  * `DICTATION_ACTIVE` stays the backstop against the race.
  */
 const DICTATION_HINT = msg('SettingsDictationHint');
-/** Why the port field was refused; the shell uses the same line for a zero port. */
-const PORT_INVALID_MESSAGE = msg('SettingsPortInvalid');
 /**
  * Why the autostart switch is mixed and disabled; the shell could not read the
  * registration it would have to change.
@@ -110,9 +108,6 @@ const generalError = el('general-error');
 const hotkeyInput = el('hotkey-input');
 const hotkeyState = el('hotkey-state');
 const hotkeyError = el('hotkey-error');
-const portInput = el('port-input');
-const portNotice = el('port-notice');
-const portError = el('port-error');
 const deviceSelect = el('input-device');
 const deviceNotice = el('device-notice');
 const deviceError = el('device-error');
@@ -285,14 +280,6 @@ let autostartFailure = '';
 /** Grows with every activation re-read of the registration: only the newest
  * answer may update the value the page took from a focus. */
 let autostartRefreshEpoch = 0;
-/** The port field holds text the shell has not taken; a view never erases it. */
-let portDirty = false;
-/**
- * A port the user completed and the shell has not confirmed yet. It travels
- * with every later general change until an answer reports it, so toggling the
- * mute switch while this send is in flight cannot put the old port back.
- */
-let pendingPort = null;
 /**
  * The language the user chose but the shell has not confirmed yet. It travels
  * with every general change, so a choice made while another send is in flight
@@ -318,10 +305,10 @@ let vocabularyFailure = '';
 /** The text last handed to the queue; a blur of it is the same gesture. */
 let vocabularyChangeBaseline = null;
 /**
- * The device picker holds a choice the shell has not confirmed yet. Like the
- * port, it travels with every later general change until an answer reports it;
- * `null` is the system default, and the flag says the value is the user's
- * rather than the draft's.
+ * The device picker holds a choice the shell has not confirmed yet. It travels
+ * with every later general change until an answer reports it; `null` is the
+ * system default, and the flag says the value is the user's rather than the
+ * draft's.
  */
 let deviceDirty = false;
 let pendingDevice = null;
@@ -487,13 +474,6 @@ function selectedMode() {
   return checked ? checked.value : 'live';
 }
 
-/** The port the general form should carry: a completed value waiting for its
- * answer, otherwise the one the shell reports. */
-function desiredPort() {
-  if (pendingPort !== null) return pendingPort;
-  return Number.isInteger(view?.settings?.port) ? view.settings.port : 4173;
-}
-
 /** The chosen device the general form carries: the user's pick while the shell
  * has not confirmed it, otherwise the stored id, or `null` for the system
  * default. It never reads the select's display, so a list that failed to load
@@ -549,7 +529,6 @@ function renderControls() {
   const hotkeyWasHeld = hotkeyFieldHoldsKeyboard();
   hotkeyInput.disabled = !usable || dictationActive;
   if (hotkeyWasHeld && hotkeyInput.disabled) signalHotkeyField(false);
-  portInput.disabled = !usable;
   // The vocabulary is editable even during a dictation: the session that is
   // already running holds the snapshot it began with, so only the next
   // recording can be affected by a change made here.
@@ -579,9 +558,9 @@ function renderHotkey() {
  * normalization the shell applied — trimmed terms, dropped empty lines and
  * repeats — instead of the text that was typed.
  *
- * The line under the field is its own, like the port's: the term count, plus
- * Google's recommendation once the list grows past it. An empty vocabulary
- * paints no line at all.
+ * The line under the field is its own: the term count, plus Google's
+ * recommendation once the list grows past it. An empty vocabulary paints no
+ * line at all.
  */
 function renderVocabulary() {
   const reported = view?.settings && Array.isArray(view.settings.custom_vocabulary) ? view.settings.custom_vocabulary : null;
@@ -646,56 +625,11 @@ function renderGeneral() {
   renderAutostart();
   if (pendingLanguage === view?.settings?.language) pendingLanguage = null;
   languageSelect.value = generalLanguage();
-  // The port field belongs to the user while it holds text the shell has not
-  // taken: a view that paints a general, chord or key answer must not erase
-  // what was typed but not yet committed. A field that already holds the
-  // reported value - after a commit, or before any edit - becomes clean again,
-  // so a following view may paint it.
-  const reported = Number.isInteger(view?.settings?.port) ? String(view.settings.port) : null;
-  if (reported !== null) {
-    if (pendingPort !== null && String(pendingPort) === reported) pendingPort = null;
-    const text = portInput.value.trim();
-    if (text === reported) portDirty = false;
-    if (!portDirty && text !== reported) portInput.value = reported;
-  }
-  if (!portDirty) setError(portError, '');
-  renderPortNotice();
   renderDictationLanguages(view?.settings?.dictation_languages);
   renderDevices();
   // A painted native view is the truth about the controls: a complaint about an
   // earlier attempt has been answered by it.
   setError(generalError, '');
-}
-
-/**
- * The port's own line under the field. A fallback this run started with
- * outranks everything - even a saved field the user has already changed, which
- * is exactly when the temporary port is easiest to forget. Then a saved port
- * that differs from the one being served, which only a restart applies. The
- * line is not the status line, so a partial-save warning never overwrites it
- * and it never overwrites one.
- */
-function renderPortNotice() {
-  if (view === null) {
-    setPortNotice('');
-    return;
-  }
-  if (view.portFallback === true) {
-    setPortNotice(
-      msg('SettingsPortFallback', { startup: view.startupPort, running: view.runningPort }),
-    );
-    return;
-  }
-  const saved = Number.isInteger(view.settings?.port) ? view.settings.port : null;
-  if (saved !== null && Number.isInteger(view.runningPort) && saved !== view.runningPort) {
-    setPortNotice(msg('SettingsPortRestart', { port: saved }));
-    return;
-  }
-  setPortNotice('');
-}
-
-function setPortNotice(text) {
-  setText(portNotice, text);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1315,14 +1249,12 @@ function onGeneralChange() {
   generalIntent = intent;
   // The chord is not part of this command: an old WebView view must not be able
   // to send a launcher key back, and a general change never touches the keys.
-  // The mute switch, the port, the chosen device, the language and the
-  // dictation languages live in this section, so their own current values
-  // travel: the change takes effect from the next dictation, while a new port
-  // only after the next restart.
+  // The mute switch, the chosen device, the language and the dictation
+  // languages live in this section, so their own current values travel: the
+  // change takes effect from the next dictation.
   const settings = {
     mode: selectedMode(),
     mute_during_recording: muteToggle.checked,
-    port: desiredPort(),
     input_device: currentInputDevice(),
     language: generalLanguage(),
     dictation_languages: selectedDictationLanguages(),
@@ -1417,73 +1349,15 @@ async function sendAutostart(draftId, enabled) {
 }
 
 /** Puts a general refusal where the page can point at something: under the
- * port field, under the device picker, or on the section's own line. */
+ * device picker, or on the section's own line. */
 function setGeneralFailure(error) {
   const message = messageOf(error);
-  if (error.field === 'port') {
-    setError(portError, message);
-    return;
-  }
   if (error.field === 'input_device') {
     deviceFailure = message;
     paintDeviceError();
     return;
   }
   setError(generalError, message);
-}
-
-/* -------------------------------------------------------------------------- */
-/* Port field                                                                 */
-/* -------------------------------------------------------------------------- */
-
-/**
- * The port field. Digits are typed, never captured: nothing is sent per
- * keystroke, and only a completed number — Enter, or leaving the field —
- * becomes a command. It travels through the same serial queue as every other
- * general change, so a port send cannot overtake a chord or a key send.
- *
- * A refused value leaves the text on screen, the running port and the previous
- * saved port exactly as they are. A committed value waiting for its answer
- * travels with every later general change too (`desiredPort`), so toggling the
- * mute switch while the port send is still in flight cannot put the old port
- * back.
- */
-function submitPort() {
-  if (view === null || closed || busy) return;
-  const text = portInput.value.trim();
-  const applied = Number.isInteger(view.settings.port) ? String(view.settings.port) : '';
-  // The field already holds what the shell applies, and nothing is waiting:
-  // there is no send and the field is clean again.
-  if (text === applied && pendingPort === null) {
-    portDirty = false;
-    setError(portError, '');
-    return;
-  }
-  const port = Number(text);
-  if (!/^\d+$/.test(text) || port < 1 || port > 65535) {
-    setError(portError, PORT_INVALID_MESSAGE);
-    setStatus(PORT_INVALID_MESSAGE);
-    return;
-  }
-  // The blur that follows Enter carries the value Enter just handed over: one
-  // gesture, not a second intent.
-  if (pendingPort !== null && pendingPort === port) return;
-  pendingPort = port;
-  setError(portError, '');
-  onGeneralChange();
-}
-
-/**
- * Sends a completed port before the page is frozen or hidden. A native close,
- * a menu action or a section switch may never produce the blur that would
- * otherwise submit the text, so every lifecycle step calls this first; the
- * dedup above keeps it from duplicating an Enter or a blur that already sent
- * the value.
- */
-function flushPort() {
-  if (view === null || closed || busy) return;
-  if (!portDirty) return;
-  submitPort();
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2170,13 +2044,7 @@ function forgetDraft() {
   hotkeyChangeBaseline = null;
   hotkeyDirty = false;
   hotkeyFailure = '';
-  // The port field belongs to the draft that just went away too.
-  pendingPort = null;
   pendingLanguage = null;
-  portDirty = false;
-  setError(portError, '');
-  setPortNotice('');
-  portInput.value = '';
   // The vocabulary field belongs to the draft that just went away too: nothing
   // typed for it may still be sent, and the next open paints a fresh field.
   vocabularyIntent += 1;
@@ -2242,7 +2110,6 @@ async function resolveClose() {
   // its answer: a partial flag such a send raised is then known to the warning
   // instead of being missed in a window that is about to hide.
   flushHotkey();
-  flushPort();
   flushVocabulary();
   // The editor is flushed first: it decides whether there is anything to apply,
   // and a refused send leaves the text on screen for the dialog below.
@@ -2445,7 +2312,6 @@ async function openLab() {
   // over one, exactly as its disabled button says.
   if (view === null || dictationActive) return;
   flushHotkey();
-  flushPort();
   flushVocabulary();
   if (!(await flushOrHold(msg('SettingsKeySendRetry')))) return;
   invalidateReveal();
@@ -2466,7 +2332,6 @@ async function switchSection(name, { focus = false } = {}) {
   // the shell has not received. The dedup keeps this from duplicating the
   // Enter or the blur that already sent the same text.
   flushHotkey();
-  flushPort();
   flushVocabulary();
   // The intent to reveal dies before anything can hide the field, and the
   // field's text is taken before it is cleared, so a switch can never lose a
@@ -2588,7 +2453,7 @@ function onHotkeyKey(event) {
 function disableForm(message) {
   formDisabled = true;
   const hotkeyWasHeld = hotkeyFieldHoldsKeyboard();
-  for (const node of [languageSelect, keyReveal, keyApply, keyClear, keyCheck, actionLab, hotkeyInput, portInput, deviceSelect, dictationPrimary, dictationSecondary, muteToggle, autostartToggle]) {
+  for (const node of [languageSelect, keyReveal, keyApply, keyClear, keyCheck, actionLab, hotkeyInput, deviceSelect, dictationPrimary, dictationSecondary, muteToggle, autostartToggle]) {
     node.disabled = true;
   }
   if (hotkeyWasHeld) signalHotkeyField(false);
@@ -2776,20 +2641,6 @@ function wire() {
   // The autostart switch is an ordinary general setting with its own command:
   // one change event is one intent, and the value is read from the control here.
   autostartToggle.addEventListener('change', () => onAutostartChange());
-
-  // The port is typed like the chord: a keystroke only edits the field and
-  // takes the complaint about the previous value away, and only a completed
-  // number — Enter, or leaving the field — is sent.
-  portInput.addEventListener('input', () => {
-    portDirty = true;
-    setError(portError, '');
-  });
-  portInput.addEventListener('keydown', (event) => {
-    if (event.key !== 'Enter' || event.isComposing) return;
-    event.preventDefault();
-    submitPort();
-  });
-  portInput.addEventListener('change', () => submitPort());
 
   // The vocabulary is typed like the chord, but a plain Enter is a line break:
   // the list is one term per line, so only Ctrl+Enter completes it — plus the
