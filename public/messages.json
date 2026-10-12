@@ -556,8 +556,6 @@
   "SettingsHistoryEmpty": {"en": "Your dictations will appear here.", "ru": "Здесь появятся ваши диктовки."},
   "SettingsHistoryLimitLabel": {"en": "Keep the last", "ru": "Хранить последних"},
   "SettingsHistoryClear": {"en": "Clear history", "ru": "Очистить историю"},
-  "SettingsHistoryClearTitle": {"en": "Clear history?", "ru": "Очистить историю?"},
-  "SettingsHistoryClearQuestion": {"en": "All saved recordings and their text will be deleted. This cannot be undone.", "ru": "Все сохранённые записи и их текст будут удалены. Отменить это нельзя."},
   "SettingsHistoryLimitTitle": {"en": "Delete older recordings?", "ru": "Удалить старые записи?"},
   "SettingsHistoryLimitQuestion": {"en": "Older recordings to delete: {count}.", "ru": "Будут удалены старые записи: {count}."},
   "SettingsHistoryDeleteConfirm": {"en": "Delete", "ru": "Удалить"},

@@ -1288,7 +1288,7 @@ function onGeneralChange() {
     input_device: currentInputDevice(),
     language: generalLanguage(),
     dictation_languages: selectedDictationLanguages(),
-    history_limit: historyClearing !== null || historyClearConfirming
+    history_limit: historyClearing !== null
       ? view.settings.history_limit : Number(historyLimit.value),
   };
   const draftId = view.draftId;
@@ -1983,16 +1983,16 @@ let historyRetryingId = null;
 const historyRetryErrors = new Map();
 /** Wording of a failed history action, above the list until the next read. */
 let historyFailure = '';
+/** Clear failures survive a hidden completion and the next list reload. */
+let historyClearFailure = '';
 /** The one deletion still offering Undo; other deletions may await the shell. */
 let pendingHistoryDelete = null;
 /** Covered rows survive reads until their own delete command settles. */
 const historyDeletes = new Map();
 /** Delete failures stay visible across list and language repaints. */
 const historyDeleteErrors = new Map();
-/** One confirmed whole-history clear, retained until its command settles. */
+/** One whole-history clear, retained across hides until cancellation or result. */
 let historyClearing = null;
-let historyClearConfirming = false;
-let historyClearConfirmEpoch = 0;
 // This button owns dynamic children: static translation must not replace SVG.
 const historyClearLabel = document.createElement('span');
 const historyClearCountdown = document.createElement('span');
@@ -2505,7 +2505,7 @@ function commitPendingHistoryDelete() {
   clearInterval(pending.countdownTimer);
   pendingHistoryDelete = null;
   pending.committing = true;
-  const hadFocus = pending.row.contains(document.activeElement);
+  const hadFocus = !closed && pending.row.contains(document.activeElement);
   coverHistoryRow(pending.row, HISTORY_UNDO_MS, hadFocus, true);
   pending.result = deleteHistoryNow(pending);
 }
@@ -2516,10 +2516,11 @@ async function deleteHistoryNow(deletion) {
     await invoke(CMD.historyDelete, { id });
     if (historyDeletes.get(id) !== deletion) return;
     historyDeletes.delete(id);
-    const hadFocus = deletion.row.contains(document.activeElement);
+    const hadFocus = !closed && deletion.row.contains(document.activeElement);
     if (deletion.audioUrl !== null) URL.revokeObjectURL(deletion.audioUrl);
     // Invalidate list reads started before the command succeeded.
     historyEpoch += 1;
+    historyStale = true;
     dropHistoryEntry(id);
     if (hadFocus) {
       const rows = Array.from(historyList.children);
@@ -2530,13 +2531,15 @@ async function deleteHistoryNow(deletion) {
     if (historyDeletes.get(id) !== deletion) return;
     const error = errorOf(cause);
     historyDeleteErrors.set(id, error);
+    historyEpoch += 1;
+    historyStale = true;
     restoreHistoryDelete(deletion);
     setHistoryRowError(id, error);
   }
 }
 
 function restoreHistoryDelete(deletion) {
-  const hadFocus = deletion.row.contains(document.activeElement);
+  const hadFocus = !closed && deletion.row.contains(document.activeElement);
   historyDeletes.delete(deletion.id);
   uncoverHistoryRow(deletion.row);
   // Restore the data behind the original card as well as its DOM and player.
@@ -2566,7 +2569,7 @@ function restoreHistoryDelete(deletion) {
 
 function undoHistoryDelete() {
   const pending = pendingHistoryDelete;
-  if (pending === null) return;
+  if (pending === null || closed) return;
   // A throttled timer must not extend Undo past its absolute deadline.
   if (performance.now() >= pending.deadline) {
     commitPendingHistoryDelete();
@@ -2578,8 +2581,8 @@ function undoHistoryDelete() {
   restoreHistoryDelete(pending);
 }
 
-/** Settles a delete that is still inside its undo window: a second delete, a
- * close request and the page going away all end the promise here. */
+/** Settles a delete inside its undo window for another delete, quit or unload.
+ * A normal settings close only hides the document and preserves the deadline. */
 function flushPendingHistoryDelete() {
   if (pendingHistoryDelete !== null) commitPendingHistoryDelete();
 }
@@ -2593,10 +2596,11 @@ function dropHistoryEntry(id) {
   historyDeleteErrors.delete(id);
   const entries = Array.isArray(historyView?.entries) ? historyView.entries.filter((entry) => entry && entry.id !== id) : [];
   historyView = { ...(historyView ?? {}), entries };
-  renderHistory();
+  if (!closed) renderHistory();
+  else historyRowOf(id)?.remove();
 }
 
-async function clearHistory() {
+function clearHistory() {
   const clearing = historyClearing;
   if (clearing !== null) {
     if (clearing.committing || closed) return;
@@ -2611,22 +2615,7 @@ async function clearHistory() {
     if (historyStale) void loadHistory();
     return;
   }
-  if (!controlsReady() || historyClearConfirming || dialogConfirm.open || historyRetryingId !== null || generalInFlight > 0) return;
-  const confirmationEpoch = ++historyClearConfirmEpoch;
-  historyClearConfirming = true;
-  paintHistoryControls();
-  let agreed;
-  try {
-    agreed = await askConfirm(
-      msg('SettingsHistoryClearTitle'),
-      msg('SettingsHistoryClearQuestion'),
-      msg('SettingsHistoryClear'),
-    );
-  } finally {
-    historyClearConfirming = false;
-    paintHistoryControls();
-  }
-  if (!agreed || confirmationEpoch !== historyClearConfirmEpoch || !controlsReady() || historyRetryingId !== null || generalInFlight > 0) return;
+  if (!controlsReady() || dialogConfirm.open || historyRetryingId !== null || generalInFlight > 0) return;
   const size = historyClear.getBoundingClientRect();
   historyClear.style.width = `${size.width}px`;
   historyClear.style.height = `${size.height}px`;
@@ -2639,12 +2628,13 @@ async function clearHistory() {
   };
   historyClearing = pending;
   // A limit question still awaiting its list read cannot leak a draft limit
-  // through an unrelated settings change during the confirmed clear.
+  // through an unrelated settings change during the pending clear.
   historyLimit.value = String(view.settings.history_limit);
   // Older reads cannot replace the entries while the clear is awaiting success.
   historyEpoch += 1;
   historyStale = true;
   historyFailure = '';
+  historyClearFailure = '';
   flushPendingHistoryDelete();
   historyClear.append(historyCountdownFrame(historyDeleteElapsed(pending)));
   paintHistoryError();
@@ -2692,12 +2682,12 @@ function onHistoryClearDeadline(clearing) {
   commitHistoryClear();
 }
 
-/** Close/pagehide settle accepted deletion, never cancel it or send it twice. */
+/** Deadline, quit and pagehide settle an accepted clear exactly once. */
 function commitHistoryClear() {
   const clearing = historyClearing;
   if (clearing === null) return null;
   if (clearing.committing) return clearing.result;
-  clearing.hadFocus = document.activeElement === historyClear;
+  clearing.hadFocus = !closed && document.activeElement === historyClear;
   clearing.committing = true;
   stopHistoryClearCountdown(clearing);
   paintHistoryControls();
@@ -2718,17 +2708,19 @@ async function clearHistoryNow(clearing) {
     historyRetryErrors.clear();
     historyDeleteErrors.clear();
     historyFailure = '';
+    historyClearFailure = '';
     historyView = { ...(historyView ?? {}), entries: [] };
     historyLoaded = true;
     historyStale = true;
     cleared = true;
   } catch (cause) {
-    historyFailure = formatError(errorOf(cause));
+    historyClearFailure = errorOf(cause);
+    historyEpoch += 1;
+    historyStale = true;
   } finally {
     if (historyClearing === clearing) historyClearing = null;
     restoreHistoryClearButton();
-    if (closed) forgetHistory();
-    else renderHistory();
+    if (!closed) renderHistory();
     if (clearing.hadFocus && !closed && section === 'history' && !historyClear.disabled && document.activeElement === document.body) {
       historyClear.focus();
     }
@@ -2754,7 +2746,8 @@ async function loadHistory() {
     loaded = true;
   } catch (cause) {
     if (epoch !== historyEpoch || closed) return;
-    if (historyDeletes.size === 0) historyView = null;
+    // A reload failure must not erase a deletion's restored card or feedback.
+    if (historyDeletes.size === 0 && historyDeleteErrors.size === 0 && historyClearFailure === '') historyView = null;
     historyFailure = formatError(errorOf(cause));
   }
   // A read that failed is not the list: the next switch to the panel reads
@@ -2767,6 +2760,7 @@ async function loadHistory() {
 /** Covered cards are reused, including their body and player. Only their cover
  * is repainted from the original deadline; committing rows never regain Undo. */
 function renderHistory() {
+  if (closed) return;
   const open = expandedHistoryId;
   const kept = historyAudioUrl;
   const focused = document.activeElement;
@@ -2807,18 +2801,18 @@ function renderHistory() {
 
 function paintHistoryError() {
   const stored = historyView?.storageError ? formatMessage(historyView.storageError) : '';
-  setError(historyError, historyFailure || stored);
+  setError(historyError, historyClearFailure || historyFailure || stored);
 }
 
 /** Every history control follows the same gate as the rest of the form; Retry
  * additionally waits for the one retry already running. */
 function paintHistoryControls() {
   const usable = controlsReady() && historyClearing === null;
-  historyLimit.disabled = !usable || historyClearConfirming;
+  historyLimit.disabled = !usable;
   // Cancel belongs to its own deadline, not to the unrelated settings gate.
   historyClear.disabled = historyClearing !== null
     ? historyClearing.committing || closed
-    : !usable || historyClearConfirming || historyRetryingId !== null || generalInFlight > 0;
+    : !usable || historyRetryingId !== null || generalInFlight > 0;
   paintHistoryClearButton();
   for (const row of Array.from(historyList.querySelectorAll('.history-row'))) {
     const entry = historyEntryOf(row.dataset.id);
@@ -2849,7 +2843,7 @@ function onHistoryChanged() {
  * a refused question puts the previous value back instead of sending it.
  */
 function onHistoryLimitChange() {
-  if (!controlsReady() || historyClearing !== null || historyClearConfirming) return;
+  if (!controlsReady() || historyClearing !== null) return;
   const next = Number(historyLimit.value);
   const current = typeof view.settings?.history_limit === 'number' ? view.settings.history_limit : null;
   if (current === null || next >= current) {
@@ -2867,12 +2861,12 @@ function onHistoryLimitChange() {
 
 async function confirmHistoryLimitAfterLoad(next, current) {
   await loadHistory();
-  if (!controlsReady() || historyClearing !== null || historyClearConfirming) return;
+  if (!controlsReady() || historyClearing !== null) return;
   await confirmHistoryLimit(next, current);
 }
 
 async function confirmHistoryLimit(next, current) {
-  if (!controlsReady() || historyClearing !== null || historyClearConfirming || dialogConfirm.open) return;
+  if (!controlsReady() || historyClearing !== null || dialogConfirm.open) return;
   const entries = Array.isArray(historyView?.entries) ? historyView.entries.length : 0;
   if (entries <= next) {
     onGeneralChange();
@@ -2887,34 +2881,22 @@ async function confirmHistoryLimit(next, current) {
     historyLimit.value = String(current);
     return;
   }
-  if (!controlsReady() || historyClearing !== null || historyClearConfirming) return;
+  if (!controlsReady() || historyClearing !== null) return;
   onGeneralChange();
 }
 
-/** Drops the painted history when the window's draft goes away: the rows, the
- * decrypted player and any read still on its way belong to the closed window,
- * and the next open reads the store again. */
+/** Invalidates draft-era reads without touching standalone deletion operations.
+ * Their cards, players, deadlines and feedback belong to the retained document.
+ * An idle history can drop its cache; the next open always reloads the store. */
 function forgetHistory() {
-  historyClearConfirmEpoch += 1;
-  // Do not discard an accepted clear or its status before the command settles.
-  commitHistoryClear();
-  if (historyClearing !== null) return;
   historyEpoch += 1;
+  historyStale = true;
+  if (historyClearing !== null || historyDeletes.size > 0
+    || historyDeleteErrors.size > 0 || historyClearFailure !== '') return;
   expandedHistoryId = null;
   revokeHistoryAudio();
-  if (pendingHistoryDelete !== null) {
-    clearTimeout(pendingHistoryDelete.timer);
-    clearInterval(pendingHistoryDelete.countdownTimer);
-    pendingHistoryDelete = null;
-  }
-  for (const deletion of historyDeletes.values()) {
-    if (deletion.audioUrl !== null) URL.revokeObjectURL(deletion.audioUrl);
-  }
-  historyDeletes.clear();
-  historyDeleteErrors.clear();
   historyView = null;
   historyLoaded = false;
-  historyStale = false;
   historyFailure = '';
   historyRetryErrors.clear();
   setError(historyError, '');
@@ -3030,7 +3012,7 @@ async function applyKeys() {
  */
 async function closeDraft({ discard, forQuit = false }) {
   if (view === null || closed) return true;
-  await commitHistoryClear();
+  if (forQuit) await commitHistoryClear();
   try {
     await invoke(CMD.close, { draftId: view.draftId, discard: discard === true, forQuit });
     forgetDraft();
@@ -3383,6 +3365,11 @@ async function openSettings() {
   pendingSection = null;
   const next = await resync();
   if (next === null) return null;
+  // Showing a retained document never grants a fresh undo window, even if its
+  // background timers have not run yet. Repaint from the original deadlines.
+  if (pendingHistoryDelete !== null && performance.now() >= pendingHistoryDelete.deadline) commitPendingHistoryDelete();
+  if (historyClearing !== null && performance.now() >= historyClearing.deadline) commitHistoryClear();
+  if (historyView !== null) renderHistory();
   const requested = wanted ?? (SECTIONS.includes(next.selectedSection) ? next.selectedSection : 'last');
   const target = requested === 'last' ? section : requested;
   // "last" keeps the section on screen; anything else goes through the very
@@ -3417,9 +3404,9 @@ function onCloseRequest(event) {
   const raw = payload && typeof payload === 'object' ? payload.reason : null;
   const reason = raw === 'quit' ? 'quit' : 'close';
   pendingCloseReason = reason === 'quit' ? 'quit' : pendingCloseReason === 'quit' ? 'quit' : 'close';
-  // A delete still inside its undo window is settled now: that window is about
-  // to go away, and no promise may outlive the page that made it.
-  flushPendingHistoryDelete();
+  // Only an actual quit may flush early: a close can be refused by the key
+  // dialog, and an accepted normal close merely hides this retained document.
+  if (reason === 'quit') flushPendingHistoryDelete();
   if (dialogClose.open || dialogConfirm.open || closePending || busy) return;
   void closeFlow();
 }
@@ -3746,7 +3733,6 @@ function wire() {
   });
 
   window.addEventListener('pagehide', () => {
-    historyClearConfirmEpoch += 1;
     // The page is going away with whatever held its keyboard: the shell must
     // not keep a chord gate that no field will ever release.
     signalHotkeyField(false);
