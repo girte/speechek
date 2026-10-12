@@ -2049,9 +2049,75 @@ function historyButton(className, label, action) {
   return button;
 }
 
+/** The SVG namespace. Icons are drawn, not typed: a symbol taken from a font
+ * is not part of the palette and cannot follow the colour of the button it
+ * sits in. */
+const SVG_NS = 'http://www.w3.org/2000/svg';
+
+/** The header icons, on a 24×24 grid: a copy sheet and a waste bin. */
+const HISTORY_ICONS = Object.freeze({
+  copy: Object.freeze([
+    ['rect', { x: '8', y: '8', width: '14', height: '14', rx: '2', ry: '2' }],
+    ['path', { d: 'M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2' }],
+  ]),
+  delete: Object.freeze([
+    ['path', { d: 'M3 6h18' }],
+    ['path', { d: 'M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6' }],
+    ['path', { d: 'M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2' }],
+    ['path', { d: 'M10 11v6' }],
+    ['path', { d: 'M14 11v6' }],
+  ]),
+});
+/** What each icon is called: the tooltip the pointer shows and the name a
+ * screen reader reads are the same localized wording. */
+const HISTORY_ICON_KEY = Object.freeze({
+  copy: 'SettingsHistoryCopy',
+  delete: 'SettingsHistoryDelete',
+});
+
+/** One inline icon, stroked in the current colour and hidden from assistive
+ * technology: the button it belongs to carries the name. */
+function historyIcon(name) {
+  const svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('width', '16');
+  svg.setAttribute('height', '16');
+  svg.setAttribute('fill', 'none');
+  svg.setAttribute('stroke', 'currentColor');
+  svg.setAttribute('stroke-width', '2');
+  svg.setAttribute('stroke-linecap', 'round');
+  svg.setAttribute('stroke-linejoin', 'round');
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+  svg.classList.add('history-icon');
+  for (const [tag, attributes] of HISTORY_ICONS[name] ?? []) {
+    const shape = document.createElementNS(SVG_NS, tag);
+    for (const [attribute, value] of Object.entries(attributes)) shape.setAttribute(attribute, value);
+    svg.append(shape);
+  }
+  return svg;
+}
+
+/** An icon-only button. The drawing is decoration, so the button carries the
+ * name, and its title is the same text for the pointer. */
+function historyIconButton(className, icon, action) {
+  const label = formatMessage(msg(HISTORY_ICON_KEY[icon]));
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = className;
+  button.title = label;
+  button.setAttribute('aria-label', label);
+  button.append(historyIcon(icon));
+  button.addEventListener('click', action);
+  return button;
+}
+
 /**
- * One row: a header that opens the recording and a body that holds it. The text
- * of a dictation is untrusted, so it only ever reaches the document as text.
+ * One row: a header that opens the recording and a body that holds it. Copy and
+ * Delete close the header, beside the toggle that opens the row rather than
+ * inside it: a button inside a button is not reachable, and neither action may
+ * open a recording. The text of a dictation is untrusted, so it only ever
+ * reaches the document as text.
  */
 function historyRow(entry) {
   const status = Object.hasOwn(HISTORY_STATUS_KEY, entry.status) ? entry.status : 'failed';
@@ -2089,6 +2155,11 @@ function historyRow(entry) {
   if (status !== 'recognized') {
     head.append(historyButton('settings-button history-retry', msg('SettingsHistoryRetry'), () => void retryHistory(entry.id)));
   }
+  // A recording without text keeps its Copy button in place, disabled, so the
+  // two actions stay where the eye last found them.
+  const copy = historyIconButton('settings-button history-icon-button history-copy', 'copy', () => void copyHistoryText(entry.id));
+  copy.disabled = text === '';
+  head.append(copy, historyIconButton('settings-button history-icon-button history-delete', 'delete', () => deleteHistory(entry.id)));
 
   const body = document.createElement('div');
   body.className = 'history-row-body';
@@ -2106,85 +2177,29 @@ function historyRow(entry) {
   }
   const actions = document.createElement('div');
   actions.className = 'settings-actions';
-  const copy = historyButton('settings-button settings-primary history-copy', msg('SettingsHistoryCopy'), () => void copyHistoryText(entry.id));
-  copy.disabled = text === '';
-  const more = historyButton('settings-button history-more', '⋯', () => toggleHistoryMenu(entry.id));
-  more.setAttribute('aria-label', formatMessage(msg('SettingsHistoryMore')));
-  more.setAttribute('aria-haspopup', 'menu');
-  more.setAttribute('aria-expanded', 'false');
-  actions.append(copy, historyButton('settings-button history-retry', msg('SettingsHistoryRetry'), () => void retryHistory(entry.id)), more);
+  actions.append(
+    historyButton('settings-button history-retry', msg('SettingsHistoryRetry'), () => void retryHistory(entry.id)),
+    historyButton('settings-button', msg('SettingsHistorySaveAudio'), () => void saveHistoryAudio(entry.id)),
+  );
   body.append(actions);
-  const menu = document.createElement('div');
-  menu.className = 'history-menu';
-  menu.setAttribute('role', 'menu');
-  menu.hidden = true;
-  const save = historyButton('settings-button', msg('SettingsHistorySaveAudio'), () => {
-    setHistoryMenu(entry.id, false);
-    void saveHistoryAudio(entry.id);
-  });
-  save.setAttribute('role', 'menuitem');
-  const remove = historyButton('settings-button', msg('SettingsHistoryDelete'), () => {
-    setHistoryMenu(entry.id, false);
-    deleteHistory(entry.id);
-  });
-  remove.setAttribute('role', 'menuitem');
-  menu.append(save, remove);
-  body.append(menu);
-  const failure = document.createElement('p');
-  failure.className = 'error history-row-error';
-  failure.hidden = true;
-  body.append(failure);
 
   toggle.addEventListener('click', () => toggleHistoryRow(entry.id));
   const retryFailure = document.createElement('p');
   retryFailure.className = 'error history-retry-error';
   setError(retryFailure, historyRetryErrors.get(entry.id) ?? '');
-  row.append(head, retryFailure, body);
+  // The row's own error sits outside the body: a Copy that failed has nowhere
+  // to show its complaint while the row is closed, and a message the reader
+  // cannot see is not a message.
+  const failure = document.createElement('p');
+  failure.className = 'error history-row-error';
+  failure.hidden = true;
+  row.append(head, retryFailure, failure, body);
   return row;
 }
 
 function setHistoryRowError(id, text) {
   const node = historyRowOf(id)?.querySelector('.history-row-error');
   if (node) setError(node, text);
-}
-
-/** Whether the row menu is open. One row at a time: it holds no state, so
- * opening another one costs nothing. */
-function setHistoryMenu(id, open) {
-  const row = historyRowOf(id);
-  if (row === null) return;
-  const menu = row.querySelector('.history-menu');
-  if (menu) menu.hidden = !open;
-  const more = row.querySelector('.history-more');
-  if (more) more.setAttribute('aria-expanded', open ? 'true' : 'false');
-}
-
-function toggleHistoryMenu(id) {
-  const row = historyRowOf(id);
-  if (row === null) return;
-  const menu = row.querySelector('.history-menu');
-  const open = menu === null || menu.hidden;
-  for (const other of Array.from(historyList.querySelectorAll('.history-row'))) {
-    if (other.dataset.id && other.dataset.id !== id) setHistoryMenu(other.dataset.id, false);
-  }
-  setHistoryMenu(id, open);
-}
-
-function closeHistoryMenus() {
-  for (const row of Array.from(historyList.querySelectorAll('.history-row'))) {
-    if (row.dataset.id) setHistoryMenu(row.dataset.id, false);
-  }
-}
-
-/** A click anywhere but the menu and its own button retires the menu. */
-function onHistoryOutsideClick(event) {
-  const target = event.target;
-  if (target instanceof Element && target.closest('.history-more, .history-menu') !== null) return;
-  closeHistoryMenus();
-}
-
-function onHistoryKey(event) {
-  if (event.key === 'Escape') closeHistoryMenus();
 }
 
 /** Opens one row. A row that already has a player keeps the URL it was opened
@@ -2222,7 +2237,6 @@ function collapseHistoryRow() {
   if (id === null) return;
   const row = historyRowOf(id);
   if (row === null) return;
-  setHistoryMenu(id, false);
   const body = row.querySelector('.history-row-body');
   if (body) body.hidden = true;
   const toggle = row.querySelector('.history-row-toggle');
@@ -3400,10 +3414,6 @@ function wire() {
   historyLimit.addEventListener('change', onHistoryLimitChange);
   historyClear.addEventListener('click', () => void clearHistory());
   historyUndoButton.addEventListener('click', undoHistoryDelete);
-  // The row menu holds no state of its own: a click elsewhere or Escape
-  // retires it.
-  document.addEventListener('click', onHistoryOutsideClick);
-  document.addEventListener('keydown', onHistoryKey);
 }
 
 /* -------------------------------------------------------------------------- */

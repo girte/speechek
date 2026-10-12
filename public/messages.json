@@ -569,7 +569,6 @@
   "SettingsHistoryCopy": {"en": "Copy", "ru": "Копировать"},
   "SettingsHistoryCopied": {"en": "Text copied.", "ru": "Текст скопирован."},
   "SettingsHistoryRetry": {"en": "Retry", "ru": "Повторить"},
-  "SettingsHistoryMore": {"en": "More actions", "ru": "Другие действия"},
   "SettingsHistorySaveAudio": {"en": "Save audio…", "ru": "Сохранить аудио…"},
   "SettingsHistoryDelete": {"en": "Delete", "ru": "Удалить"},
   "SettingsHistoryDeleted": {"en": "Recording deleted", "ru": "Запись удалена"},

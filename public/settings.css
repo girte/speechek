@@ -277,9 +277,23 @@ body.settings-body [hidden] { display: none !important; }
 .history-row-body { padding: 10px 0 0; }
 .history-row-body audio { width: 100%; margin: 0 0 10px; }
 .history-text { white-space: pre-wrap; user-select: text; overflow-wrap: anywhere; margin: 0 0 10px; font-size: 13px; line-height: 1.55; }
-.history-more { flex: none; padding: 8px 12px; font-size: 13px; }
-.history-menu { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 0; padding: 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
-.history-menu .settings-button { padding: 8px 12px; font-size: 13px; }
+/* The header's icon actions close the header, outside the toggle that opens
+   the row: their size is fixed and they never shrink, so the preview is what
+   gives way first when the window narrows. The auto margin keeps them at the
+   right edge even when a narrow header wraps them onto a line of their own. */
+.history-row-head .history-copy { margin-left: auto; }
+.history-row-head .history-icon-button {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+}
+.history-icon { flex: none; pointer-events: none; }
+.history-row-head .history-delete { color: var(--error); }
+.history-row-head .history-delete:hover:not(:disabled) { border-color: var(--error); color: var(--error); }
 .history-controls, .history-undo { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
 .history-controls .settings-device-select { width: auto; max-width: 120px; }
 #history-clear { color: var(--error); }
