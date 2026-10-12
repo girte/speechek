@@ -154,8 +154,6 @@ const historyList = el('history-list');
 const historyEmpty = el('history-empty');
 const historyLimit = el('history-limit');
 const historyClear = el('history-clear');
-const historyUndo = el('history-undo');
-const historyUndoButton = el('history-undo-button');
 
 // Translation-only display state: never stores editor values or changes controls.
 const retainedText = new Map();
@@ -1942,14 +1940,12 @@ function checkKeys() {
 /* -------------------------------------------------------------------------- */
 
 /**
- * The history is a read of the shell's own store: every command here answers
- * with the list as it is now, and this page keeps no copy of a recording. What
- * it does own is the blob URL of the one row whose player is open, and that URL
- * is revoked the moment the row closes, so a decrypted recording never outlives
- * the player it was opened for.
+ * The list is a read of the shell's store. Open players own their blob URLs;
+ * a covered deletion retains its original card and URL until Undo or a shell
+ * result. Closing the page releases every decrypted player.
  *
- * A delete is a promise, not a call: the row leaves the list at once and the
- * shell is told five seconds later unless the user takes it back. A second
+ * A delete is a promise, not a call: the row keeps its place under a cover and
+ * the shell is told five seconds later unless the user takes it back. A second
  * delete, a close request and the page going away all settle that promise
  * first, so no deletion is left waiting on a page that no longer exists.
  */
@@ -1983,8 +1979,12 @@ let historyRetryingId = null;
 const historyRetryErrors = new Map();
 /** Wording of a failed history action, above the list until the next read. */
 let historyFailure = '';
-/** A delete inside its undo window: `{ id, timer }`, or null. */
+/** The one deletion still offering Undo; other deletions may await the shell. */
 let pendingHistoryDelete = null;
+/** Covered rows survive reads until their own delete command settles. */
+const historyDeletes = new Map();
+/** Delete failures stay visible across list and language repaints. */
+const historyDeleteErrors = new Map();
 
 /** The row of one recording, or null when the list does not show it. */
 function historyRowOf(id) {
@@ -1997,7 +1997,7 @@ function historyRowOf(id) {
 
 function historyEntryOf(id) {
   const entries = Array.isArray(historyView?.entries) ? historyView.entries : [];
-  return entries.find((entry) => entry && entry.id === id) ?? null;
+  return entries.find((entry) => entry && entry.id === id) ?? historyDeletes.get(id)?.entry ?? null;
 }
 
 /** The row's one-line preview: the text it holds, why there is none, or the
@@ -2192,7 +2192,7 @@ function historyRow(entry) {
   // cannot see is not a message.
   const failure = document.createElement('p');
   failure.className = 'error history-row-error';
-  failure.hidden = true;
+  setError(failure, historyDeleteErrors.get(entry.id) ?? '');
   row.append(head, retryFailure, failure, body);
   return row;
 }
@@ -2260,7 +2260,16 @@ function historyBytes(value) {
 async function loadHistoryAudio(id) {
   try {
     const bytes = await invoke(CMD.historyAudio, { id });
-    if (closed || expandedHistoryId !== id) return;
+    if (closed) return;
+    const owner = historyDeletes.get(id);
+    if (owner?.expanded) {
+      if (owner.audioUrl !== null) URL.revokeObjectURL(owner.audioUrl);
+      owner.audioUrl = URL.createObjectURL(new Blob([historyBytes(bytes)], { type: 'audio/flac' }));
+      const player = owner.row.querySelector('audio');
+      if (player) player.src = owner.audioUrl;
+      return;
+    }
+    if (expandedHistoryId !== id) return;
     revokeHistoryAudio();
     historyAudioUrl = URL.createObjectURL(new Blob([historyBytes(bytes)], { type: 'audio/flac' }));
     const player = historyRowOf(id)?.querySelector('audio');
@@ -2269,7 +2278,7 @@ async function loadHistoryAudio(id) {
       player.load();
     }
   } catch (cause) {
-    if (closed || expandedHistoryId !== id) return;
+    if (closed || (expandedHistoryId !== id && !historyDeletes.get(id)?.expanded)) return;
     setHistoryRowError(id, formatError(errorOf(cause)));
   }
 }
@@ -2341,50 +2350,212 @@ async function saveHistoryAudio(id) {
   }
 }
 
-/** Hides one row and tells the shell only when the undo window closes: while
- * the window is open the recording is still there, so undo is a repaint. */
+/** Keeps the original row and player covered until Undo or a shell result. */
 function deleteHistory(id) {
-  if (view === null || closed) return;
+  if (view === null || closed || historyDeletes.has(id)) return;
   const row = historyRowOf(id);
-  if (row === null) return;
+  const entry = historyEntryOf(id);
+  if (row === null || entry === null) return;
   flushPendingHistoryDelete();
-  if (expandedHistoryId === id) collapseHistoryRow();
-  row.hidden = true;
-  pendingHistoryDelete = { id, timer: setTimeout(commitPendingHistoryDelete, HISTORY_UNDO_MS) };
-  show(historyUndo);
-  setStatus(msg('SettingsHistoryDeleted'));
+  const expanded = expandedHistoryId === id;
+  const deletion = {
+    id, row, entry, expanded,
+    index: Array.from(historyList.children).indexOf(row),
+    audioUrl: expanded ? historyAudioUrl : null,
+    deadline: performance.now() + HISTORY_UNDO_MS,
+    committing: false,
+    timer: null,
+    countdownTimer: null,
+  };
+  // The covered player owns its URL now, even if another row is opened.
+  if (expanded) {
+    expandedHistoryId = null;
+    historyAudioUrl = null;
+  }
+  historyDeleteErrors.delete(id);
+  historyDeletes.set(id, deletion);
+  pendingHistoryDelete = deletion;
+  row.style.height = `${row.getBoundingClientRect().height}px`;
+  coverHistoryRow(row, historyDeleteElapsed(deletion), true);
+  deletion.timer = setTimeout(() => onHistoryDeleteDeadline(deletion), Math.max(0, deletion.deadline - performance.now()));
+  deletion.countdownTimer = setInterval(() => updateHistoryDeleteCountdown(deletion), 1000);
+}
+
+/** Covers one row for the wait: the row itself stays, darkened and inert, under
+ * a perimeter that runs out exactly when the undo window does. */
+function coverHistoryRow(row, elapsedMs, focusUndo, committing = false) {
+  row.querySelector('.history-overlay')?.remove();
+  const overlay = historyDeleteOverlay(elapsedMs, committing);
+  row.classList.add('history-row-deleting');
+  row.append(overlay);
+  if (focusUndo) {
+    if (committing) {
+      overlay.tabIndex = -1;
+      overlay.focus();
+    } else {
+      overlay.querySelector('.history-overlay-undo')?.focus();
+    }
+  }
+  // Everything but the cover is out of reach — pointer, keyboard and the
+  // accessibility tree alike — while the delete is the only thing happening.
+  for (const child of Array.from(row.children)) {
+    if (child === overlay) continue;
+    child.inert = true;
+    child.setAttribute('aria-hidden', 'true');
+  }
+}
+
+/** Uncovers one row: the delete was taken back or refused, so its own content
+ * and its own actions are the row's again. */
+function uncoverHistoryRow(row) {
+  row.querySelector('.history-overlay')?.remove();
+  row.classList.remove('history-row-deleting');
+  row.style.removeProperty('height');
+  for (const child of Array.from(row.children)) {
+    child.inert = false;
+    child.removeAttribute('aria-hidden');
+  }
+}
+
+/** SVG uses physical CSS pixels, not a stretched square: the corner radius
+ * and inset match the card at any aspect ratio. The rect path is clockwise.
+ * Source: https://svgwg.org/svg2-draft/shapes.html#RectElement */
+function historyDeleteOverlay(elapsedMs, committing) {
+  const overlay = document.createElement('div');
+  overlay.className = 'history-overlay';
+  const frame = document.createElementNS(SVG_NS, 'svg');
+  frame.setAttribute('class', 'history-overlay-frame');
+  frame.setAttribute('aria-hidden', 'true');
+  frame.setAttribute('focusable', 'false');
+  if (committing) frame.setAttribute('hidden', '');
+  const perimeter = document.createElementNS(SVG_NS, 'rect');
+  perimeter.setAttribute('class', 'history-overlay-perimeter');
+  perimeter.setAttribute('x', '1');
+  perimeter.setAttribute('y', '1');
+  perimeter.setAttribute('rx', '6');
+  perimeter.setAttribute('pathLength', '100');
+  perimeter.style.animationDuration = `${HISTORY_UNDO_MS}ms`;
+  perimeter.style.animationDelay = `-${elapsedMs}ms`;
+  frame.append(perimeter);
+  const text = document.createElement('span');
+  text.className = 'history-overlay-text';
+  text.setAttribute('role', 'status');
+  setText(text, msg('SettingsHistoryDeleting'));
+  overlay.append(frame, text);
+  if (!committing) {
+    const countdown = document.createElement('span');
+    countdown.className = 'history-overlay-countdown';
+    countdown.setAttribute('aria-hidden', 'true');
+    setText(countdown, msg('SettingsHistoryDeleteRemaining', { seconds: Math.ceil((HISTORY_UNDO_MS - elapsedMs) / 1000) }));
+    overlay.append(countdown);
+    overlay.append(historyButton('settings-button history-overlay-undo', msg('SettingsHistoryUndo'), undoHistoryDelete));
+  }
+  return overlay;
+}
+
+/** A monotonic deadline is unaffected by system clock adjustments.
+ * Source: https://developer.mozilla.org/en-US/docs/Web/API/Performance/now */
+function historyDeleteElapsed(deletion) {
+  return Math.min(Math.max(HISTORY_UNDO_MS - (deletion.deadline - performance.now()), 0), HISTORY_UNDO_MS);
+}
+
+function updateHistoryDeleteCountdown(deletion) {
+  const countdown = deletion.row.querySelector('.history-overlay-countdown');
+  if (countdown) {
+    const seconds = Math.max(0, Math.ceil((deletion.deadline - performance.now()) / 1000));
+    setText(countdown, msg('SettingsHistoryDeleteRemaining', { seconds }));
+  }
+}
+
+function onHistoryDeleteDeadline(deletion) {
+  if (pendingHistoryDelete !== deletion) return;
+  const pending = deletion;
+  const remaining = pending.deadline - performance.now();
+  if (remaining > 0) {
+    pending.timer = setTimeout(() => onHistoryDeleteDeadline(deletion), remaining);
+    return;
+  }
+  commitPendingHistoryDelete();
 }
 
 function commitPendingHistoryDelete() {
   const pending = pendingHistoryDelete;
   if (pending === null) return;
   clearTimeout(pending.timer);
+  clearInterval(pending.countdownTimer);
   pendingHistoryDelete = null;
-  hide(historyUndo);
-  void deleteHistoryNow(pending.id);
+  pending.committing = true;
+  const hadFocus = pending.row.contains(document.activeElement);
+  coverHistoryRow(pending.row, HISTORY_UNDO_MS, hadFocus, true);
+  void deleteHistoryNow(pending);
 }
 
-async function deleteHistoryNow(id) {
+async function deleteHistoryNow(deletion) {
+  const { id } = deletion;
   try {
     await invoke(CMD.historyDelete, { id });
+    if (historyDeletes.get(id) !== deletion) return;
+    historyDeletes.delete(id);
+    const hadFocus = deletion.row.contains(document.activeElement);
+    if (deletion.audioUrl !== null) URL.revokeObjectURL(deletion.audioUrl);
+    // Invalidate list reads started before the command succeeded.
+    historyEpoch += 1;
     dropHistoryEntry(id);
+    if (hadFocus) {
+      const rows = Array.from(historyList.children);
+      const next = rows[Math.min(deletion.index, rows.length - 1)];
+      next?.querySelector('.history-overlay-undo, .history-row-toggle')?.focus();
+    }
   } catch (cause) {
-    // The shell did not delete it, so the row comes back rather than the list
-    // claiming a deletion that did not happen.
-    const row = historyRowOf(id);
-    if (row) row.hidden = false;
-    setStatus(formatError(errorOf(cause)));
+    if (historyDeletes.get(id) !== deletion) return;
+    const error = errorOf(cause);
+    historyDeleteErrors.set(id, error);
+    restoreHistoryDelete(deletion);
+    setHistoryRowError(id, error);
   }
+}
+
+function restoreHistoryDelete(deletion) {
+  const hadFocus = deletion.row.contains(document.activeElement);
+  historyDeletes.delete(deletion.id);
+  uncoverHistoryRow(deletion.row);
+  // Restore the data behind the original card as well as its DOM and player.
+  const entries = Array.isArray(historyView?.entries) ? historyView.entries.slice() : [];
+  const index = entries.findIndex((entry) => entry?.id === deletion.id);
+  if (index === -1) entries.splice(deletion.index, 0, deletion.entry);
+  else entries[index] = deletion.entry;
+  historyView = { ...(historyView ?? {}), entries };
+  if (deletion.expanded) {
+    collapseHistoryRow();
+    expandedHistoryId = deletion.id;
+    historyAudioUrl = deletion.audioUrl;
+  }
+  setText(deletion.row.querySelector('.history-time'), historyTime(deletion.entry.startedUtcMs));
+  const glyph = deletion.row.querySelector('.history-glyph');
+  glyph?.setAttribute('aria-label', formatMessage(msg(HISTORY_STATUS_KEY[deletion.row.dataset.status])));
+  for (const [icon, key] of Object.entries(HISTORY_ICON_KEY)) {
+    const button = deletion.row.querySelector(`.history-${icon}`);
+    if (button) {
+      button.title = formatMessage(msg(key));
+      button.setAttribute('aria-label', button.title);
+    }
+  }
+  paintHistoryControls();
+  if (hadFocus) deletion.row.querySelector('.history-delete')?.focus();
 }
 
 function undoHistoryDelete() {
   const pending = pendingHistoryDelete;
   if (pending === null) return;
+  // A throttled timer must not extend Undo past its absolute deadline.
+  if (performance.now() >= pending.deadline) {
+    commitPendingHistoryDelete();
+    return;
+  }
   clearTimeout(pending.timer);
+  clearInterval(pending.countdownTimer);
   pendingHistoryDelete = null;
-  hide(historyUndo);
-  const row = historyRowOf(pending.id);
-  if (row) row.hidden = false;
+  restoreHistoryDelete(pending);
 }
 
 /** Settles a delete that is still inside its undo window: a second delete, a
@@ -2394,7 +2565,12 @@ function flushPendingHistoryDelete() {
 }
 
 function dropHistoryEntry(id) {
+  const removedIndex = Array.from(historyList.children).indexOf(historyRowOf(id));
+  for (const deletion of historyDeletes.values()) {
+    if (removedIndex >= 0 && deletion.index > removedIndex) deletion.index -= 1;
+  }
   historyRetryErrors.delete(id);
+  historyDeleteErrors.delete(id);
   const entries = Array.isArray(historyView?.entries) ? historyView.entries.filter((entry) => entry && entry.id !== id) : [];
   historyView = { ...(historyView ?? {}), entries };
   renderHistory();
@@ -2432,7 +2608,7 @@ async function loadHistory() {
     loaded = true;
   } catch (cause) {
     if (epoch !== historyEpoch || closed) return;
-    historyView = null;
+    if (historyDeletes.size === 0) historyView = null;
     historyFailure = formatError(errorOf(cause));
   }
   // A read that failed is not the list: the next switch to the panel reads
@@ -2442,27 +2618,35 @@ async function loadHistory() {
   renderHistory();
 }
 
-/** Rebuilds the list from the newest answer. The open row keeps its player and
- * the URL it was opened with, and a row inside its undo window stays away. */
+/** Covered cards are reused, including their body and player. Only their cover
+ * is repainted from the original deadline; committing rows never regain Undo. */
 function renderHistory() {
   const open = expandedHistoryId;
   const kept = historyAudioUrl;
+  const focused = document.activeElement;
+  const focusedDelete = Array.from(historyDeletes.values()).find((deletion) => deletion.row.contains(focused));
   clearChildren(historyList);
   const entries = Array.isArray(historyView?.entries) ? historyView.entries : [];
-  for (const entry of entries) {
-    if (entry && typeof entry.id === 'string') historyList.append(historyRow(entry));
+  const visible = entries.filter((entry) => entry && typeof entry.id === 'string' && !historyDeletes.has(entry.id));
+  // Retain each covered card at its previous position even if a read omitted it.
+  for (const deletion of Array.from(historyDeletes.values()).sort((a, b) => a.index - b.index)) {
+    visible.splice(Math.min(deletion.index, visible.length), 0, deletion.entry);
   }
-  // A retry complaint describes a recording, not a rendered row: it outlives a
-  // repaint of the same list and goes once the recording itself is gone.
-  for (const id of Array.from(historyRetryErrors.keys())) {
-    if (!entries.some((entry) => entry && entry.id === id)) historyRetryErrors.delete(id);
+  for (const entry of visible) {
+    const deletion = historyDeletes.get(entry.id);
+    const row = deletion?.row ?? historyRow(entry);
+    historyList.append(row);
+    if (deletion) {
+      coverHistoryRow(row, historyDeleteElapsed(deletion), deletion === focusedDelete, deletion.committing);
+    }
   }
-  historyList.hidden = entries.length === 0;
-  historyEmpty.hidden = !(historyView !== null && entries.length === 0);
-  if (pendingHistoryDelete !== null) {
-    const row = historyRowOf(pendingHistoryDelete.id);
-    if (row) row.hidden = true;
+  for (const errors of [historyRetryErrors, historyDeleteErrors]) {
+    for (const id of errors.keys()) {
+      if (!visible.some((entry) => entry.id === id)) errors.delete(id);
+    }
   }
+  historyList.hidden = visible.length === 0;
+  historyEmpty.hidden = !(historyView !== null && visible.length === 0);
   if (open !== null) {
     if (historyRowOf(open) === null) {
       expandedHistoryId = null;
@@ -2490,6 +2674,9 @@ function paintHistoryControls() {
     const entry = historyEntryOf(row.dataset.id);
     const hasText = typeof entry?.text === 'string' && entry.text !== '';
     for (const button of Array.from(row.querySelectorAll('button'))) {
+      // The cover's own Undo belongs to the delete, not to the form: it stays
+      // usable while the window is open, and the deadline is what ends it.
+      if (button.classList.contains('history-overlay-undo')) continue;
       if (button.classList.contains('history-copy')) button.disabled = !usable || !hasText;
       else if (button.classList.contains('history-retry')) button.disabled = !usable || historyRetryingId !== null;
       else button.disabled = !usable;
@@ -2561,14 +2748,19 @@ function forgetHistory() {
   revokeHistoryAudio();
   if (pendingHistoryDelete !== null) {
     clearTimeout(pendingHistoryDelete.timer);
+    clearInterval(pendingHistoryDelete.countdownTimer);
     pendingHistoryDelete = null;
   }
+  for (const deletion of historyDeletes.values()) {
+    if (deletion.audioUrl !== null) URL.revokeObjectURL(deletion.audioUrl);
+  }
+  historyDeletes.clear();
+  historyDeleteErrors.clear();
   historyView = null;
   historyLoaded = false;
   historyStale = false;
   historyFailure = '';
   historyRetryErrors.clear();
-  hide(historyUndo);
   setError(historyError, '');
   clearChildren(historyList);
   historyList.hidden = true;
@@ -3409,11 +3601,14 @@ function wire() {
     // and no promise may outlive it. The recording's player goes with it.
     flushPendingHistoryDelete();
     revokeHistoryAudio();
+    for (const deletion of historyDeletes.values()) {
+      if (deletion.audioUrl !== null) URL.revokeObjectURL(deletion.audioUrl);
+      deletion.audioUrl = null;
+    }
   });
 
   historyLimit.addEventListener('change', onHistoryLimitChange);
   historyClear.addEventListener('click', () => void clearHistory());
-  historyUndoButton.addEventListener('click', undoHistoryDelete);
 }
 
 /* -------------------------------------------------------------------------- */

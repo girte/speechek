@@ -294,10 +294,46 @@ body.settings-body [hidden] { display: none !important; }
 .history-icon { flex: none; pointer-events: none; }
 .history-row-head .history-delete { color: var(--error); }
 .history-row-head .history-delete:hover:not(:disabled) { border-color: var(--error); color: var(--error); }
-.history-controls, .history-undo { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+.history-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
 .history-controls .settings-device-select { width: auto; max-width: 120px; }
 #history-clear { color: var(--error); }
-.history-undo { padding: 12px 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+
+/* The covered card keeps its measured height and original content. Its border
+   resumes from the absolute deadline after a list or language repaint. */
+.history-row-deleting { position: relative; overflow: hidden; }
+.history-overlay {
+  position: absolute;
+  inset: -1px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 7px;
+  background: var(--bg);
+  background: color-mix(in srgb, var(--bg) 90%, transparent);
+}
+.history-overlay-frame { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; pointer-events: none; }
+.history-overlay-perimeter {
+  fill: none;
+  width: calc(100% - 2px);
+  height: calc(100% - 2px);
+  stroke: var(--error);
+  stroke-width: 2;
+  stroke-dasharray: 100;
+  stroke-dashoffset: 0;
+  animation: history-delete-perimeter 5s linear forwards;
+}
+@keyframes history-delete-perimeter {
+  from { stroke-dashoffset: 0; }
+  to { stroke-dashoffset: -100; }
+}
+.history-overlay-text { color: var(--text); font-size: 13px; }
+.history-overlay .history-overlay-undo { flex: none; padding: 6px 10px; font-size: 12px; }
+.history-overlay .history-overlay-undo:focus-visible { outline-offset: -3px; }
+.history-overlay-countdown { display: none; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
 #history-list { margin-top: 14px; }
 
 .settings-foot {
@@ -349,4 +385,8 @@ body.settings-body [hidden] { display: none !important; }
 
 @media (prefers-reduced-motion: reduce) {
   .settings-tab, .settings-button { transition: none; }
+  /* Static seconds replace the moving perimeter, with the same deadline. */
+  .history-overlay-frame { display: none; }
+  .history-overlay-perimeter { animation: none; }
+  .history-overlay-countdown { display: inline; }
 }
