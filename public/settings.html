@@ -160,10 +160,7 @@
         <section class="settings-panel" id="panel-history" role="tabpanel" aria-labelledby="tab-history" tabindex="-1" hidden>
           <h2 class="settings-block-title" data-i18n="SettingsHistoryTitle">Recording history</h2>
           <p class="settings-lead" data-i18n="SettingsHistoryLead">Stored only on this computer, encrypted.</p>
-          <p class="error" id="history-error" role="alert" hidden></p>
-          <ul class="settings-results" id="history-list"></ul>
-          <p class="hint" id="history-empty" data-i18n="SettingsHistoryEmpty" hidden>Your dictations will appear here.</p>
-          <div class="history-footer">
+          <div class="history-controls">
             <label for="history-limit" data-i18n="SettingsHistoryLimitLabel">Keep the last</label>
             <select id="history-limit" class="settings-device-select">
               <option value="5">5</option><option value="10" selected>10</option><option value="20">20</option><option value="50">50</option>
@@ -174,6 +171,9 @@
             <span data-i18n="SettingsHistoryDeleted">Recording deleted</span>
             <button type="button" class="settings-button" id="history-undo-button" data-i18n="SettingsHistoryUndo">Undo</button>
           </div>
+          <p class="error" id="history-error" role="alert" hidden></p>
+          <ul class="settings-results" id="history-list"></ul>
+          <p class="hint" id="history-empty" data-i18n="SettingsHistoryEmpty" hidden>Your dictations will appear here.</p>
         </section>
       </div>
     </div>

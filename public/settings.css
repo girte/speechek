@@ -280,8 +280,8 @@ body.settings-body [hidden] { display: none !important; }
 .history-more { flex: none; padding: 8px 12px; font-size: 13px; }
 .history-menu { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 0; padding: 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
 .history-menu .settings-button { padding: 8px 12px; font-size: 13px; }
-.history-footer, .history-undo { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
-.history-footer .settings-device-select { width: auto; max-width: 120px; }
+.history-controls, .history-undo { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+.history-controls .settings-device-select { width: auto; max-width: 120px; }
 #history-clear { color: var(--error); }
 .history-undo { padding: 12px 14px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
 #history-list { margin-top: 14px; }
