@@ -5,6 +5,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 The text of each GitHub Release is generated from the matching version section below plus a fixed install/unsigned/known-limitations/SHA-256 footer.
 
+## [0.5.1] - 2026-10-23
+
+### Fixed
+
+- **Recording history Retry now follows the selected recognition mode**: Live Smart replays saved audio through Live instead of silently switching to batch Smart; Smart and Verbatim retain their respective batch modes. A retry keeps the mode, keys, vocabulary and languages captured at its start, never enables the microphone or pastes automatically, and replaces saved text only after complete, non-empty recognition. Failed retries preserve the previous text and audio. Ordinary dictation's Live activity rotation and whole-recording Smart fallback are unchanged. ([#13](https://github.com/girte/speechek/issues/13))
+- Live history retries preserve long recordings across activity rotations and retain audio beyond the ten-minute boundary in a subsequent Live session without dropping the tail; a confirmed silent tail does not discard an otherwise successful transcript.
+
 ## [0.5.0] - 2026-10-12
 
 ### Added
