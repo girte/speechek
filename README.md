@@ -123,6 +123,8 @@ API keys are different: they take effect only after you click **Apply keys**.
 
 The **Recording history** tab keeps your last 5, 10, 20 or 50 dictations (10 by default). Expand a recording to listen, read the full text, retry recognition or save the audio; the copy and trash icons are available even when the row is collapsed. History is always on; Esc-cancelled, lab and too-short recordings aren't saved. See [Recording history](docs/user-guide.md#recording-history) for retention, deletion and export privacy.
 
+History **Retry** follows the recognition mode selected when you click it: Live Smart replays the saved audio through Live; Smart and Verbatim use their respective batch modes. A history Live retry never silently switches to batch Smart. Ordinary dictation's recovery behaviour is unchanged.
+
 <details>
 <summary>Screenshot: the settings window</summary>
 

@@ -156,7 +156,7 @@ Each collapsed row shows the date, time, duration and a text preview, with copy 
 
 Click a row to expand it: you get playback of its FLAC audio, the full recognized text, and **Retry** and **Save audio…** side by side.
 
-- **Retry** uses the mode currently selected in **General settings**; **Live Smart** is retried as batch **Smart**. It sends the saved audio to Google again, so it needs internet access, a working API key and quota. Success replaces the saved text with no undo; failure keeps the previous text. Retry never pastes automatically — use the copy icon if you want the result elsewhere.
+- **Retry** uses the recognition mode selected in **General settings** when you click it: **Live Smart** streams the saved audio through Live, while **Smart** and **Verbatim** use their respective batch modes. The microphone stays off. A Live retry does not silently fall back to batch Smart; replay takes roughly the recording's duration plus final processing. Changing settings during a retry does not change that attempt. The saved audio is sent to Google again, so internet access, a working API key and quota are required. Success replaces the saved text with no undo; failure keeps the previous text and audio. Retry never pastes automatically — use the copy icon if you want the result elsewhere.
 - **Save audio…** opens a normal file-save dialog and exports decrypted FLAC audio. **The exported file is unencrypted outside Speechek**; protect it yourself before sharing or storing it elsewhere.
 - The **trash icon** starts a **5-second countdown inside that row**. Click **Undo** before it expires to keep the recording.
 - **Clear history** starts a **5-second countdown directly on the button**, with **Cancel** and no confirmation dialog. Cancel before it expires to keep the history.
@@ -208,8 +208,8 @@ Speechek writes `settings.json` and `secrets.bin` one after the other. If someth
 **Your recordings**
 
 - Speechek keeps your last dictations (10 by default), audio and recognized text, in `%APPDATA%\Speechek\history`, encrypted with Windows DPAPI for your user account and stored only on this computer. A normal (Production) build keeps no journals and no other automatic copies of audio or text. **Save audio…** exports an unencrypted FLAC file to the location you choose. Only a separate debug Development build with the explicit `dev-diagnostics` flag additionally writes a plaintext local archive; see [Building from source](#building-from-source).
-- For Smart and Verbatim, the recording is uploaded to Gemini temporarily and deleted after recognition. Speechek also asks Gemini not to store the request. History **Retry** and Live Smart's incomplete-result fallback also upload saved audio for batch recognition.
-- Live Smart streams the audio to Gemini while you speak. Keeping a local history doesn't prevent this cloud transmission.
+- For Smart and Verbatim, the recording is uploaded to Gemini temporarily and deleted after recognition. Speechek also asks Gemini not to store the request. History **Retry** does the same when Smart or Verbatim is selected. Ordinary Live Smart dictation's incomplete-result fallback also uploads the whole retained recording for batch recognition; this fallback is unchanged.
+- Live Smart streams audio to Gemini while you speak. A history retry with Live Smart selected streams the saved audio instead, without using the microphone. Keeping a local history doesn't prevent this cloud transmission.
 - A custom vocabulary, if you set one, is sent to Google with every recording, in all three modes. It's plain text in `settings.json`, never in `secrets.bin`.
 
 **Limits**

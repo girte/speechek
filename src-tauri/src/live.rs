@@ -5,6 +5,13 @@
 //! The key never reaches the browser, and no error, log line or message sent back to
 //! the browser ever contains it (`backend::redact`).
 //!
+//! The same loop also drives the history retry's saved-take replay: an internal
+//! client synthesizes the overlay's frames at the recording's own pace and
+//! consumes the finals, so the replay keeps the relay's rotation, replay and
+//! incomplete-session rules instead of a second protocol implementation. A
+//! retained take longer than the Live audio cap is replayed as consecutive
+//! sessions with the same pinned key, ring, vocabulary and languages.
+//!
 //! One accepted socket binds exactly one key for the whole session, and the browser
 //! sees exactly five messages: `ready` once the upstream confirms its setup,
 //! `interim` and `final` for the input transcription, `error` for a terminal
@@ -104,6 +111,15 @@ const IDLE_PARK: Duration = Duration::from_secs(24 * 60 * 60);
 /// progress never reaches this deadline.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(700);
 
+/// One replay frame: 100 ms of 16 kHz mono PCM16, the chunk the Live API
+/// documents for realtime input
+/// (<https://ai.google.dev/gemini-api/docs/live-api/live-transcribe>).
+const REPLAY_FRAME_BYTES: usize =
+    (SAMPLE_RATE as usize * BYTES_PER_SAMPLE as usize) / 10;
+/// How far apart a saved take's frames are sent: the same pace the overlay's
+/// own real-time stream keeps.
+const REPLAY_FRAME_INTERVAL: Duration = Duration::from_millis(100);
+
 /* -------------------------------------------------------------------------- */
 /* Session state                                                              */
 /* -------------------------------------------------------------------------- */
@@ -132,6 +148,13 @@ impl Mode {
         match self {
             Self::Smart => "SMART",
             Self::Verbatim => "VERBATIM",
+        }
+    }
+
+    fn wire_name(self) -> &'static str {
+        match self {
+            Self::Smart => "smart",
+            Self::Verbatim => "verbatim",
         }
     }
 }
@@ -854,9 +877,204 @@ fn mask_urls(detail: &str) -> String {
 /// What woke the loop. The sockets are borrowed by the select's futures only, so the
 /// handlers can take them again by `&mut`.
 enum Event {
-    Client(Option<Result<ClientMessage, axum::Error>>),
+    Client(Option<ClientFrame>),
     Upstream(Option<Result<UpstreamMessage, tokio_tungstenite::tungstenite::Error>>),
     Deadline,
+}
+
+/// One frame read from the client side, whoever provides it.
+enum ClientFrame {
+    /// One browser frame exactly as axum delivered it: its text or bytes are
+    /// read directly, so the browser path copies neither.
+    Browser(ClientMessage),
+    /// A frame the saved-audio replay synthesized, already parsed.
+    Message(Value),
+    /// The browser socket failed; the session is cancelled like a close.
+    Failed,
+}
+
+/// Where the relay's client side comes from: the browser's WebSocket, or the
+/// saved-audio replay that stands in for it.
+enum ClientSocket<'a> {
+    Browser(WebSocket),
+    Playback(Playback<'a>),
+}
+
+impl<'a> ClientSocket<'a> {
+    /// One frame, or `None` when the client is gone. A pending future here is
+    /// cancelled by the relay's select; the replay relies on that to wait for
+    /// `ready` and for the terminal message.
+    async fn recv(&mut self) -> Option<ClientFrame> {
+        match self {
+            Self::Browser(socket) => match socket.recv().await {
+                Some(Ok(message)) => Some(ClientFrame::Browser(message)),
+                Some(Err(_)) => Some(ClientFrame::Failed),
+                None => None,
+            },
+            Self::Playback(playback) => playback.recv().await,
+        }
+    }
+
+    /// Writes one relay message. The browser gets exactly the JSON text it
+    /// always got; the replay consumes the value itself, so a replay frame is
+    /// never serialized.
+    async fn send(&mut self, payload: &Value) -> Result<(), axum::Error> {
+        match self {
+            Self::Browser(socket) => {
+                socket.send(ClientMessage::text(payload.to_string())).await
+            }
+            Self::Playback(playback) => {
+                playback.observe(payload);
+                Ok(())
+            }
+        }
+    }
+
+    async fn close(&mut self, frame: Option<CloseFrame>) {
+        if let Self::Browser(socket) = self {
+            let _ = socket.send(ClientMessage::Close(frame)).await;
+        }
+    }
+}
+
+/// The client side of one saved-take replay: it synthesizes exactly the frames
+/// the overlay would send - `start`, 100 ms audio chunks and `end` - at the
+/// recording's own pace, and consumes what the relay writes back.
+struct Playback<'a> {
+    pcm: &'a [u8],
+    /// The first byte not yet turned into a frame.
+    offset: usize,
+    /// The gap between two audio frames; zero in tests that drive a long take.
+    interval: Duration,
+    /// When the next audio frame may be sent.
+    next_due: Option<Instant>,
+    start_sent: bool,
+    ready: bool,
+    end_sent: bool,
+    /// Every final the Live API returned, in order. Interims are never kept.
+    finals: Vec<String>,
+    /// The terminal error, when the relay reported one.
+    error: Option<UiMessage>,
+    done: bool,
+}
+
+impl<'a> Playback<'a> {
+    fn new(pcm: &'a [u8], interval: Duration) -> Self {
+        Self {
+            pcm,
+            offset: 0,
+            interval,
+            next_due: None,
+            start_sent: false,
+            ready: false,
+            end_sent: false,
+            finals: Vec::new(),
+            error: None,
+            done: false,
+        }
+    }
+
+    /// One synthesized browser frame. Once `end` has been sent the replay has
+    /// nothing more to say: the relay finishes from the upstream messages and
+    /// its own deadlines, so this waits rather than pretending the client is
+    /// gone - which would cancel the session before its result arrived.
+    ///
+    /// The cursor only moves after the pacing sleep has completed, so a select
+    /// that cancels this future never loses or repeats a chunk.
+    async fn recv(&mut self) -> Option<ClientFrame> {
+        if !self.start_sent {
+            self.start_sent = true;
+            return Some(ClientFrame::Message(
+                json!({ "type": "start", "mode": Mode::Smart.wire_name() }),
+            ));
+        }
+        if !self.ready {
+            // `ready` is written by the relay once the setup is confirmed. The
+            // relay's select cancels this future for that write and creates a
+            // new one afterwards, so there is nothing to notify.
+            return std::future::pending::<Option<ClientFrame>>().await;
+        }
+        if self.offset < self.pcm.len() {
+            if let Some(due) = self.next_due {
+                tokio::time::sleep_until(due).await;
+            }
+            let end = (self.offset + REPLAY_FRAME_BYTES).min(self.pcm.len());
+            let data =
+                base64::engine::general_purpose::STANDARD.encode(&self.pcm[self.offset..end]);
+            self.offset = end;
+            self.next_due = Some(Instant::now() + self.interval);
+            return Some(ClientFrame::Message(json!({ "type": "audio", "data": data })));
+        }
+        if !self.end_sent {
+            self.end_sent = true;
+            return Some(ClientFrame::Message(json!({ "type": "end" })));
+        }
+        std::future::pending::<Option<ClientFrame>>().await
+    }
+
+    /// Consumes one relay message without serializing it.
+    fn observe(&mut self, payload: &Value) {
+        match payload.get("type").and_then(Value::as_str) {
+            Some("ready") => self.ready = true,
+            Some("final") => {
+                if let Some(text) = payload.get("text").and_then(Value::as_str) {
+                    self.finals.push(text.to_owned());
+                }
+            }
+            Some("interim") => {}
+            Some("error") => {
+                self.error = Some(
+                    payload
+                        .get("ui")
+                        .and_then(|ui| serde_json::from_value::<UiMessage>(ui.clone()).ok())
+                        .unwrap_or_else(|| UiMessage::new(MessageId::LiveConnectionClosed)),
+                );
+            }
+            Some("done") => self.done = true,
+            _ => {}
+        }
+    }
+
+    /// The replay's result: exactly the non-empty finals, joined the way the
+    /// overlay joins them, and only after a `done` that carried no error.
+    fn text(self) -> Result<String, SavedAudioError> {
+        if let Some(ui) = self.error {
+            return Err(SavedAudioError {
+                code: "LIVE_ERROR",
+                ui,
+            });
+        }
+        if !self.done {
+            return Err(SavedAudioError {
+                code: "LIVE_INCOMPLETE",
+                ui: UiMessage::new(MessageId::LiveIncomplete),
+            });
+        }
+        let capacity = self
+            .finals
+            .iter()
+            .map(|final_text| final_text.len())
+            .sum::<usize>()
+            + self.finals.len().saturating_sub(1);
+        let mut text = String::with_capacity(capacity);
+        for final_text in self.finals {
+            if final_text.is_empty() {
+                continue;
+            }
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(&final_text);
+        }
+        Ok(text)
+    }
+}
+
+/// Why a saved-take replay produced no usable transcript.
+#[derive(Debug)]
+pub(crate) struct SavedAudioError {
+    pub code: &'static str,
+    pub ui: UiMessage,
 }
 
 /* -------------------------------------------------------------------------- */
@@ -878,6 +1096,136 @@ pub async fn serve(
     languages: Arc<[String]>,
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] trace: Option<RequestTrace>,
 ) {
+    let _ = run(
+        ClientSocket::Browser(socket),
+        &provider,
+        key,
+        ring,
+        vocabulary,
+        languages,
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        trace,
+    )
+    .await;
+}
+
+/// Replays one saved take through the same relay in Smart mode. A take longer
+/// than the Live API's ten-minute audio cap is replayed as consecutive
+/// sessions of at most that cap, with the same pinned key, ring, vocabulary
+/// and languages. The result is the join of every session's finals, returned
+/// only when every session completed and the combined transcript is non-empty.
+pub(crate) async fn transcribe_saved(
+    provider: &Provider,
+    key: Arc<SecretKey>,
+    ring: Arc<KeyRing>,
+    vocabulary: Arc<[String]>,
+    languages: Arc<[String]>,
+    pcm: Vec<u8>,
+) -> Result<String, SavedAudioError> {
+    transcribe_pcm(
+        provider,
+        key,
+        ring,
+        vocabulary,
+        languages,
+        &pcm,
+        REPLAY_FRAME_INTERVAL,
+    )
+    .await
+}
+
+/// The session splitter: every session carries at most the relay's exact
+/// ten-minute audio cap, so the documented Live limit is never exceeded and no
+/// saved byte is dropped. The one pinned key is reused by every session.
+async fn transcribe_pcm(
+    provider: &Provider,
+    key: Arc<SecretKey>,
+    ring: Arc<KeyRing>,
+    vocabulary: Arc<[String]>,
+    languages: Arc<[String]>,
+    pcm: &[u8],
+    interval: Duration,
+) -> Result<String, SavedAudioError> {
+    let cap = MAX_AUDIO_BYTES as usize;
+    let mut remaining = pcm;
+    let mut text = String::new();
+    loop {
+        let take_len = remaining.len().min(cap);
+        let take = &remaining[..take_len];
+        let part = replay_saved(
+            provider,
+            Arc::clone(&key),
+            Arc::clone(&ring),
+            Arc::clone(&vocabulary),
+            Arc::clone(&languages),
+            take,
+            interval,
+        )
+        .await?;
+        // A confirmed silent segment is valid, especially the short retained
+        // tail beyond ten minutes. Only the whole recording needs text.
+        if !part.trim().is_empty() {
+            if text.is_empty() {
+                text = part;
+            } else {
+                text.reserve(1 + part.len());
+                text.push(' ');
+                text.push_str(&part);
+            }
+        }
+        remaining = &remaining[take_len..];
+        if remaining.is_empty() {
+            break;
+        }
+    }
+    if text.trim().is_empty() {
+        return Err(SavedAudioError {
+            code: "EMPTY_TEXT",
+            ui: UiMessage::new(MessageId::RecorderEmptyText),
+        });
+    }
+    Ok(text)
+}
+
+/// One relay session with a chosen replay pace. Tests drive a long take with a
+/// zero interval instead of waiting for it in real time.
+async fn replay_saved(
+    provider: &Provider,
+    key: Arc<SecretKey>,
+    ring: Arc<KeyRing>,
+    vocabulary: Arc<[String]>,
+    languages: Arc<[String]>,
+    pcm: &[u8],
+    interval: Duration,
+) -> Result<String, SavedAudioError> {
+    let client = ClientSocket::Playback(Playback::new(pcm, interval));
+    let client = run(
+        client,
+        provider,
+        key,
+        ring,
+        vocabulary,
+        languages,
+        #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+        None,
+    )
+    .await;
+    let ClientSocket::Playback(playback) = client else {
+        unreachable!("a saved-take replay runs with its own client side");
+    };
+    playback.text()
+}
+
+/// The one relay loop both the browser socket and the saved-take replay drive.
+async fn run<'a>(
+    mut client: ClientSocket<'a>,
+    provider: &Provider,
+    key: Arc<SecretKey>,
+    ring: Arc<KeyRing>,
+    vocabulary: Arc<[String]>,
+    languages: Arc<[String]>,
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))] trace: Option<RequestTrace>,
+) -> ClientSocket<'a> {
     // Redaction is only ever as complete as the ring: the socket's own key has to
     // be part of it, and it is, because it was selected from it.
     debug_assert!(ring
@@ -885,7 +1233,6 @@ pub async fn serve(
         .iter()
         .any(|candidate| Arc::ptr_eq(candidate, &key)));
 
-    let mut socket = socket;
     let mut upstream: Option<Upstream> = None;
     let mut state = Relay::new(
         key,
@@ -904,63 +1251,87 @@ pub async fn serve(
             None => tokio::time::sleep(IDLE_PARK),
         };
 
+        // A saved take has no live source to keep feeding: while an activity
+        // is closing, its frames wait in the client, not in `held`. The
+        // browser socket keeps its existing held behavior unchanged.
+        let playback_closing = match &client {
+            ClientSocket::Playback(_) => state.activity == ActivityPhase::Closing,
+            ClientSocket::Browser(_) => false,
+        };
         let event = tokio::select! {
-            message = socket.recv() => Event::Client(message),
+            frame = client.recv(), if !playback_closing => Event::Client(frame),
             message = OptionFuture::from(upstream.as_mut().map(|live| live.next())), if upstream.is_some() => {
                 Event::Upstream(message.flatten())
             }
             _ = deadline, if armed => Event::Deadline,
         };
 
-        // Any frame from the browser proves it is still there and pushes the idle
-        // deadline out.
+        // Any frame from the client side proves it is still there and pushes the
+        // idle deadline out.
         if matches!(event, Event::Client(_)) {
             state.touch();
         }
 
         match event {
-            Event::Client(Some(Ok(ClientMessage::Text(text)))) => {
-                let raw = text.as_str().to_owned();
-                handle_client(&mut socket, &mut upstream, &mut state, &raw, &provider).await;
+            Event::Client(Some(ClientFrame::Browser(ClientMessage::Text(text)))) => {
+                handle_client_text(
+                    &mut client,
+                    &mut upstream,
+                    &mut state,
+                    text.as_str(),
+                    provider,
+                )
+                .await;
             }
-            Event::Client(Some(Ok(ClientMessage::Binary(data)))) => {
+            Event::Client(Some(ClientFrame::Browser(ClientMessage::Binary(data)))) => {
                 match std::str::from_utf8(&data) {
                     Ok(raw) => {
-                        let raw = raw.to_owned();
-                        handle_client(&mut socket, &mut upstream, &mut state, &raw, &provider)
+                        handle_client_text(&mut client, &mut upstream, &mut state, raw, provider)
                             .await;
                     }
-                    // The browser only ever sends text frames; binary frames are still
-                    // decoded as UTF-8, and undecodable bytes end the session.
+                    // The browser only ever sends text frames; binary frames are
+                    // still decoded as UTF-8, and undecodable bytes end the session.
                     Err(_) => {
                         // A binary frame the browser never should have sent: the
                         // client ended the request by being unreadable.
                         #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
                         note_cause(&state, RequestCause::ClientEnd);
-                        cancel(&mut socket, &mut upstream, &mut state).await;
-                        return;
+                        cancel(&mut client, &mut upstream, &mut state).await;
+                        return client;
                     }
                 }
             }
-            // The browser went away, or its socket failed. Only the upstream is left to
-            // close: nothing could be delivered on a socket that is already gone.
-            Event::Client(Some(Ok(ClientMessage::Close(_))))
-            | Event::Client(None)
-            | Event::Client(Some(Err(_))) => {
+            Event::Client(Some(ClientFrame::Message(message))) => {
+                handle_client_message(
+                    &mut client,
+                    &mut upstream,
+                    &mut state,
+                    &message,
+                    provider,
+                )
+                .await;
+            }
+            // The browser went away, or its socket failed. Only the upstream is
+            // left to close: nothing could be delivered on a client already gone.
+            Event::Client(Some(ClientFrame::Browser(ClientMessage::Close(_))))
+            | Event::Client(Some(ClientFrame::Failed))
+            | Event::Client(None) => {
                 #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
                 note_cause(&state, RequestCause::ClientCancel);
-                cancel(&mut socket, &mut upstream, &mut state).await;
-                return;
+                cancel(&mut client, &mut upstream, &mut state).await;
+                return client;
             }
-            Event::Client(Some(Ok(ClientMessage::Ping(_) | ClientMessage::Pong(_)))) => {}
+            Event::Client(Some(ClientFrame::Browser(
+                ClientMessage::Ping(_) | ClientMessage::Pong(_),
+            ))) => {}
             Event::Upstream(message) => {
-                handle_upstream(&mut socket, &mut upstream, &mut state, message).await
+                handle_upstream(&mut client, &mut upstream, &mut state, message).await
             }
-            Event::Deadline => handle_deadline(&mut socket, &mut upstream, &mut state).await,
+            Event::Deadline => handle_deadline(&mut client, &mut upstream, &mut state).await,
         }
 
         if state.done {
-            return;
+            return client;
         }
     }
 }
@@ -969,9 +1340,9 @@ pub async fn serve(
 /* Client messages                                                            */
 /* -------------------------------------------------------------------------- */
 
-/// Dispatch one text frame from the browser.
-async fn handle_client(
-    socket: &mut WebSocket,
+/// Parses one text frame from the browser and dispatches it.
+async fn handle_client_text(
+    socket: &mut ClientSocket<'_>,
     upstream: &mut Option<Upstream>,
     state: &mut Relay,
     raw: &str,
@@ -984,10 +1355,25 @@ async fn handle_client(
         fail(socket, upstream, state, UiMessage::new(MessageId::LiveMalformedJson)).await;
         return;
     };
+    handle_client_message(socket, upstream, state, &message, provider).await;
+}
+
+/// Dispatches one client message, already parsed: the browser's text and the
+/// replay's own frames share exactly this state machine.
+async fn handle_client_message(
+    socket: &mut ClientSocket<'_>,
+    upstream: &mut Option<Upstream>,
+    state: &mut Relay,
+    message: &Value,
+    provider: &Provider,
+) {
+    if state.done {
+        return;
+    }
     let message_type = message.get("type");
     match message_type.and_then(Value::as_str) {
-        Some("start") => start(socket, upstream, state, &message, provider).await,
-        Some("audio") => push_audio(socket, upstream, state, &message).await,
+        Some("start") => start(socket, upstream, state, message, provider).await,
+        Some("audio") => push_audio(socket, upstream, state, message).await,
         Some("end") => end(socket, upstream, state).await,
         _ => {
             // The `String(type)` spelling, for the shapes JSON can deliver.
@@ -1010,7 +1396,7 @@ async fn handle_client(
 
 /// `start`: bind the mode and open the Live session.
 async fn start(
-    socket: &mut WebSocket,
+    socket: &mut ClientSocket<'_>,
     upstream: &mut Option<Upstream>,
     state: &mut Relay,
     message: &Value,
@@ -1040,7 +1426,7 @@ async fn start(
 /// (the relay drives `activityStart`/`activityEnd` itself) and the mode's input
 /// transcription.
 async fn open_upstream(
-    socket: &mut WebSocket,
+    socket: &mut ClientSocket<'_>,
     upstream: &mut Option<Upstream>,
     state: &mut Relay,
     provider: &Provider,
@@ -1149,7 +1535,7 @@ async fn open_upstream(
 
 /// `audio`: one base64 PCM16 frame, queued until the setup is confirmed.
 async fn push_audio(
-    socket: &mut WebSocket,
+    socket: &mut ClientSocket<'_>,
     upstream: &mut Option<Upstream>,
     state: &mut Relay,
     message: &Value,
@@ -1274,7 +1660,7 @@ async fn push_audio(
 }
 
 /// `end`: stop the recording and wait for the final transcript.
-async fn end(socket: &mut WebSocket, upstream: &mut Option<Upstream>, state: &mut Relay) {
+async fn end(socket: &mut ClientSocket<'_>, upstream: &mut Option<Upstream>, state: &mut Relay) {
     if state.done {
         return;
     }
@@ -1322,7 +1708,7 @@ async fn end(socket: &mut WebSocket, upstream: &mut Option<Upstream>, state: &mu
 /// The control frames' payloads are bound here only to feed the archive, so a
 /// build without development diagnostics has nothing to read them.
 async fn handle_upstream(
-    socket: &mut WebSocket,
+    socket: &mut ClientSocket<'_>,
     upstream: &mut Option<Upstream>,
     state: &mut Relay,
     message: Option<Result<UpstreamMessage, tokio_tungstenite::tungstenite::Error>>,
@@ -1467,7 +1853,7 @@ async fn handle_upstream(
 
 /// Handles one JSON message from the Live socket.
 async fn handle_upstream_message(
-    socket: &mut WebSocket,
+    socket: &mut ClientSocket<'_>,
     upstream: &mut Option<Upstream>,
     state: &mut Relay,
     raw: &str,
@@ -1716,7 +2102,7 @@ async fn handle_upstream_message(
 
 /// The Live socket closed.
 async fn upstream_closed(
-    socket: &mut WebSocket,
+    socket: &mut ClientSocket<'_>,
     upstream: &mut Option<Upstream>,
     state: &mut Relay,
     code: u16,
@@ -1803,7 +2189,7 @@ fn describe_close(code: u16, reason: &str) -> Option<Value> {
 
 /// The earliest expired deadline decides, exactly like a timer that was scheduled first.
 async fn handle_deadline(
-    socket: &mut WebSocket,
+    socket: &mut ClientSocket<'_>,
     upstream: &mut Option<Upstream>,
     state: &mut Relay,
 ) {
@@ -1942,7 +2328,7 @@ fn arm_final_timeout(state: &mut Relay) {
 
 /// Terminal failure: report it, then always finish with `done` so the UI cannot hang.
 async fn fail(
-    socket: &mut WebSocket,
+    socket: &mut ClientSocket<'_>,
     upstream: &mut Option<Upstream>,
     state: &mut Relay,
     mut ui: UiMessage,
@@ -1966,7 +2352,7 @@ async fn fail(
 }
 
 /// Terminal success: exactly one `done`, then both sockets close.
-async fn finish(socket: &mut WebSocket, upstream: &mut Option<Upstream>, state: &mut Relay) {
+async fn finish(socket: &mut ClientSocket<'_>, upstream: &mut Option<Upstream>, state: &mut Relay) {
     if state.done {
         return;
     }
@@ -1976,23 +2362,23 @@ async fn finish(socket: &mut WebSocket, upstream: &mut Option<Upstream>, state: 
     state.clear_timers();
     write_client(socket, state, &json!({ "type": "done" })).await;
     close_upstream(upstream).await;
-    let _ = socket
-        .send(ClientMessage::Close(Some(CloseFrame {
+    socket
+        .close(Some(CloseFrame {
             code: 1000,
             reason: "done".into(),
-        })))
+        }))
         .await;
 }
 
 /// The browser socket is gone: no more messages to it, but the Live session is
 /// closed so the provider does not hold the upstream open.
-async fn cancel(socket: &mut WebSocket, upstream: &mut Option<Upstream>, state: &mut Relay) {
+async fn cancel(socket: &mut ClientSocket<'_>, upstream: &mut Option<Upstream>, state: &mut Relay) {
     state.done = true;
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
     note_terminal(state, Outcome::Cancelled);
     state.clear_timers();
     close_upstream(upstream).await;
-    let _ = socket.send(ClientMessage::Close(None)).await;
+    socket.close(None).await;
 }
 
 /// Closes the Live socket once; taking it out of the option makes that structural.
@@ -2013,10 +2399,10 @@ async fn close_upstream(upstream: &mut Option<Upstream>) {
 /// transformation between the provider's message and what the browser receives
 /// - a filtered interim, a promoted final, a mapped error - is visible next to
 /// the frame it came from.
-async fn write_client(socket: &mut WebSocket, state: &Relay, payload: &Value) {
+async fn write_client(socket: &mut ClientSocket<'_>, state: &Relay, payload: &Value) {
     #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
     note_browser_message(state, payload);
-    if let Err(error) = socket.send(ClientMessage::text(payload.to_string())).await {
+    if let Err(error) = socket.send(payload).await {
         #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
         note_transport_error(state, &crate::provider::transport_chain_text(&error));
         warn(
@@ -2549,7 +2935,7 @@ mod relay_tests {
     /// test can assert exactly what crossed the socket and in what order -
     /// including what did not cross it.
     /// An injected JSON null closes the fake socket instead of sending a frame.
-    async fn scripted_upstream(
+    pub(super) async fn scripted_upstream(
         mut answer: impl FnMut(&Value) -> Vec<Value> + Send + 'static,
     ) -> (u16, mpsc::UnboundedSender<Value>, Arc<Mutex<Vec<Value>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4165,6 +4551,512 @@ mod relay_tests {
             "the relay is still running: {records:?}"
         );
         cleanup(diagnostics, &root);
+    }
+}
+
+/// The saved-take replay, driven through the real relay loop and a fake Live
+/// endpoint. Nothing here waits for a real recording's duration: the long takes
+/// use a test-only replay pace, and every assertion is about what actually
+/// crossed the sockets.
+#[cfg(all(test, debug_assertions, feature = "dev-diagnostics"))]
+mod saved_audio_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    const SYNTHETIC_KEY: &str = "speechek-replay-synthetic-key-7c2e";
+
+    fn ring_and_key() -> (Arc<SecretKey>, Arc<KeyRing>) {
+        let key = Arc::new(SecretKey::new(SYNTHETIC_KEY.to_owned()));
+        let ring = Arc::new(KeyRing::new(vec![Arc::clone(&key)]));
+        (key, ring)
+    }
+
+    fn replay_provider(upstream_port: u16) -> Provider {
+        Provider::for_test(
+            "http://127.0.0.1:1",
+            &format!("ws://127.0.0.1:{upstream_port}"),
+        )
+    }
+
+    /// A fake Live endpoint that accepts one socket, reads frames and never
+    /// answers. The two signals say when the relay dialed and when its socket
+    /// closed.
+    async fn hanging_upstream() -> (
+        u16,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        let (accepted, accepted_rx) = tokio::sync::oneshot::channel();
+        let (closed, closed_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                return;
+            };
+            let _ = accepted.send(());
+            while let Some(message) = ws.next().await {
+                if message.is_err() || matches!(message, Ok(WsMessage::Close(_))) {
+                    break;
+                }
+            }
+            let _ = closed.send(());
+        });
+        (port, accepted_rx, closed_rx)
+    }
+
+    /// A fake Live endpoint that accepts `sessions` relay connections in
+    /// order, logs every frame it receives and lets `answer(session, frame)`
+    /// script each session's replies.
+    async fn scripted_upstream_sessions(
+        sessions: u32,
+        mut answer: impl FnMut(u32, &Value) -> Vec<Value> + Send + 'static,
+    ) -> (u16, Arc<Mutex<Vec<Value>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port");
+        let port = listener.local_addr().expect("an address").port();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let upstream_log = Arc::clone(&log);
+        tokio::spawn(async move {
+            for session in 0..sessions {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                loop {
+                    let Some(message) = ws.next().await else {
+                        break;
+                    };
+                    let Ok(message) = message else {
+                        break;
+                    };
+                    let WsMessage::Text(text) = message else {
+                        if matches!(message, WsMessage::Close(_)) {
+                            break;
+                        }
+                        continue;
+                    };
+                    let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else {
+                        continue;
+                    };
+                    upstream_log
+                        .lock()
+                        .expect("the upstream log lock")
+                        .push(value.clone());
+                    for reply in answer(session, &value) {
+                        if ws.send(WsMessage::text(reply.to_string())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        (port, log)
+    }
+
+
+    /// A loud synthetic take of the requested length: the relay forces a
+    /// rotation every 200 s without needing a pause, so 450 s crosses two
+    /// boundaries and leaves a 50 s tail. Loud frames make every held tail
+    /// worth replaying.
+    fn loud_take(seconds: usize) -> Vec<u8> {
+        (0..seconds * SAMPLE_RATE as usize)
+            .flat_map(|_| 8_000_i16.to_le_bytes())
+            .collect()
+    }
+
+    /// The whole saved take reaches the upstream once, rotations happen at
+    /// 200 s and 400 s, the tail after them is still forwarded, and the
+    /// complete finals from all three activities are joined into the result.
+    /// The closing-activity pause lets the fake upstream answer each rotation
+    /// before the zero-paced stream reaches the next boundary.
+    #[tokio::test]
+    async fn a_long_saved_take_is_rotated_and_its_whole_tail_reaches_the_result() {
+        let mut activity_ends = 0_u32;
+        let (upstream_port, _inject, log) =
+            relay_tests::scripted_upstream(move |frame| {
+                if frame.get("setup").is_some() {
+                    return vec![json!({ "setupComplete": {} })];
+                }
+                if frame.pointer("/realtimeInput/activityEnd").is_some() {
+                    activity_ends += 1;
+                    let text = match activity_ends {
+                        1 => "first",
+                        2 => "second",
+                        _ => "tail",
+                    };
+                    return vec![
+                        json!({ "voiceActivity": { "type": "ACTIVITY_END" } }),
+                        json!({ "serverContent": { "inputTranscription": { "text": text } } }),
+                    ];
+                }
+                Vec::new()
+            })
+            .await;
+        let provider = replay_provider(upstream_port);
+        let (key, ring) = ring_and_key();
+        let pcm = loud_take(450);
+
+        let text = tokio::time::timeout(
+            Duration::from_secs(30),
+            replay_saved(
+                &provider,
+                key,
+                ring,
+                Arc::default(),
+                Arc::default(),
+                &pcm,
+                Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("the replayed take finishes in test time")
+        .expect("the replayed take finishes");
+        assert_eq!(
+            text, "first second tail",
+            "every activity's final is part of the result"
+        );
+
+        let frames = log.lock().expect("the upstream log lock").clone();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.pointer("/realtimeInput/activityStart").is_some())
+                .count(),
+            3,
+            "the setup activity and the two after the forced rotations"
+        );
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.pointer("/realtimeInput/activityEnd").is_some())
+                .count(),
+            3,
+            "the two rotation ends and the recording's own end"
+        );
+
+        let mut forwarded = Vec::new();
+        for frame in &frames {
+            let Some(data) = frame
+                .pointer("/realtimeInput/audio/data")
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .expect("the fixture's base64");
+            assert_eq!(
+                bytes.len(),
+                REPLAY_FRAME_BYTES,
+                "one 100 ms chunk per frame"
+            );
+            forwarded.extend_from_slice(&bytes);
+        }
+        assert_eq!(
+            forwarded, pcm,
+            "the whole take, the rotated tail included, crossed exactly once"
+        );
+    }
+
+    /// A retained take may be 601 s while one Live session is capped at
+    /// 600 s: the replay splits it at exactly that boundary, reuses the pinned
+    /// key, keeps every sample of both sessions and joins all finals.
+    #[tokio::test]
+    async fn a_retained_six_hundred_one_second_take_splits_into_two_sessions() {
+        let mut first_final = [true; 2];
+        let (upstream_port, log) = scripted_upstream_sessions(2, move |session, frame| {
+            let index = session as usize;
+            if frame.get("setup").is_some() {
+                return vec![json!({ "setupComplete": {} })];
+            }
+            if frame.pointer("/realtimeInput/activityEnd").is_some() {
+                let first = first_final[index];
+                first_final[index] = false;
+                let mut replies = vec![json!({ "voiceActivity": { "type": "ACTIVITY_END" } })];
+                if first {
+                    replies.push(json!({
+                        "serverContent": {
+                            "inputTranscription": { "text": format!("session-{}", session + 1) }
+                        }
+                    }));
+                }
+                return replies;
+            }
+            Vec::new()
+        })
+        .await;
+        let provider = replay_provider(upstream_port);
+        let (key, ring) = ring_and_key();
+        let pcm = loud_take(601);
+
+        let text = tokio::time::timeout(
+            Duration::from_secs(60),
+            transcribe_pcm(
+                &provider,
+                key,
+                ring,
+                Arc::default(),
+                Arc::default(),
+                &pcm,
+                Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("both sessions finish in test time")
+        .expect("the retained take finishes");
+        assert_eq!(
+            text, "session-1 session-2",
+            "both sessions contributed their final in order"
+        );
+
+        let frames = log.lock().expect("the upstream log lock").clone();
+        let setups: Vec<&Value> = frames
+            .iter()
+            .filter(|frame| frame.get("setup").is_some())
+            .collect();
+        assert_eq!(setups.len(), 2, "the take really crossed two relay sessions");
+        assert_eq!(
+            setups[0], setups[1],
+            "both sessions carry the same pinned configuration"
+        );
+
+        let mut forwarded = Vec::new();
+        for frame in &frames {
+            let Some(data) = frame
+                .pointer("/realtimeInput/audio/data")
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            forwarded.extend_from_slice(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .expect("the fixture's base64"),
+            );
+        }
+        assert_eq!(
+            forwarded, pcm,
+            "all 601 seconds, including the tail session, crossed exactly once"
+        );
+        assert_eq!(forwarded.len(), 601 * BYTES_PER_SAMPLE as usize * SAMPLE_RATE as usize);
+    }
+
+    /// A confirmed tail session that returns no final is not an incomplete
+    /// session: the first 600 s transcript is kept and the silent 1 s tail
+    /// contributes nothing. Only an overall empty transcript is an error.
+    #[tokio::test]
+    async fn a_silent_tail_session_keeps_the_full_transcript() {
+        let mut head_sent = false;
+        let (upstream_port, log) = scripted_upstream_sessions(2, move |session, frame| {
+            if frame.get("setup").is_some() {
+                return vec![json!({ "setupComplete": {} })];
+            }
+            if frame.pointer("/realtimeInput/activityEnd").is_some() {
+                if session == 0 && !head_sent {
+                    head_sent = true;
+                    return vec![
+                        json!({ "voiceActivity": { "type": "ACTIVITY_END" } }),
+                        json!({ "serverContent": { "inputTranscription": { "text": "head" } } }),
+                    ];
+                }
+                return vec![json!({ "voiceActivity": { "type": "ACTIVITY_END" } })];
+            }
+            Vec::new()
+        })
+        .await;
+        let provider = replay_provider(upstream_port);
+        let (key, ring) = ring_and_key();
+        let pcm = loud_take(601);
+
+        let text = tokio::time::timeout(
+            Duration::from_secs(60),
+            transcribe_pcm(
+                &provider,
+                key,
+                ring,
+                Arc::default(),
+                Arc::default(),
+                &pcm,
+                Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("both sessions finish in test time")
+        .expect("a confirmed silent tail is not a failure");
+        assert_eq!(
+            text, "head",
+            "the first session's transcript survives the silent tail"
+        );
+
+        let frames = log.lock().expect("the upstream log lock").clone();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.get("setup").is_some())
+                .count(),
+            2,
+            "the take really crossed two sessions"
+        );
+        let mut forwarded = Vec::new();
+        for frame in &frames {
+            let Some(data) = frame
+                .pointer("/realtimeInput/audio/data")
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            forwarded.extend_from_slice(
+                &base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .expect("the fixture's base64"),
+            );
+        }
+        assert_eq!(
+            forwarded, pcm,
+            "the silent tail is still relayed, not truncated"
+        );
+    }
+
+    /// The second session failing discards the first session's transcript:
+    /// the replay returns an error, never a partial join.
+    #[tokio::test]
+    async fn a_failing_tail_session_returns_no_partial_text() {
+        let (upstream_port, log) = scripted_upstream_sessions(2, move |session, frame| {
+            if frame.get("setup").is_some() {
+                if session == 0 {
+                    return vec![json!({ "setupComplete": {} })];
+                }
+                return vec![
+                    json!({ "setupComplete": {} }),
+                    json!({ "error": { "message": "synthetic tail session failure" } }),
+                ];
+            }
+            if session == 0 && frame.pointer("/realtimeInput/activityEnd").is_some() {
+                return vec![
+                    json!({ "voiceActivity": { "type": "ACTIVITY_END" } }),
+                    json!({ "serverContent": { "inputTranscription": { "text": "head" } } }),
+                ];
+            }
+            Vec::new()
+        })
+        .await;
+        let provider = replay_provider(upstream_port);
+        let (key, ring) = ring_and_key();
+        let pcm = loud_take(601);
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(60),
+            transcribe_pcm(
+                &provider,
+                key,
+                ring,
+                Arc::default(),
+                Arc::default(),
+                &pcm,
+                Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("both sessions finish in test time")
+        .expect_err("a failed tail session is not a transcript");
+        assert_eq!(error.code, "LIVE_ERROR");
+        assert_eq!(error.ui.key, MessageId::LiveApiError);
+
+        let frames = log.lock().expect("the upstream log lock").clone();
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| frame.get("setup").is_some())
+                .count(),
+            2,
+            "the failure happened in the second session"
+        );
+    }
+
+    /// Dropping the replay future drops the one relay loop with it: the Live
+    /// socket is closed and no task keeps running behind the caller.
+    #[tokio::test]
+    async fn cancelling_a_saved_replay_closes_the_upstream_socket() {
+        // The fixture's own error type is not inspected; a dropped signal is
+        // the failure `expect` reports.
+
+        let (upstream_port, accepted, closed) = hanging_upstream().await;
+        let (key, ring) = ring_and_key();
+        let task = tokio::spawn(async move {
+            let provider = replay_provider(upstream_port);
+            let pcm = vec![0_u8; 64_000];
+            replay_saved(
+                &provider,
+                key,
+                ring,
+                Arc::default(),
+                Arc::default(),
+                &pcm,
+                Duration::from_millis(10),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), accepted)
+            .await
+            .expect("the relay dials the Live endpoint")
+            .expect("the endpoint accepted");
+
+        task.abort();
+        match task.await {
+            Err(error) => assert!(error.is_cancelled()),
+            Ok(_) => panic!("the aborted replay returned"),
+        }
+        tokio::time::timeout(Duration::from_secs(5), closed)
+            .await
+            .expect("the upstream sees the cancellation")
+            .expect("the fixture reports its close");
+    }
+
+    /// An upstream error is terminal: the replay returns it instead of the
+    /// finals it may already have seen.
+    #[tokio::test]
+    async fn a_saved_replay_error_returns_no_text() {
+        let (upstream_port, _inject, _log) = relay_tests::scripted_upstream(|frame| {
+            if frame.get("setup").is_some() {
+                return vec![
+                    json!({ "setupComplete": {} }),
+                    json!({ "error": { "message": "synthetic replay failure" } }),
+                ];
+            }
+            Vec::new()
+        })
+        .await;
+        let provider = replay_provider(upstream_port);
+        let (key, ring) = ring_and_key();
+
+        let error = transcribe_saved(
+            &provider,
+            key,
+            ring,
+            Arc::default(),
+            Arc::default(),
+            vec![0_u8; 3_200],
+        )
+        .await
+        .expect_err("an upstream error is not a transcript");
+        assert_eq!(error.code, "LIVE_ERROR");
+        assert_eq!(
+            error.ui.key,
+            MessageId::LiveApiError,
+            "the relay's own failure reaches the caller"
+        );
     }
 }
 

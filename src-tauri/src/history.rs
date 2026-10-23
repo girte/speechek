@@ -23,7 +23,8 @@
 //! window can say so instead of showing a history that quietly lost a take.
 //!
 //! The settings window owns the surface: it lists the entries, plays an entry's
-//! audio, re-runs recognition over it through the batch API, exports the
+//! audio, re-runs recognition over it in the configured mode - the shared Live
+//! relay for `live`, the batch API for `smart` and `verbatim` - exports the
 //! decrypted FLAC through the native save dialog, deletes one entry or clears
 //! the history, and lowers the limit the store prunes to.
 //!
@@ -48,7 +49,9 @@ use zeroize::Zeroizing;
 use crate::flac::{self, FlacError};
 use crate::i18n::{self, MessageId, UiMessage};
 use crate::preferences::{self, PreferencesState, SettingsUiError};
-use crate::secrets;
+use crate::provider::Provider;
+use crate::secrets::{self, SecretKey};
+use crate::settings::RuntimeSnapshot;
 
 /* -------------------------------------------------------------------------- */
 /* Names, sizes and formats                                                   */
@@ -512,8 +515,9 @@ pub(crate) struct History {
     /// generation the shell assigned.
     takes: Mutex<HashMap<u64, Arc<Take>>>,
     /// Held for the whole of every store operation and every listing, so a
-    /// prune cannot delete an entry a retry is reading.
-    io: Mutex<()>,
+    /// prune cannot delete an entry a retry is reading. Cloned into the retry
+    /// helper so its commit takes the same lock.
+    io: Arc<Mutex<()>>,
     /// The entry one retry is running for, if any.
     retrying: Mutex<Option<String>>,
     /// Why the last write failed, until a write succeeds. Cleared by a
@@ -526,7 +530,7 @@ impl History {
         Self {
             store,
             takes: Mutex::new(HashMap::new()),
-            io: Mutex::new(()),
+            io: Arc::new(Mutex::new(())),
             retrying: Mutex::new(None),
             last_error: Mutex::new(None),
         }
@@ -790,9 +794,11 @@ pub async fn history_audio(
     .await
 }
 
-/// Re-runs recognition over one entry's own audio with the batch API, using the
-/// mode of the running configuration with `live` mapped to `smart`, and
-/// replaces the stored text with the result. A failure keeps the previous text.
+/// Re-runs recognition over one entry's own audio with the mode the running
+/// configuration had when the retry started: `live` replays the take through
+/// the same Live relay, `smart` and `verbatim` stay on the batch API. The
+/// stored text is replaced only by a complete, non-empty result; a failure
+/// keeps the previous text.
 #[tauri::command]
 pub async fn history_retry(
     window: WebviewWindow,
@@ -800,10 +806,10 @@ pub async fn history_retry(
     id: String,
 ) -> Result<HistoryEntryView, SettingsUiError> {
     preferences::check_window(&window)?;
-    let store = store_of(&app.state::<History>())?;
+    let history = app.state::<History>();
+    let store = store_of(&history)?;
     validate_id(&id).map_err(HistoryError::command)?;
     {
-        let history = app.state::<History>();
         let mut retrying = history.retrying.lock();
         if retrying.is_some() {
             return Err(SettingsUiError::new(
@@ -818,6 +824,29 @@ pub async fn history_retry(
     let _ticket = RetryTicket(app.clone());
     changed(&app);
 
+    // The snapshot is captured before the first await: the whole retry - the
+    // mode, the ring, the vocabulary and the languages - is the revision Save
+    // had published when Retry was pressed. Its key is chosen only after the
+    // audio was successfully decoded, so a rejected take consumes no turn.
+    let state = app.state::<PreferencesState>();
+    let snapshot = state.runtime.snapshot();
+    let provider = Arc::clone(&state.provider);
+    let io = Arc::clone(&history.io);
+
+    retry_stored_entry(store, io, id, provider, snapshot).await
+}
+
+/// Decodes one stored take, recognizes it with the snapshot's selected mode and
+/// commits a non-empty result. The caller has already pinned the snapshot; its
+/// one key is selected here only after the audio decoded. A failure never
+/// touches the entry.
+pub(crate) async fn retry_stored_entry(
+    store: HistoryStore,
+    io: Arc<Mutex<()>>,
+    id: String,
+    provider: Arc<Provider>,
+    snapshot: Arc<RuntimeSnapshot>,
+) -> Result<HistoryEntryView, SettingsUiError> {
     let decoded = store.clone();
     let entry_id = id.clone();
     let pcm = run_blocking(move || {
@@ -828,23 +857,51 @@ pub async fn history_retry(
     })
     .await?;
 
-    let state = app.state::<PreferencesState>();
-    let snapshot = state.runtime.snapshot();
     let key = snapshot.keys.next_key().ok_or_else(|| {
         SettingsUiError::new("MISSING_API_KEY", UiMessage::new(MessageId::RecorderMissingApiKey))
     })?;
+    let text = recognize_retry(&provider, &snapshot, &key, pcm).await?;
+    if text.trim().is_empty() {
+        return Err(empty_retry_text());
+    }
+
+    run_blocking(move || {
+        let _io = io.lock();
+        store
+            .replace_text(&id, &text)
+            .map_err(HistoryError::command)?;
+        Ok(store.entry(&id).map_err(HistoryError::command)?.view(None))
+    })
+    .await
+}
+
+/// The one selected mode decides the transport: `live` replays the saved PCM
+/// through the shared Live relay in Smart mode; every other mode is the batch
+/// request it always was. There is no fallback between them.
+async fn recognize_retry(
+    provider: &Provider,
+    snapshot: &RuntimeSnapshot,
+    key: &Arc<SecretKey>,
+    pcm: Vec<u8>,
+) -> Result<String, SettingsUiError> {
     let settings = &snapshot.settings;
-    let mode = if settings.mode == "live" {
-        "smart"
-    } else {
-        settings.mode.as_str()
-    };
-    let text = state
-        .provider
+    if settings.mode == "live" {
+        return crate::live::transcribe_saved(
+            provider,
+            Arc::clone(key),
+            Arc::clone(&snapshot.keys),
+            Arc::clone(&settings.custom_vocabulary),
+            Arc::clone(&settings.dictation_languages),
+            pcm,
+        )
+        .await
+        .map_err(|error| SettingsUiError::new(error.code, error.ui));
+    }
+    provider
         .transcribe(
-            &key,
+            key,
             snapshot.keys.keys(),
-            mode,
+            settings.mode.as_str(),
             &settings.custom_vocabulary,
             &settings.dictation_languages,
             wav_from_pcm(&pcm),
@@ -852,23 +909,13 @@ pub async fn history_retry(
             None,
         )
         .await
-        .map_err(|error| SettingsUiError::new(error.code, error.ui))?;
-    if text.trim().is_empty() {
-        return Err(SettingsUiError::new(
-            "EMPTY_TEXT",
-            UiMessage::new(MessageId::RecorderEmptyText),
-        ));
-    }
+        .map_err(|error| SettingsUiError::new(error.code, error.ui))
+}
 
-    run_blocking(move || {
-        let history = app.state::<History>();
-        let _io = history.io.lock();
-        store
-            .replace_text(&id, &text)
-            .map_err(HistoryError::command)?;
-        Ok(store.entry(&id).map_err(HistoryError::command)?.view(None))
-    })
-    .await
+/// One stored entry's empty result: the failure the page already shows for a
+/// batch take whose model returned nothing.
+fn empty_retry_text() -> SettingsUiError {
+    SettingsUiError::new("EMPTY_TEXT", UiMessage::new(MessageId::RecorderEmptyText))
 }
 
 /// Holds the one-retry marker for as long as the retry runs and releases it on
@@ -1201,5 +1248,415 @@ mod tests {
         assert_eq!(&wav[36..40], b"data");
         assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), pcm.len() as u32);
         assert_eq!(&wav[44..], &pcm);
+    }
+
+    /// The retry path itself - a real sealed store, a real FLAC decode and the
+    /// shared Live relay - against a fake provider. The batch endpoint is a
+    /// counting listener, so "the Live mode never touches batch" is evidence,
+    /// not an assumption.
+    #[cfg(all(debug_assertions, feature = "dev-diagnostics"))]
+    mod retry_tests {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        use base64::Engine as _;
+        use futures_util::{SinkExt as _, StreamExt as _};
+        use serde_json::{json, Value};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        use super::{pcm, Fixture};
+        use super::super::{recognize_retry, retry_stored_entry, AUDIO_MAGIC};
+        use crate::i18n::{Language, MessageId, UiMessage};
+        use crate::provider::Provider;
+        use crate::secrets::{KeyRing, SecretKey};
+        use crate::settings::{RuntimeSnapshot, Settings};
+
+        const SYNTHETIC_KEY: &str = "speechek-retry-synthetic-key-1d4a";
+
+        fn settings(mode: &str) -> Settings {
+            Settings {
+                hotkey: "Ctrl+Shift+Space".to_owned(),
+                mode: mode.to_owned(),
+                mute_during_recording: false,
+                input_device: None,
+                language: Language::En,
+                custom_vocabulary: Arc::default(),
+                dictation_languages: Arc::default(),
+                history_limit: 10,
+            }
+        }
+
+        fn test_snapshot(mode: &str, ring: Arc<KeyRing>) -> Arc<RuntimeSnapshot> {
+            Arc::new(RuntimeSnapshot {
+                settings: settings(mode),
+                keys: ring,
+                revision: 1,
+            })
+        }
+
+        fn ring_and_key() -> (Arc<SecretKey>, Arc<KeyRing>) {
+            let key = Arc::new(SecretKey::new(SYNTHETIC_KEY.to_owned()));
+            let ring = Arc::new(KeyRing::new(vec![Arc::clone(&key)]));
+            (key, ring)
+        }
+
+        fn fake_provider(http_port: u16, live_port: u16) -> Provider {
+            Provider::for_test(
+                &format!("http://127.0.0.1:{http_port}"),
+                &format!("ws://127.0.0.1:{live_port}"),
+            )
+        }
+
+        /// A fake Live endpoint: every frame the relay sends is logged, and
+        /// `answer` decides what comes back. It exits when the relay closes.
+        async fn fake_live(
+            mut answer: impl FnMut(&Value) -> Vec<Value> + Send + 'static,
+        ) -> (u16, Arc<Mutex<Vec<Value>>>) {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a loopback port");
+            let port = listener.local_addr().expect("an address").port();
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let upstream_log = Arc::clone(&log);
+            tokio::spawn(async move {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                loop {
+                    let Some(message) = ws.next().await else {
+                        return;
+                    };
+                    let Ok(message) = message else {
+                        return;
+                    };
+                    let WsMessage::Text(text) = message else {
+                        if matches!(message, WsMessage::Close(_)) {
+                            return;
+                        }
+                        continue;
+                    };
+                    let Ok(value) = serde_json::from_str::<Value>(text.as_str()) else {
+                        continue;
+                    };
+                    upstream_log
+                        .lock()
+                        .expect("the upstream log lock")
+                        .push(value.clone());
+                    for reply in answer(&value) {
+                        if ws.send(WsMessage::text(reply.to_string())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+            (port, log)
+        }
+
+        /// A listener that counts connections and drops each one, so a request
+        /// to the batch endpoint fails quickly and is still observable.
+        async fn connection_counter() -> (u16, Arc<AtomicUsize>) {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("a loopback port");
+            let port = listener.local_addr().expect("an address").port();
+            let count = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&count);
+            tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                }
+            });
+            (port, count)
+        }
+
+        /// The saved take crosses the Live socket as the same PCM, the end
+        /// follows the last byte, and only the non-empty finals become the
+        /// committed text. The batch endpoint never sees a connection.
+        async fn live_retry_round_trip() {
+            let fixture = Fixture::new();
+            let pcm = pcm();
+            fixture
+                .0
+                .save("1-1", 1, 125, &pcm, Some("stale text"), None)
+                .unwrap();
+            let audio_before = fixture.0.read_audio("1-1").unwrap();
+
+            let (live_port, log) = fake_live(move |frame| {
+                if frame.get("setup").is_some() {
+                    return vec![json!({ "setupComplete": {} })];
+                }
+                if frame.pointer("/realtimeInput/activityEnd").is_some() {
+                    return vec![
+                        json!({ "voiceActivity": { "type": "ACTIVITY_END" } }),
+                        json!({ "serverContent": { "inputTranscription": { "text": "fresh" } } }),
+                        json!({ "serverContent": { "inputTranscription": { "text": "text" } } }),
+                    ];
+                }
+                if frame.pointer("/realtimeInput/audio").is_some() {
+                    return vec![json!({
+                        "serverContent": { "interimInputTranscription": { "text": "never used" } }
+                    })];
+                }
+                Vec::new()
+            })
+            .await;
+            let (http_port, http_hits) = connection_counter().await;
+            let provider = Arc::new(fake_provider(http_port, live_port));
+            let (_, ring) = ring_and_key();
+            let snapshot = test_snapshot("live", Arc::clone(&ring));
+
+            let view = retry_stored_entry(
+                fixture.0.clone(),
+                Arc::new(parking_lot::Mutex::new(())),
+                "1-1".to_owned(),
+                provider,
+                snapshot,
+            )
+            .await
+            .expect("the live retry succeeds");
+
+            assert_eq!(view.text, "fresh text");
+            assert_eq!(view.status, "recognized");
+            assert!(view.error.is_none());
+            assert_eq!(
+                (view.started_utc_ms, view.duration_ms),
+                (1, 125),
+                "the retry rewrites only the text"
+            );
+            assert_eq!(
+                fixture.0.entry("1-1").unwrap().view(None).text,
+                "fresh text"
+            );
+            let audio_after = fixture.0.read_audio("1-1").unwrap();
+            assert_eq!(
+                &*audio_after, &*audio_before,
+                "a retry never rewrites the saved audio"
+            );
+            assert_eq!(
+                http_hits.load(Ordering::SeqCst),
+                0,
+                "the Live mode never dials the batch endpoint"
+            );
+
+            let frames = log.lock().expect("the upstream log lock").clone();
+            let mut forwarded = Vec::new();
+            let mut ends = Vec::new();
+            for frame in &frames {
+                if let Some(data) = frame
+                    .pointer("/realtimeInput/audio/data")
+                    .and_then(Value::as_str)
+                {
+                    forwarded.extend_from_slice(
+                        &base64::engine::general_purpose::STANDARD
+                            .decode(data)
+                            .expect("the fixture's base64"),
+                    );
+                }
+                if frame.pointer("/realtimeInput/activityEnd").is_some() {
+                    ends.push(forwarded.len());
+                }
+            }
+            assert_eq!(forwarded, pcm, "the relay carried the exact saved PCM");
+            assert_eq!(
+                ends,
+                vec![pcm.len()],
+                "the end follows every saved byte and precedes the final"
+            );
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame.pointer("/realtimeInput/activityStart").is_some())
+                    .count(),
+                1
+            );
+        }
+
+        #[tokio::test]
+        async fn a_live_retry_replays_the_saved_audio_and_commits_the_complete_text() {
+            live_retry_round_trip().await;
+        }
+
+        /// A terminal error after an interim and a final is still a failure:
+        /// the stored entry - including its previous failure reason - and its
+        /// audio stay exactly as they were.
+        #[tokio::test]
+        async fn a_live_retry_failure_after_partial_text_keeps_the_entry() {
+            let fixture = Fixture::new();
+            let pcm = pcm();
+            fixture
+                .0
+                .save(
+                    "1-1",
+                    1,
+                    125,
+                    &pcm,
+                    None,
+                    Some(UiMessage::new(MessageId::HistoryNotRecognized)),
+                )
+                .unwrap();
+            let audio_before = fixture.0.read_audio("1-1").unwrap();
+
+            let (live_port, _log) = fake_live(move |frame| {
+                if frame.get("setup").is_some() {
+                    return vec![json!({ "setupComplete": {} })];
+                }
+                if frame.pointer("/realtimeInput/activityEnd").is_some() {
+                    return vec![
+                        json!({ "voiceActivity": { "type": "ACTIVITY_END" } }),
+                        json!({ "serverContent": { "inputTranscription": { "text": "partial" } } }),
+                        json!({ "error": { "message": "synthetic retry failure" } }),
+                    ];
+                }
+                if frame.pointer("/realtimeInput/audio").is_some() {
+                    return vec![json!({
+                        "serverContent": { "interimInputTranscription": { "text": "unfinished" } }
+                    })];
+                }
+                Vec::new()
+            })
+            .await;
+            let (http_port, _http_hits) = connection_counter().await;
+            let provider = Arc::new(fake_provider(http_port, live_port));
+            let (_, ring) = ring_and_key();
+            let snapshot = test_snapshot("live", Arc::clone(&ring));
+
+            let error = retry_stored_entry(
+                fixture.0.clone(),
+                Arc::new(parking_lot::Mutex::new(())),
+                "1-1".to_owned(),
+                provider,
+                snapshot,
+            )
+            .await
+            .expect_err("a terminal error is not a retry result");
+            assert_eq!(error.ui.key, MessageId::LiveApiError);
+
+            let view = fixture.0.entry("1-1").unwrap().view(None);
+            assert!(view.text.is_empty());
+            assert_eq!(
+                view.error.as_ref().map(|error| error.key),
+                Some(MessageId::HistoryNotRecognized)
+            );
+            let audio_after = fixture.0.read_audio("1-1").unwrap();
+            assert_eq!(&*audio_after, &*audio_before);
+        }
+
+        /// A session that ends without any final transcript reports the same
+        /// empty-text failure a batch retry reports, and commits nothing.
+        #[tokio::test]
+        async fn a_live_retry_without_a_final_reports_empty_text_and_keeps_the_entry() {
+            let fixture = Fixture::new();
+            fixture
+                .0
+                .save("1-1", 1, 125, &pcm(), Some("keep this"), None)
+                .unwrap();
+
+            let (live_port, _log) = fake_live(move |frame| {
+                if frame.get("setup").is_some() {
+                    return vec![json!({ "setupComplete": {} })];
+                }
+                if frame.pointer("/realtimeInput/activityEnd").is_some() {
+                    return vec![json!({ "voiceActivity": { "type": "ACTIVITY_END" } })];
+                }
+                Vec::new()
+            })
+            .await;
+            let (http_port, _http_hits) = connection_counter().await;
+            let provider = Arc::new(fake_provider(http_port, live_port));
+            let (_, ring) = ring_and_key();
+            let snapshot = test_snapshot("live", Arc::clone(&ring));
+
+            let error = retry_stored_entry(
+                fixture.0.clone(),
+                Arc::new(parking_lot::Mutex::new(())),
+                "1-1".to_owned(),
+                provider,
+                snapshot,
+            )
+            .await
+            .expect_err("an empty transcript is not committed");
+            assert_eq!(error.ui.key, MessageId::RecorderEmptyText);
+            assert_eq!(fixture.0.entry("1-1").unwrap().view(None).text, "keep this");
+        }
+
+        /// A take that cannot be decoded is rejected before the pinned key is
+        /// drawn from the ring: a corrupt recording must not consume a turn.
+        #[tokio::test]
+        async fn unreadable_audio_does_not_consume_a_key_turn() {
+            let fixture = Fixture::new();
+            fixture
+                .0
+                .save("1-1", 1, 125, &pcm(), Some("keep this"), None)
+                .unwrap();
+            fixture
+                .0
+                .write("1-1", "audio", AUDIO_MAGIC, b"not a FLAC stream")
+                .unwrap();
+            let first = Arc::new(SecretKey::new("speechek-retry-first-key".to_owned()));
+            let second = Arc::new(SecretKey::new("speechek-retry-second-key".to_owned()));
+            let ring = Arc::new(KeyRing::new(vec![Arc::clone(&first), Arc::clone(&second)]));
+            let snapshot = test_snapshot("live", Arc::clone(&ring));
+            let provider = Arc::new(fake_provider(1, 1));
+
+            let error = retry_stored_entry(
+                fixture.0.clone(),
+                Arc::new(parking_lot::Mutex::new(())),
+                "1-1".to_owned(),
+                provider,
+                snapshot,
+            )
+            .await
+            .expect_err("a corrupt take is rejected");
+            assert_eq!(error.ui.key, MessageId::HistoryAudioDamaged);
+
+            let next = ring.next_key().expect("the ring still has keys");
+            assert!(
+                Arc::ptr_eq(&next, &first),
+                "a rejected take consumed no key turn"
+            );
+            assert_eq!(fixture.0.entry("1-1").unwrap().view(None).text, "keep this");
+        }
+
+        /// Smart and Verbatim keep the batch transport they always had; only
+        /// the Live selection reaches the Live socket.
+        #[tokio::test]
+        async fn smart_and_verbatim_retries_stay_on_the_batch_transport() {
+            for mode in ["smart", "verbatim"] {
+                let (http_port, http_hits) = connection_counter().await;
+                let (live_port, live_hits) = connection_counter().await;
+                let provider = fake_provider(http_port, live_port);
+                let (key, ring) = ring_and_key();
+                let snapshot = test_snapshot(mode, ring);
+
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    recognize_retry(&provider, &snapshot, &key, pcm()),
+                )
+                .await
+                .expect("the batch attempt completes");
+                assert!(
+                    result.is_err(),
+                    "{mode} fails against a batch endpoint that drops the request"
+                );
+                assert!(
+                    http_hits.load(Ordering::SeqCst) >= 1,
+                    "{mode} still dials the batch endpoint"
+                );
+                assert_eq!(
+                    live_hits.load(Ordering::SeqCst),
+                    0,
+                    "{mode} never opens the Live socket"
+                );
+            }
+        }
     }
 }
