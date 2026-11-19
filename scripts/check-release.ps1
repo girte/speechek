@@ -329,8 +329,7 @@ function Check-Notices {
 # ---------------------------------------------------------------------------
 
 $script:ForbiddenSegments = @(
-    '.private/', '.agents/', 'node_modules/', 'src-tauri/target/', 'src-tauri/gen/',
-    'docs/backlog.md', 'docs/release-research.md'
+    '.private/', '.agents/', 'node_modules/', 'src-tauri/target/', 'src-tauri/gen/'
 )
 $script:ForbiddenBasenames = @('secrets.bin', 'keys.txt', 'config/settings.json')
 
@@ -341,6 +340,7 @@ function Get-ForbiddenPathReason([string]$Path) {
     }
     if ($script:ForbiddenBasenames -contains $n) { return $n }
     $bn = [System.IO.Path]::GetFileName($n)
+    if ($bn -eq 'agents.md' -or $bn -eq 'claude.md') { return 'agent instructions file' }
     if ($bn -eq '.env') { return '.env' }
     if ($bn -like '.env.*' -and $bn -ne '.env.example') { return '.env credential file' }
     if ($n -match '\.(wav|pcm|webm|log|flac|jsonl)$' -or $bn -like '*.flac.part') { return 'non-publishable file type' }

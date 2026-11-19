@@ -28,11 +28,10 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Private working set: pre-cutover snapshot, local notes/tools, internal docs.
-# Kept on disk, never published. See scripts/public-files.json for the
-# explicit public allowlist that the public repository is built from.
+# Agent instructions and private working material live outside this
+# repository and are never published. scripts/public-files.json is the
+# explicit public allowlist; scripts/check-release.ps1 enforces it.
 .private/
 .agents/
-/docs/backlog.md
-/docs/release-research.md
-/docs/settings-window-spec.md
+AGENTS.md
+CLAUDE.md
