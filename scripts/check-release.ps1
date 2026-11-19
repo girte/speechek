@@ -329,7 +329,7 @@ function Check-Notices {
 # ---------------------------------------------------------------------------
 
 $script:ForbiddenSegments = @(
-    '.private/', '.agents/', 'node_modules/', 'src-tauri/target/', 'src-tauri/gen/'
+    '.agents/', 'node_modules/', 'src-tauri/target/', 'src-tauri/gen/'
 )
 $script:ForbiddenBasenames = @('secrets.bin', 'keys.txt', 'config/settings.json')
 

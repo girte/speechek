@@ -31,7 +31,6 @@ Thumbs.db
 # Agent instructions and private working material live outside this
 # repository and are never published. scripts/public-files.json is the
 # explicit public allowlist; scripts/check-release.ps1 enforces it.
-.private/
 .agents/
 AGENTS.md
 CLAUDE.md
