@@ -258,10 +258,6 @@ function Resolve-SpeechekBun {
         $perUser = Join-Path $env:USERPROFILE '.bun\bin\bun.exe'
         if (Test-SpeechekBunExe $perUser) { return (Resolve-Path -LiteralPath $perUser).Path }
     }
-    # Local developer cache on the reference machine; it does not exist in a
-    # public checkout, so it is only a convenience fallback after PATH.
-    $localCache = Join-Path $RepoRoot '.private\tools\bun-windows-x64\bun.exe'
-    if (Test-SpeechekBunExe $localCache) { return (Resolve-Path -LiteralPath $localCache).Path }
 
     throw ("Bun 1.4.2 was not found as a real bun.exe. Put bun.exe on PATH, or set the " +
            "SPEECHEK_BUN environment variable to a bun.exe path (PowerShell/cmd shims are not usable).")

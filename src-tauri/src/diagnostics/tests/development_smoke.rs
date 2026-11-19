@@ -133,9 +133,9 @@ fn repo_root() -> PathBuf {
 
 /// The Bun the other checks would use, resolved exactly as
 /// `Resolve-SpeechekBun` resolves it: `SPEECHEK_BUN` first, then `PATH`, then
-/// the per-user install, then the local developer cache. `SPEECHEK_BUN` is a
-/// tool path, not provider configuration, and nothing here reads an API base,
-/// a key or any other provider setting.
+/// the per-user install. `SPEECHEK_BUN` is a tool path, not provider
+/// configuration, and nothing here reads an API base, a key or any other
+/// provider setting.
 fn resolve_bun() -> PathBuf {
     let configured = std::env::var_os("SPEECHEK_BUN").map(PathBuf::from);
     if let Some(bun) = configured.as_deref().filter(|path| path.is_file()) {
@@ -161,14 +161,6 @@ fn resolve_bun() -> PathBuf {
         if per_user.is_file() {
             return per_user;
         }
-    }
-    let local = repo_root()
-        .join(".private")
-        .join("tools")
-        .join("bun-windows-x64")
-        .join("bun.exe");
-    if local.is_file() {
-        return local;
     }
     panic!(
         "Bun was not found. Put bun.exe on PATH, or set SPEECHEK_BUN to a real \

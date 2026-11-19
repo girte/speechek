@@ -128,10 +128,10 @@ $repoRoot = Get-SpeechekRepoRoot $PSScriptRoot
 $tauriDir = Join-Path $repoRoot 'src-tauri'
 $outDir = Join-Path $tauriDir 'target\debug'
 $debugExe = Join-Path $outDir ($TestMainBinary + '.exe')
-$privateDir = Join-Path $repoRoot '.private\smoke'
-$ownershipPath = Join-Path $privateDir 'test-ownership.json'
-$fixtureServerJs = Join-Path $privateDir 'fixture-provider.mjs'
-$liveProbeJs = Join-Path $privateDir 'live-probe.mjs'
+$smokeDir = Join-Path $tauriDir 'target\smoke'
+$ownershipPath = Join-Path $smokeDir 'test-ownership.json'
+$fixtureServerJs = Join-Path $smokeDir 'fixture-provider.mjs'
+$liveProbeJs = Join-Path $smokeDir 'live-probe.mjs'
 $englishLang = Join-Path $tauriDir 'nsis\languages\English.nsh'
 $russianLang = Join-Path $tauriDir 'nsis\languages\Russian.nsh'
 
@@ -494,7 +494,7 @@ function Write-SmokeSettings {
     New-SmokeSecretContainer -Path (Join-Path (Split-Path -Parent $Path) 'secrets.bin') -Key $TestFakeKey
 }
 
-# ── Fixture server (embedded, written to the ignored .private/smoke area) ───
+# ── Fixture server (embedded, written to the ignored src-tauri/target/smoke area) ───
 function Write-SmokeFixtureScripts {
     $server = @'
 const port = Number(process.argv[2]);
@@ -621,7 +621,7 @@ function Start-SmokeFixtureServer {
     param([Parameter(Mandatory = $true)][int]$ListenPort)
     $bunExe = Resolve-SpeechekBun $repoRoot
     $psi = New-SpeechekProcessStartInfo -FilePath $bunExe -Arguments @($fixtureServerJs, [string]$ListenPort) `
-        -WorkingDirectory $privateDir -CaptureOutput
+        -WorkingDirectory $smokeDir -CaptureOutput
     $process = [System.Diagnostics.Process]::Start($psi)
     $script:FixtureServer = $process
     [void]$script:StartedProcessIds.Add($process.Id)
@@ -653,7 +653,7 @@ function Invoke-SmokeLiveProbe {
     )
     $bunExe = Resolve-SpeechekBun $repoRoot
     $result = Get-SpeechekProcessResult -FilePath $bunExe -Arguments @($liveProbeJs, $WsUrl, $Protocol) `
-        -WorkingDirectory $privateDir
+        -WorkingDirectory $smokeDir
     if ($result.ExitCode -ne 0) {
         throw "the Live WebSocket probe failed: $($result.StandardError) $($result.StandardOutput)"
     }
@@ -1479,7 +1479,7 @@ public static class SmokeRegSec
     Add-Type -TypeDefinition $source -Language CSharp
 }
 
-$script:SmokeAclBackupPath = Join-Path $privateDir 'uninstall-key-dacl.bin'
+$script:SmokeAclBackupPath = Join-Path $smokeDir 'uninstall-key-dacl.bin'
 
 function Get-SmokeUninstallSubKey {
     return 'Software\Microsoft\Windows\CurrentVersion\Uninstall\' + $TestProductName
@@ -1777,7 +1777,7 @@ $fixtureBObject = $null
 if ($Fixture) { $fixtureObject = Read-SmokeFixture -FixturePath $Fixture }
 if ($FixtureB) { $fixtureBObject = Read-SmokeFixture -FixturePath $FixtureB }
 
-if (-not (Test-Path -LiteralPath $privateDir)) { New-Item -ItemType Directory -Path $privateDir -Force | Out-Null }
+if (-not (Test-Path -LiteralPath $smokeDir)) { New-Item -ItemType Directory -Path $smokeDir -Force | Out-Null }
 Write-SmokeFixtureScripts
 
 $scenarios = if ($Scenario -eq 'All') {
